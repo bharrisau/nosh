@@ -4,7 +4,7 @@ milestone: v1.1
 milestone_name: M3 Roaming + Windows Client
 status: "Roadmap created; ready for /gsd:plan-phase 4"
 stopped_at: Phase 4 context gathered
-last_updated: "2026-05-29T22:40:56.194Z"
+last_updated: "2026-05-29T22:47:56.543Z"
 last_activity: 2026-05-30 — v1.1 roadmap (Phases 4-8) written
 progress:
   total_phases: 5
