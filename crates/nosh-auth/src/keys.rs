@@ -182,6 +182,28 @@ pub fn record_known_host(path: &Path, host: &str, key: &NoshPublicKey) -> anyhow
     Ok(())
 }
 
+/// Parse a `NoshPublicKey` from a 44-byte Ed25519 `SubjectPublicKeyInfo` DER.
+///
+/// Returns `None` for any non-Ed25519 or malformed SPKI — the caller must
+/// treat this as an auth failure and close the connection (D-04).
+///
+/// This is the public extraction surface used by the server to thread the
+/// authenticated peer identity into the session after the TLS handshake
+/// (D-05). It reuses the same validation as [`AuthorizedKeysVerifier`] so
+/// the identity stored in the session is provably the authorized key.
+pub fn nosh_key_from_spki(spki: &[u8]) -> Option<NoshPublicKey> {
+    if spki.len() != ED25519_SPKI_LEN {
+        return None;
+    }
+    let expected_prefix = ed25519_spki_der(&[0u8; 32]);
+    if spki[..12] != expected_prefix[..12] {
+        return None;
+    }
+    let mut key32 = [0u8; 32];
+    key32.copy_from_slice(&spki[12..]);
+    Some(NoshPublicKey::from_raw(key32))
+}
+
 /// Extract the `SubjectPublicKeyInfo` DER from an X.509 certificate.
 ///
 /// Used by both verifiers to pin on the SPKI bytes (decision D-09/D-10) rather
