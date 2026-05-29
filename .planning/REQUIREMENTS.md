@@ -25,17 +25,17 @@ v1 = the M0–M2 architecture-validation spike (Linux-only). Hard dependency cha
 
 ### Session (M2)
 
-- [ ] **SESS-01**: Server allocates a real PTY (via `portable-pty`) and spawns the user's interactive login shell
-- [ ] **SESS-02**: Keystrokes flow client→server to PTY stdin, and shell output flows PTY→server→client, over a reliable stream — interactively usable
-- [ ] **SESS-03**: Client puts its local terminal in raw mode and restores it on exit, panic, or abrupt disconnect (RAII guard)
-- [ ] **SESS-04**: `TERM` and the initial window size (rows×cols) propagate to the server PTY at session open, so terminfo-aware and fullscreen programs render correctly
-- [ ] **SESS-05**: Window resize (SIGWINCH) propagates to the server PTY, debounced/coalesced (~30–50 ms) to avoid resize storms
-- [ ] **SESS-06**: Ctrl-C and other signals reach the foreground process group on the server (verified: e.g. `sleep 100` interrupts)
-- [ ] **SESS-07**: Client-supplied environment is sanitized at shell open — strip `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PYTHONPATH`, `NODE_OPTIONS`; whitelist `TERM`, `LANG`/`LC_*`, `TZ`; `SSH_AUTH_SOCK` is never forwarded via the environment
-- [ ] **SESS-08**: The remote shell's exit code is delivered to the client via an explicit `SessionClose { exit_code, reason }` control frame, and the client process exits with that code
-- [ ] **SESS-09**: Connection closes cleanly with a structured reason (shell exited / auth failed / server shutdown) using QUIC application error codes — no hangs or spurious errors
-- [ ] **SESS-10**: A server-side session object (`session_id`, SSH identity, PTY handle, shell pid, idle-since) holds session state as a discrete struct, so M3 reattach is additive rather than a refactor (reattach itself NOT implemented)
-- [ ] **SESS-11**: Session open/close/resize events are instrumented with `tracing` spans (`session_id`, `peer_addr`, `username`)
+- [x] **SESS-01**: Server allocates a real PTY (via `portable-pty`) and spawns the user's interactive login shell
+- [x] **SESS-02**: Keystrokes flow client→server to PTY stdin, and shell output flows PTY→server→client, over a reliable stream — interactively usable
+- [~] **SESS-03**: Client puts its local terminal in raw mode and restores it on exit, panic, or abrupt disconnect (RAII guard)
+- [x] **SESS-04**: `TERM` and the initial window size (rows×cols) propagate to the server PTY at session open, so terminfo-aware and fullscreen programs render correctly
+- [x] **SESS-05**: Window resize (SIGWINCH) propagates to the server PTY, debounced/coalesced (~30–50 ms) to avoid resize storms
+- [~] **SESS-06**: Ctrl-C and other signals reach the foreground process group on the server (verified: e.g. `sleep 100` interrupts)
+- [x] **SESS-07**: Client-supplied environment is sanitized at shell open — strip `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PYTHONPATH`, `NODE_OPTIONS`; whitelist `TERM`, `LANG`/`LC_*`, `TZ`; `SSH_AUTH_SOCK` is never forwarded via the environment
+- [x] **SESS-08**: The remote shell's exit code is delivered to the client via an explicit `SessionClose { exit_code, reason }` control frame, and the client process exits with that code
+- [x] **SESS-09**: Connection closes cleanly with a structured reason (shell exited / auth failed / server shutdown) using QUIC application error codes — no hangs or spurious errors
+- [x] **SESS-10**: A server-side session object (`session_id`, SSH identity, PTY handle, shell pid, idle-since) holds session state as a discrete struct, so M3 reattach is additive rather than a refactor (reattach itself NOT implemented)
+- [x] **SESS-11**: Session open/close/resize events are instrumented with `tracing` spans (`session_id`, `peer_addr`, `username`)
 
 ## v2 Requirements
 
@@ -99,17 +99,17 @@ Which phases cover which requirements. Updated during roadmap creation.
 | AUTH-03 | Phase 2 | Done |
 | AUTH-04 | Phase 2 | Done |
 | AUTH-05 | Phase 2 | Done |
-| SESS-01 | Phase 3 | Pending |
-| SESS-02 | Phase 3 | Pending |
-| SESS-03 | Phase 3 | Pending |
-| SESS-04 | Phase 3 | Pending |
-| SESS-05 | Phase 3 | Pending |
-| SESS-06 | Phase 3 | Pending |
-| SESS-07 | Phase 3 | Pending |
-| SESS-08 | Phase 3 | Pending |
-| SESS-09 | Phase 3 | Pending |
-| SESS-10 | Phase 3 | Pending |
-| SESS-11 | Phase 3 | Pending |
+| SESS-01 | Phase 3 | Done |
+| SESS-02 | Phase 3 | Done |
+| SESS-03 | Phase 3 | Human |
+| SESS-04 | Phase 3 | Done |
+| SESS-05 | Phase 3 | Done |
+| SESS-06 | Phase 3 | Human |
+| SESS-07 | Phase 3 | Done |
+| SESS-08 | Phase 3 | Done |
+| SESS-09 | Phase 3 | Done |
+| SESS-10 | Phase 3 | Done |
+| SESS-11 | Phase 3 | Done |
 
 **Coverage:**
 - v1 requirements: 21 total
