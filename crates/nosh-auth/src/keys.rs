@@ -82,18 +82,13 @@ impl NoshPublicKey {
     /// Returns the OpenSSH-style SHA256 fingerprint of this key: `SHA256:<base64>`.
     ///
     /// The raw private/public key bytes are NEVER included — only the hash (D-07).
-    /// Fingerprint is SHA256 over the raw 32-byte Ed25519 key material, base64
-    /// without padding, matching `ssh-keygen -l -E sha256` output.
+    /// Matches `ssh-keygen -l -E sha256` exactly: SHA256 over the SSH wire-format
+    /// public-key blob (`string("ssh-ed25519") || string(key32)` with 4-byte
+    /// big-endian length prefixes), base64 without padding.
     pub fn fingerprint(&self) -> String {
-        use base64::Engine as _;
-        use sha2::Digest as _;
-        let hash = sha2::Sha256::new()
-            .chain_update(self.key32)
-            .finalize();
-        format!(
-            "SHA256:{}",
-            base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash)
-        )
+        let ed = ssh_key::public::Ed25519PublicKey(self.key32);
+        let pk = PublicKey::from(ed);
+        format!("{}", pk.fingerprint(ssh_key::HashAlg::Sha256))
     }
 }
 
@@ -252,7 +247,9 @@ mod tests {
 
     #[test]
     fn fingerprint_format() {
-        // SHA256 of 32 zero bytes, base64-no-pad = 43 chars, prefixed with "SHA256:".
+        // SHA256 of the SSH wire blob for an all-zeros Ed25519 key, base64-no-pad.
+        // Golden value: computed via `ssh-keygen -l -E sha256` and independently
+        // via SHA256(sshstring("ssh-ed25519") || sshstring([0u8;32])).
         let key = NoshPublicKey::from_raw([0u8; 32]);
         let fp = key.fingerprint();
         assert!(fp.starts_with("SHA256:"), "fingerprint must start with SHA256: — got {fp:?}");
@@ -262,6 +259,13 @@ mod tests {
         assert!(!b64_part.contains('='), "base64-no-pad must not contain padding: {fp:?}");
         // The raw key bytes must not appear in the fingerprint output.
         assert!(!fp.contains('\0'), "raw key bytes must not appear in fingerprint");
+        // Golden-vector assertion: must match OpenSSH wire-blob hashing, NOT raw-key
+        // hashing. `ssh-keygen -l -E sha256` for a zero-byte Ed25519 public key
+        // produces this exact value.
+        assert_eq!(
+            fp, "SHA256:kmYcvdi2GkPeWxB6XLjrZB8JHsy2Hm8luHMFp9GMvqk",
+            "fingerprint must match OpenSSH SHA256 wire-blob format (D-07)"
+        );
     }
 
     #[test]
