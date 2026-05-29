@@ -78,6 +78,23 @@ impl NoshPublicKey {
         let pk = PublicKey::from(ed);
         pk.to_openssh().context("encode OpenSSH public key")
     }
+
+    /// Returns the OpenSSH-style SHA256 fingerprint of this key: `SHA256:<base64>`.
+    ///
+    /// The raw private/public key bytes are NEVER included — only the hash (D-07).
+    /// Fingerprint is SHA256 over the raw 32-byte Ed25519 key material, base64
+    /// without padding, matching `ssh-keygen -l -E sha256` output.
+    pub fn fingerprint(&self) -> String {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::new()
+            .chain_update(self.key32)
+            .finalize();
+        format!(
+            "SHA256:{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash)
+        )
+    }
 }
 
 /// Load an OpenSSH `authorized_keys` file into pinned keys (match on key only;
