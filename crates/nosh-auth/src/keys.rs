@@ -34,9 +34,19 @@ pub fn ed25519_spki_der(key32: &[u8; 32]) -> Vec<u8> {
 /// A pinned nosh public identity: an Ed25519 key reduced to its raw 32 bytes
 /// (and, by extension, its SPKI). Used for both `authorized_keys` (server) and
 /// `known_hosts` (client) comparisons — equality is SPKI equality.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NoshPublicKey {
     key32: [u8; 32],
+}
+
+/// Print the OpenSSH fingerprint rather than the raw key bytes (D-07).
+/// A `{:?}` log of `NoshPublicKey` must never expose `key32`.
+impl std::fmt::Debug for NoshPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoshPublicKey")
+            .field("fingerprint", &self.fingerprint())
+            .finish()
+    }
 }
 
 impl NoshPublicKey {
