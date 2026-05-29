@@ -89,8 +89,10 @@ pub fn make_endpoint(
     Ok(endpoint)
 }
 
-/// Accept connections forever, capping concurrent half-open handshakes and
-/// enforcing an auth-completion timeout (AUTH-05 / D-13).
+/// Accept connections forever, capping concurrent PRE-AUTH (half-open)
+/// handshakes and enforcing an auth-completion timeout (AUTH-05 / D-13). The
+/// per-connection permit is released as soon as the handshake resolves, so the
+/// cap bounds unauthenticated state rather than total live sessions.
 pub async fn run_accept_loop(endpoint: quinn::Endpoint, limits: AuthLimits) -> anyhow::Result<()> {
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent));
     while let Some(incoming) = endpoint.accept().await {
@@ -109,10 +111,10 @@ pub async fn run_accept_loop(endpoint: quinn::Endpoint, limits: AuthLimits) -> a
         };
         let timeout = limits.auth_timeout;
         tokio::spawn(async move {
-            // The permit is held for the whole handshake+session; dropping it
-            // on any exit path releases capacity.
-            let _permit = permit;
-            if let Err(e) = handle_connection(incoming, timeout).await {
+            // The permit bounds PRE-AUTH state only (D-13): it is released the
+            // moment the handshake resolves (success, failure, or timeout), so
+            // long-lived authenticated sessions do not consume pre-auth capacity.
+            if let Err(e) = handle_connection(incoming, timeout, permit).await {
                 tracing::warn!("connection handler ended: {e:#}");
             }
         });
@@ -125,6 +127,7 @@ pub async fn run_accept_loop(endpoint: quinn::Endpoint, limits: AuthLimits) -> a
 async fn handle_connection(
     incoming: quinn::Incoming,
     auth_timeout: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> anyhow::Result<()> {
     // AUTH-05: bound the time a connection may stay half-open. The TLS handshake
     // (including client-cert verification) completes when `incoming` resolves;
@@ -136,6 +139,9 @@ async fn handle_connection(
             return Ok(());
         }
     };
+    // Auth is complete: release the pre-auth permit so the now-authenticated
+    // session no longer counts against the pre-auth concurrency cap (D-13).
+    drop(permit);
     let peer = conn.remote_address();
 
     // Log the negotiated ALPN for observability.
