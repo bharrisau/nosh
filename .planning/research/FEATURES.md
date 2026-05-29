@@ -1,211 +1,219 @@
 # Feature Research
 
-**Domain:** QUIC-based roaming remote shell (nosh — Mosh/ET successor)
-**Researched:** 2026-05-29
-**Confidence:** HIGH (spike-stage features derived directly from brief; deferred features from Mosh/ET public record)
+**Domain:** Roaming remote shell — M3 Roaming + Windows Client (nosh v1.1)
+**Researched:** 2026-05-30
+**Confidence:** HIGH (derived from INIT.md design brief, Mosh/ET public record, QUIC RFC 9000/9221, quinn docs, and v1.0 validated codebase)
 
 ---
 
 ## Framing
 
-This document is scoped to the **architecture-validation spike (M0–M2)**: prove QUIC+SSH-auth+PTY
-coexist and carry a live interactive shell on Linux. It categorizes features into four buckets:
+This document is scoped to **v1.1 (M3)**: adding connection migration, server-side session
+persistence, 1-RTT cold reattach, Session.identity threading, and a bounded Windows-client slice
+to the already-working v1.0 QUIC shell. All v1.0 table-stakes (PTY, auth, I/O, resize, env
+sanitization) are shipped and are not re-listed unless they have direct v1.1 interactions.
 
-1. **Spike table-stakes** — must exist or the session is not real / demonstrable
-2. **Deferred differentiators** — the Mosh/ET-successor payoff, mapped to M3–M7
-3. **Anti-features** — explicitly NOT building, with rationale
-4. **Cheap now, painful later** — low-cost items worth pulling into the spike to avoid retrofit pain
-
----
-
-## 1. Spike Table-Stakes
-
-Features without which the interactive session does not work. Missing any one of these means the
-spike output is a demo toy, not a usable shell.
-
-| Feature | Why Essential for Spike | Complexity | Notes |
-|---------|------------------------|------------|-------|
-| **Client-side raw-mode terminal** | Without raw mode the local terminal line-disciplines intercept keystrokes before they reach the transport; interactive programs (vim, htop, readline) break immediately | LOW | `cfmakeraw` / `termios` on connect; must restore on exit (including panic/signal) |
-| **Server-side PTY allocation** (`portable-pty`) | The shell needs a controlling terminal; without it `isatty()` returns false, readline disables editing, job-control signals don't work | MEDIUM | `native_pty_system()` → `openpty()` → `spawn_command()`; `PtySize` must be set at spawn |
-| **Keystroke delivery client→server** | Bidirectional I/O is the whole point | LOW | Reliable QUIC stream is correct for keystrokes (ordering + no loss) |
-| **Shell output delivery server→client** | Same | LOW | Same stream or a dedicated output stream; high-volume so backpressure matters |
-| **TERM propagation** | Without `TERM`, terminfo-aware programs (vim, less, man) emit wrong/broken escape sequences; the session looks broken on first `vim` invocation | LOW | Pass `TERM` from client env to server PTY env at session open; part of the whitelist-only env pass-through |
-| **Window size initial set** | If PTY is opened with a wrong/default size (e.g. 80×24 when the client is 220×55), every fullscreen program wraps incorrectly immediately | LOW | Read `TIOCGWINSZ` on client before first packet; include in session-open message |
-| **Window resize propagation (SIGWINCH)** | Users drag terminal windows; without resize propagation vim/htop misrender after any resize | MEDIUM | Client catches `SIGWINCH`, sends resize message; server calls `resize_pty()` on `MasterPty` |
-| **Exit code propagation** | Scripts and CI that call nosh need the remote shell's exit status; without it `$?` is always 0 or meaningless | LOW | `Child::wait()` → `ExitStatus`; encode in a control frame before closing the connection; client process must `std::process::exit(remote_code)` |
-| **Clean connection close** | Without an explicit close sequence, the other end either hangs waiting for more data or sees a spurious error | LOW | Orderly QUIC stream FIN + connection close after shell exits |
-| **Ctrl-C / signal passthrough** | Ctrl-C in raw mode sends byte 0x03; the PTY line discipline delivers SIGINT to the foreground process group on the server. This is automatic once raw mode + PTY are correct — but must be verified | LOW | No special handling needed beyond raw mode + PTY; verify with `sleep 100` then Ctrl-C |
-| **SSH-key mutual auth** (M1 deliverable, prerequisite to M2) | The spike is not demonstrable without auth; anybody can connect without it | HIGH | Self-signed-cert-pinning fallback is acceptable; `authorized_keys` + `known_hosts`/TOFU; signing via `ssh-agent` |
-| **QUIC datagram + stream coexistence** (M0) | Core architectural hypothesis; if these interfere the entire design collapses | MEDIUM | `quinn` unreliable datagram frames alongside bidirectional streams on one connection |
-
-### What "spike done" looks like
-
-- `nosh user@host` authenticates, opens a PTY, delivers an interactive `$SHELL`
-- Resize client window → remote `stty size` updates
-- `vim`, `htop`, `bash` readline all work correctly
-- `exit 42` → client process exits with code 42
-- Ctrl-C kills foreground process on server
-- Connection drops cleanly; no orphan server process (or a deliberate orphan if session-object is implemented — see §4)
+Features are categorized relative to this milestone, not the full product roadmap.
 
 ---
 
-## 2. Deferred Differentiators
+## Feature Landscape
 
-The Mosh/ET-successor features. Not building in M0–M2. Each is mapped to its milestone.
+### Table Stakes (Users Expect These)
 
-| Feature | Value Proposition | Deferred To | Why Defer |
-|---------|------------------|-------------|-----------|
-| **Roaming / QUIC connection migration** | Session survives Wi-Fi→LTE IP change with zero interruption — the primary differentiator over ET | M3 | Requires the session layer to be proven first; migration is additive on top of a working connection |
-| **Cold-reattach (resume from suspend)** | Lid-close + lid-open reconnects to the running session in ~1 RTT | M3 | Needs sequence-numbered session object; building the object stub is cheap (see §4), but the reattach protocol is not |
-| **Predictive local echo** | Keystroke appears locally before server round-trip; eliminates perceived latency on high-RTT links — Mosh's killer feature | M4 | Hardest UX correctness problem; requires terminal state model (VT parser) on client; wrong prediction is worse than no prediction |
-| **Native scrollback sync** | Browse terminal history without tmux; fully synced buffer | M5 | Requires reliable stream + buffer protocol; ET demonstrates it's tractable but non-trivial |
-| **SSH agent forwarding** | Use local SSH keys from inside the remote session | M5 | Dedicated agent channel; never via env var |
-| **Port forwarding (local + remote)** | Tunnel TCP ports through the session | M5 | Reliable stream multiplexing, per-channel flow control (M5 control-first model) |
-| **Channel multiplexing (multiple windows)** | Multiple shell windows over one QUIC connection | M5 | Requires control-first channel model (OPEN/ACCEPT/REJECT on channel 0) |
-| **OSC 52 clipboard** | Copy-paste between local and remote | M5 | Relatively cheap once reliable stream is in place; defer to avoid scope creep |
-| **Integrated file transfer** | `nosh cp` style transfer over reliable stream | M5 | Same stream infrastructure as forwarding |
-| **Windows native client + server** (ConPTY) | First-class Windows support without WSL | M6 | `portable-pty` already abstracts this; defer until Linux path is validated |
-| **macOS support** | macOS client/server | Post-M6 | Not Linux-only by architecture; defer for scope |
-| **WebTransport / reverse-proxy topology** | Run behind nginx without losing auth or migration | M7 | Inner-auth layer over WebTransport; significant protocol work |
-| **NAT hole-punch / relay** | Work through symmetric NAT; migrate off relay once direct path opens | M7 | Coordination server + TURN fallback + migration handover |
-| **Host-key rotation as a signed object** | New host key signed by old; clients re-pin without scary mismatch prompt | M1+ | Can be added incrementally after basic TOFU works |
-| **Connection status / latency indicator** | Show RTT, packet loss, migration state in status line | M3–M4 | Requires roaming and datagram plumbing first |
-| **Periodic forward-secrecy rekey** | Bounded per-epoch byte ceiling as cheap insurance | M3+ | Not urgent for a spike; mention in architecture doc |
-| **Happy-eyeballs transport selection** | Race QUIC vs TCP fallback; first handshake wins | M7 | QUIC-only this milestone by design |
+These are the behaviors that define whether the M3 milestone is complete. Missing any one means the
+claimed feature does not work.
 
----
+| Feature | Why Expected | Complexity | Notes |
+|---------|--------------|------------|-------|
+| **Connection migration (NAT rebind)** | Any remote shell claiming "roaming" must survive the most common IP change: NAT port reassignment after a brief network blip. This happens invisibly on mobile; users don't know it happened, they just know the shell didn't drop. | LOW | `ServerConfig::migration = true` in quinn is the server-side toggle. QUIC handles NAT rebind automatically: the server accepts packets from the new 4-tuple, probes the path with PATH_CHALLENGE/PATH_RESPONSE, and continues the connection. No application-layer code needed for the NAT-rebind case specifically. |
+| **Connection migration (explicit path switch)** | Switching from Wi-Fi to cellular changes the source IP/port. The same QUIC connection must continue — zero interruption, zero reconnection prompt, zero re-auth. | MEDIUM | The OS network change causes packets to arrive from a new source address. With `ServerConfig::migration = true`, quinn's transport layer validates the new path and migrates automatically. The nosh application sees only brief packet-level loss at worst. No explicit "migrate" API call is needed from nosh-client for the common case; the QUIC stack handles it. |
+| **Migration is invisible to the user** | Mosh users never see a reconnection dialog during a network change — the terminal just keeps working. Users who switch from Mosh to nosh will expect the same. | LOW | No user-visible UI is required during migration. Existing streams remain open; the connection continues on the new path. An RTT/latency status indicator is a differentiator (see below), not table stakes. |
+| **Session.identity threaded from authenticated cert** | Cold reattach authorization is bound to the SSH identity — this is the anti-hijack invariant. Without identity threading, reattach cannot verify the reconnecting client owns the session. | MEDIUM | This is the known-by-design v1.0 seam. The authenticated peer SPKI must be extracted from the rustls handshake context (post-handshake, before session creation) and stored as `Session.identity`. **This is the first implementation task** — every other v1.1 feature except migration depends on it. |
+| **Server-side session persistence (Mosh lifetime model)** | Users expect closing the laptop lid does not kill their remote shell. The mosh-server model — server process persists until the shell exits — is the established user expectation for roaming shells. | MEDIUM | Session lives in a `SessionManager` registry on the server. When the QUIC connection drops, the session enters an orphaned state but the PTY+shell process continues running. Session is keyed by SSH identity fingerprint, not QUIC connection ID (the connection is gone). A configurable idle timeout (default 0 = disabled) governs cleanup. A per-identity cap prevents unbounded memory growth. |
+| **Configurable idle timeout (default: disabled)** | Server admins need a safety valve; users need to know idle sessions don't vanish by default. | LOW | Mosh's experience confirms: users who return to a session hours/days later and find it dead consider this a regression. The correct default is no idle timeout. A `--session-timeout <seconds>` flag on `nosh-server` serves operator needs without surprising users. |
+| **Per-identity session cap** | Without a cap, a client that creates many sessions and disconnects without closing them exhausts server memory indefinitely. | LOW | Configurable max-orphaned-sessions-per-identity (e.g., default 5). When exceeded, the oldest orphaned session is evicted (shell is killed). This is a safety boundary, not a primary UX feature. |
+| **Cold reattach (1-RTT)** | After suspend/resume or a prolonged network outage, the user runs nosh again and re-enters their existing session. ET's BackedReader/BackedWriter model set this expectation; users who know ET will expect it. | HIGH | The client sends a `Reattach{token, last_acked_seq, identity_proof}` control message on the new QUIC connection immediately after the TLS handshake completes. The server validates both the token and the authenticated identity. If valid, the session is rebound to the new connection and undelivered output since `last_acked_seq` is replayed. This is 1-RTT (one message round-trip after the handshake). |
+| **Reattach authorization bound to SSH identity** | A reattach token alone is not sufficient — a stolen token must not enable session hijack. The SSH identity binding is the anti-hijack invariant, matching the "reuses your SSH keys" design principle. | MEDIUM | The `Reattach` message is only accepted after the new TLS handshake completes and the server verifies the peer SPKI against the stored `Session.identity`. The token is also required as a second factor against coincidence/brute-force. **Both checks must pass.** This is table stakes, not optional hardening. |
+| **Reattach token entropy** | A low-entropy token is brute-forceable over the network during the session's lifetime. | LOW | Token is a 32-byte random value generated by a CSPRNG at session creation. `getrandom` or `rand` (likely already in the transitive dep tree via quinn/rustls) is sufficient. No new crate needed. |
+| **Output sequence numbering for replay** | Cold reattach requires the server to replay bytes the client missed. Without a per-session monotonic sequence on the output stream, the server cannot know what to replay. | MEDIUM | A lightweight ring-buffer of the last N bytes of server→client output plus a monotonic byte-offset counter must be maintained per session. The client sends the last seq it received; the server re-sends bytes from that offset. This is a new subsystem (no equivalent in v1.0). It is the primary implementation complexity of cold reattach. |
+| **Windows client: VT raw mode** | A Windows terminal (Windows Terminal, ConHost) must pass raw VT bytes through without interception. Without this, vim/htop/readline all break and the client is not usable. | MEDIUM | Windows 10+ supports `ENABLE_VIRTUAL_TERMINAL_INPUT` (input handle) and `ENABLE_VIRTUAL_TERMINAL_PROCESSING` (output handle) console modes. The Windows client must set these modes at startup and restore them on exit. `crossterm` provides `enable_raw_mode()` / `disable_raw_mode()` which handle both Unix termios and Windows console mode flags transparently. |
+| **Windows client: terminal resize** | The user resizes the Windows Terminal window; the remote PTY must update. Without resize propagation, fullscreen apps misrender. | MEDIUM | On Windows there is no `SIGWINCH`. Resize events arrive as `INPUT_RECORD` structures in the console input buffer (type `WINDOW_BUFFER_SIZE_RECORD`) — there is no VT encoding for them. `crossterm::event::Event::Resize` wraps this cross-platform. The Windows client must poll for this event type and send the same `Resize` message the Linux client sends. |
+| **Windows client: on-disk Ed25519 key signing** | The Windows client must authenticate using an existing OpenSSH private key. Windows ssh-agent/Pageant integration is deferred; on-disk key signing is the explicitly bounded temporary path. | MEDIUM | `ssh-key` 0.6.7 parses `~/.ssh/id_ed25519` (OpenSSH private key format). `PrivateKey::sign()` with `ed25519-dalek` produces the same Ed25519 signature the Linux ssh-agent path produces. Key material must be zeroed after use (`zeroize`). Passphrase-encrypted keys require a prompt (see below — P2). |
+| **Windows client: TERM and locale propagation** | Without a correct `TERM` sent to the server, terminfo-aware programs emit wrong sequences. | LOW | Same mechanism as Linux: client reads `TERM` env var (default `xterm-256color` if unset on Windows) and includes it in the session-open message. `LC_ALL`, `LANG` follow the same whitelist pattern as Linux. Windows does not have locale env vars by default; the client should send `LANG=en_US.UTF-8` as a safe default if not set. |
 
-## 3. Anti-Features
+### Differentiators (Competitive Advantage)
 
-Explicitly NOT building. Scope guardrails.
+Features that make nosh meaningfully better than Mosh or ET for this milestone's goals.
 
-| Anti-Feature | Why It Seems Appealing | Why We Reject It | What We Do Instead |
-|--------------|----------------------|-----------------|-------------------|
-| **Being a terminal emulator** | "Full terminal support" sounds good | nosh is a transport layer, not an emulator; implementing VT state on the client is only needed for predictive echo (M4) and scrollback (M5) — doing it now bloats scope | Pass bytes through; let the local terminal emulator (iTerm2, Windows Terminal, etc.) do rendering |
-| **Cipher/algorithm negotiation** | "Security flexibility" | A negotiation protocol is a downgrade-attack surface; it adds complexity, a protocol version to maintain, and the negotiation itself is a TLS anti-pattern (TLS 1.3 already does this correctly) | TLS 1.3 via rustls; algorithm agility lives in the TLS layer, not our application layer |
-| **Web/browser client** | WebTransport is on the roadmap anyway | Browser client is a full product (UI, auth flow, clipboard integration); WebTransport topology (M7) is server-to-server plumbing, not a browser UI | Document that the HTTP/3 wire shape is browser-compatible; build the browser UI only if there's explicit demand |
-| **SSH CA certificate mapping** | "Enterprise key management" | SSH CA certs (`ssh-keygen -s`) don't map to X.509; the mapping is non-trivial and unproven in rustls | Raw-key trust (`authorized_keys` / RPK) first; CA mapping is a separate workstream |
-| **Custom UDP protocol** (Mosh's SSP) | Direct control of wire format | We get datagram framing from QUIC RFC 9221 for free; re-inventing at the UDP layer means losing QUIC's congestion control, migration, TLS | QUIC unreliable datagrams (RFC 9221) for state sync; no custom UDP |
-| **TCP fallback (this milestone)** | "Reliability" for firewalled users | Adds a second transport path to prove and maintain; distracts from the core QUIC hypothesis | QUIC/UDP/443 only for the spike; TCP fallback is a topology concern deferred to M7 |
-| **0-RTT early data** | Faster reconnect | Replayable; only saves 1 RTT on cold reconnect, which is dwarfed by Wi-Fi/DHCP bring-up; the anti-replay burden isn't worth it | 1-RTT default; revisit only if profiling demonstrates real latency pain |
-| **Interactive multiplexer (tmux/screen built-in)** | "Feature parity with ET+tmux combo" | ET delegates scrollback to tmux control mode for good reason — building a full multiplexer is a separate product | Native scrollback via synced buffer (M5); channel multiplexing (M5); don't build a multiplexer |
-| **Inbound server port range** (Mosh model) | Mosh does it this way | Requires the client to reach back to a server-chosen port; hostile to NAT/firewalls; the central complaint about Mosh's architecture | Single UDP/443; server listens, client connects |
-| **`SSH_AUTH_SOCK` forwarding via environment** | "Convenient agent forwarding" | Privilege-escalation footgun; env vars are forwarded to child processes and subshells, leaking agent access unintentionally | Dedicated agent forwarding channel (M5); `SSH_AUTH_SOCK` is explicitly stripped from the env whitelist at M2 |
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| **QUIC migration: zero-RTT, zero-code, invisible** | Mosh roams by detecting the new client source address and re-sending to it (within seconds, with a visible stall when the network has already changed). ET roams by dropping the TCP connection and reconnecting (user sees "reconnecting" briefly). QUIC migration is instantaneous at the transport layer — no application round-trip, no reconnect, no re-auth. This is the headline differentiator over both incumbents. | LOW | The feature complexity is genuinely low because `ServerConfig::migration = true` is almost all the nosh code required. The differentiation comes from QUIC's architecture, not from application logic nosh writes. The claim "your shell just keeps working" is accurate and demonstrable. |
+| **Reattach authorization via SSH identity (not a session password)** | ET's reattach uses a server-generated session password separate from the user's SSH identity. nosh binds reattach to the same SSH key used for authentication — reattach is as secure as the original login, and the user manages one credential, not two. A stolen reattach token plus a different key is rejected. | HIGH | ET uses a bootstrap-phase password valid for the session duration. nosh requires both the token AND the TLS-handshake identity check. This is the correct design for a tool that advertises "reuses your SSH keys" — the reattach path must be as strong as the initial auth path. |
+| **Session persistence without a separate daemon** | Mosh has no reattach at all (orphaned sessions accumulate silently). ET requires `etserver` as a persistent daemon process. nosh's server is a single `systemd`-managed binary that manages all sessions internally via `SessionManager` — no separate daemon, no auxiliary service, simpler deployment. | MEDIUM | `SessionManager` is an in-process registry. Sessions are lightweight (PTY handle + shell PID + output ring-buffer + identity). Multiple concurrent sessions from different identities are all held in one process. |
+| **First native Windows client without WSL** | Mosh has no Windows client. ET's Windows support is through WSL or limited native builds. nosh will have a native Windows client (Windows Terminal, crossterm, on-disk key) that works without WSL — opening the tool to a large population of Windows developers who use SSH from Windows Terminal daily. | MEDIUM | quinn and tokio both build for `x86_64-pc-windows-msvc`. `crossterm` is explicitly cross-platform. The nosh-client portability shim (`#[cfg(unix)]` / `#[cfg(windows)]`) isolates platform-specific signing and raw-mode handling. The main challenge is CI/cross-compile setup. |
+| **Roaming headless-testable** | Mosh and ET roaming is effectively only human-verified. nosh's architecture (QUIC migration + forced-path-change test) allows a headless CI test of migration using two network interfaces (or `ip addr add` / `ip route` manipulation). This validates the feature deterministically, not just in live demos. | MEDIUM | The forced-path-change test uses the Linux `ip` tool to simulate an address change. A real Wi-Fi→cellular live check remains a human-verified complement. Having both gives confidence. |
 
----
+### Anti-Features (Commonly Requested, Often Problematic)
 
-## 4. Cheap Now, Painful to Retrofit Later
-
-Low-cost items to include in the spike that become expensive or architecturally invasive to add later.
-
-| Feature | Why Cheap Now | Why Painful Later | Spike Action |
-|---------|--------------|------------------|-------------|
-| **Environment-variable sanitization** | One pass at shell spawn time; the list is known (from quicshell spec and SSH hardening practice) | Retrofitting means auditing every call site that opens a shell; subtle security regressions possible | Implement at M2 session open: strip `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PYTHONPATH`, `NODE_OPTIONS`; whitelist `TERM`, `LC_*`, `TZ`; never pass `SSH_AUTH_SOCK` |
-| **Resize-burst coalescing** | A debounce timer (~30–50 ms) at the point where SIGWINCH is caught; a few lines | Later the resize message path may be entangled with session resumption and migration logic | Implement in the SIGWINCH handler at M2; debounce before emitting a resize message |
-| **Server-side session object** | A struct holding `{session_id, ssh_identity, pty_handle, shell_pid, idle_since}` is almost free to define now | Cold-reattach (M3) requires this object to survive across connection drop; if the session lifecycle is not structured as an object from the start, M3 requires a refactor of the connection handler | Define the session struct and give each session a UUID at M2; don't implement reattach yet, but don't inline everything into the connection handler either |
-| **Exit-code forwarding** | `Child::wait()` already returns `ExitStatus`; encoding it in a close frame is trivial | If the close protocol is not defined now, any future feature that needs to know why the session ended (logging, automation, scripting) requires a protocol extension | Include an explicit `SessionClose { exit_code: u32, reason: CloseReason }` control frame in the protocol from M0/M2 |
-| **Locale / `LC_*` pass-through** | Part of the env whitelist; negligible extra work | Without locale, non-ASCII input/output may silently corrupt; some tools fail in C locale; users report broken shells immediately | Add `LC_*` and `LANG` to the whitelist alongside `TERM` and `TZ` |
-| **Structured connection-close (not just TCP-hang-up)** | Define an explicit close message in the control framing now | If the connection close is just "stream EOF", distinguishing clean exit from network drop in later features (roaming, logging, scripting) is ambiguous | Protocol-level: close message with reason code (shell exited, auth failed, server shutdown); use QUIC connection close frame with application error codes |
-| **Per-session logging skeleton** | A `tracing` span per session with `session_id`, `peer_addr`, `username` fields costs nothing | Debugging production session issues (why did this session drop? what was the exit code?) is very painful without structured logs | Instrument session open/close/resize events with `tracing`; no performance cost in release builds |
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| **Session reattach by name/number** | "I want to pick which session to reattach to" — tmux-style named session selection. | Requires a session enumeration protocol (leaks session metadata), a selection UI, and complicates the reattach handshake. At this milestone there is at most one orphaned session per identity (or a small cap). | Automatic latest-session reattach for the authenticated identity. Named sessions are M5+ if needed. |
+| **0-RTT reattach** | "Faster resume from suspend" — skip one round-trip vs 1-RTT. | 0-RTT QUIC early data is replayable. The `Reattach` message carries a token and last-acked sequence. Replay against a server that already accepted the message produces a duplicate session bind — undefined behavior. The latency gain is imperceptible: 1 RTT is dwarfed by Wi-Fi/DHCP bring-up (hundreds of ms). | 1-RTT is the correct default. 0-RTT is explicitly deferred and should only be reconsidered with measured latency profiling data. |
+| **Windows ssh-agent / Pageant integration (v1.1)** | Windows developers use Pageant or Win32-OpenSSH agent. This is architecturally correct and desirable. | Correct in a later milestone, but adds Windows named-pipe IPC plumbing that is out of scope for the bounded Windows-client slice. On-disk key is the explicitly scoped interim. | On-disk key signing for v1.1 Windows client. Agent integration deferred. |
+| **Idle timeout on by default** | "Prevent zombie sessions from accumulating." | Mosh's open issue history shows users who leave sessions overnight and return to find them killed consider this a regression from mosh-server's model. The per-identity cap handles the real concern (memory bounds) without surprising users. | Per-identity session cap (bounds memory). Idle timeout configurable but off by default. |
+| **Mosh-style always-visible status bar** | "Show network quality / connection state at the bottom." | A status bar requires terminal real-estate, conflicts with fullscreen apps, and is only meaningful with latency/packet-loss data (requires predictive echo M4 to be useful). | Structured tracing logs per session give operator visibility. A status indicator is deferred to M4. |
+| **TCP fallback during migration** | "What if UDP/443 is blocked mid-session?" | For a network that blocks UDP, the session never established in the first place — this is a connect-time concern, not a migration concern. Adding a second transport path mid-session is a different feature from migration. | TCP/WebTransport fallback is an M7 topology concern, not a migration feature. |
+| **Mosh-style inbound port range for reattach** | "Server opens a new port for each reattached session." | Requires the client to reach back to a server-chosen ephemeral port — NAT/firewall hostile. This is the central complaint about Mosh's architecture and the exact problem QUIC solves. | Single UDP/443 for all sessions, including reattach. The new QUIC connection uses the same server port. |
 
 ---
 
 ## Feature Dependencies
 
 ```
-[QUIC datagram + stream coexistence] (M0)
-    └──required by──> [SSH-key mutual auth] (M1)
-                          └──required by──> [PTY + interactive shell] (M2)
-                                                └──required by──> [Roaming / migration] (M3)
-                                                                      └──required by──> [Cold reattach] (M3)
-                                                └──required by──> [Predictive echo] (M4)
-                                                └──required by──> [Scrollback / forwarding] (M5)
+[v1.0 validated stack: QUIC, auth, PTY, I/O, resize, env sanitization]
+    └──prerequisite for──> [all v1.1 features]
 
-[Raw-mode client terminal]
-    └──required by──> [Keystroke delivery]
-    └──required by──> [Window resize propagation]
+[Session.identity threading] ← first task
+    └──required by──> [Cold reattach authorization (identity check)]
+    └──required by──> [Session persistence keyed by identity fingerprint]
+    └──required by──> [Per-identity session cap]
 
-[Server-side session object] (cheap-now)
-    └──required by──> [Cold reattach] (M3)
-    └──required by──> [Session multiplexing] (M5)
+[Server-side session persistence (SessionManager + orphaned state)]
+    └──required by──> [Cold reattach (something to reattach to)]
+    └──required by──> [Output ring-buffer for replay]
 
-[Env sanitization] (cheap-now)
-    └──independent but must precede──> [Shell spawn] (M2)
+[Output sequence numbering + ring-buffer]
+    └──required by──> [Cold reattach output replay]
 
-[Exit-code forwarding] (cheap-now)
-    └──enables──> [Scripting / CI use of nosh]
+[Reattach token (CSPRNG, stored in Session)]
+    └──required by──> [Cold reattach first factor check]
+
+[QUIC ServerConfig::migration = true]  ← nearly independent
+    └──enables──> [NAT rebind survival (automatic)]
+    └──enables──> [Explicit path switch (automatic)]
+    └──independent of──> [Session persistence]
+    └──independent of──> [Cold reattach]
+
+[Windows: crossterm raw mode + resize event polling]
+    └──required by──> [Windows client: usable interactive shell]
+    └──required by──> [Windows client: terminal resize propagation]
+
+[Windows: on-disk key parsing + signing (ssh-key + ed25519-dalek)]
+    └──required by──> [Windows client: TLS handshake authentication]
 ```
 
 ### Dependency Notes
 
-- **PTY requires QUIC connection**: obvious, but worth stating — M0 (transport) must pass before M1 (auth), which must pass before M2 (session).
-- **Predictive echo requires VT state on client**: the client must parse terminal escape sequences to maintain a local state model; this is non-trivial and is the reason M4 is a dedicated milestone.
-- **Session object is not a hard dependency for the spike**, but its absence makes M3 a refactor rather than an additive feature — worth the trivial upfront cost.
-- **Agent forwarding must not use `SSH_AUTH_SOCK`**: the env sanitization and the agent-forwarding channel (M5) are complementary, not alternatives; both are correct.
+- **Session.identity threading is the critical prerequisite**: it must be the first
+  implementation task. Session persistence keying, reattach identity check, and per-identity
+  cap all depend on it. It was deliberately left as a v1.0 seam.
+- **QUIC migration is nearly independent**: enabling migration requires one server-side config
+  flag. No session state is involved. It can be validated as soon as the v1.0 server code is
+  compiled with `ServerConfig::migration = true`. It does not depend on identity threading.
+- **Session persistence must precede cold reattach**: there is nothing to reattach to until the
+  session survives the connection dropping.
+- **Output ring-buffer is a new subsystem**: v1.0 delivers bytes on a reliable stream but
+  maintains no application-layer sequence number. Adding the ring-buffer and seq counter to the
+  session output path is the principal implementation complexity of cold reattach.
+- **Windows client is largely independent**: it shares nosh-proto message types and the same
+  connection/auth flow, but its platform-specific code (crossterm raw mode, on-disk signing) is
+  isolated to nosh-client under `#[cfg]` gates. It can be developed in parallel with session
+  persistence work once Session.identity is threaded (because the auth path is shared).
+- **Migration and cold reattach are complementary, not redundant**: migration keeps the
+  *same* QUIC connection alive through a path change (handled inside quinn). Cold reattach
+  creates a *new* QUIC connection to an orphaned session (handled in the nosh application layer).
+  These are distinct code paths with distinct UX triggers.
 
 ---
 
-## MVP Definition (Spike = M0–M2)
+## MVP Definition
 
-### The spike is DONE when:
+### v1.1 Launch Requirements
 
-- [ ] QUIC client and server exchange datagram frames and bidirectional stream data on UDP/443 (M0)
-- [ ] Datagrams and streams demonstrably coexist without interference (M0)
-- [ ] Client authenticates to server using Ed25519 SSH key against `authorized_keys`; server host key checked against `known_hosts`/TOFU (M1)
-- [ ] Signing routed through `ssh-agent`; private key never handled directly (M1)
-- [ ] Server spawns a real PTY and login shell (M2)
-- [ ] Keystrokes flow client→server; shell output flows server→client; the session is interactively usable (M2)
-- [ ] `vim`, `htop`, `bash` readline work correctly (raw mode + TERM + correct initial PTY size) (M2)
-- [ ] Window resize propagates to server PTY with burst coalescing (M2)
-- [ ] Environment sanitized on shell open (LD_*, DYLD_*, BASH_ENV, IFS, etc. stripped; TERM/LC_*/TZ whitelisted) (M2)
-- [ ] Remote exit code propagated to client process exit code (M2)
-- [ ] Server-side session struct defined (session_id, identity, PTY handle) even though reattach is not implemented (M2)
+The milestone is done when all of these pass:
 
-### Explicitly NOT in scope for the spike:
+- [ ] **Session.identity threaded** — authenticated peer SPKI extracted and stored in `Session.identity` post-handshake; existing live-handshake tests still pass
+- [ ] **Connection migration (NAT rebind)** — headless test: forced source address/port change while a stream is active; stream continues without application-level reconnect
+- [ ] **Connection migration (path switch)** — headless test via dual-interface or `ip addr` manipulation; human-verified Wi-Fi→cellular live check as complement
+- [ ] **Session persistence** — server session survives QUIC connection drop; PTY+shell continues running; session enters orphaned state; configurable idle timeout (default off); per-identity cap enforced
+- [ ] **Cold reattach (1-RTT)** — new QUIC connection from same identity sends `Reattach{token, last_acked_seq}`; server validates identity + token; output since `last_acked_seq` replayed; session rebound; headless test passes
+- [ ] **Reattach identity binding** — reattach attempt from a different SSH identity (different SPKI) with a valid token is rejected
+- [ ] **Windows client: VT raw mode** — `crossterm::terminal::enable_raw_mode()` called on Windows; interactive programs (vim, htop) work correctly against Linux server
+- [ ] **Windows client: terminal resize** — Windows Terminal window resize fires `crossterm::event::Event::Resize`; client sends `Resize` to server; `stty size` updates
+- [ ] **Windows client: on-disk key signing** — client reads `~/.ssh/id_ed25519`, signs with `ssh-key` + `ed25519-dalek`; authenticates against Linux server `authorized_keys`; TLS handshake passes
 
-- Roaming / connection migration
-- Predictive echo
-- Scrollback, forwarding, multiplexing
-- macOS or Windows
-- WebTransport, NAT punch, relay
-- 0-RTT
-- Terminal emulation on client
+### Add After Validation (Post-v1.1)
+
+- [ ] **Windows ssh-agent / Pageant integration** — deferred; requires Windows named-pipe IPC
+- [ ] **Passphrase-encrypted on-disk key prompt** — `rpassword` or similar; prompting UX is not in the v1.1 bounded slice, but unencrypted keys work
+- [ ] **Connection status indicator** — meaningful only with latency data from M4 (predictive echo)
+- [ ] **Per-identity session list** — enumerate and select a specific orphaned session; M5+
+
+### Future Consideration (v2+)
+
+- [ ] **Named/numbered sessions** — tmux-style; M5+
+- [ ] **0-RTT reattach** — only with profiling data showing 1-RTT matters
+- [ ] **Status bar** — only with M4 predictive echo data
+
+---
+
+## Feature Prioritization Matrix
+
+| Feature | User Value | Implementation Cost | Priority |
+|---------|------------|---------------------|----------|
+| Session.identity threading | HIGH (enables all reattach + persistence) | LOW (seam fill, not new design) | P1 |
+| QUIC connection migration | HIGH (headline differentiator) | LOW (one server config flag) | P1 |
+| Server-side session persistence | HIGH (user expectation from Mosh) | MEDIUM (SessionManager, orphan state) | P1 |
+| Output ring-buffer + sequence numbering | HIGH (required for cold reattach replay) | MEDIUM (new subsystem) | P1 |
+| Cold reattach (1-RTT) | HIGH (ET's key UX contribution) | HIGH (new proto messages + replay logic) | P1 |
+| Reattach identity binding | HIGH (security table stakes) | LOW (piggybacks on identity threading) | P1 |
+| Reattach token entropy | MEDIUM (security hygiene) | LOW (CSPRNG at session creation) | P1 |
+| Per-identity session cap | MEDIUM (memory safety) | LOW (counter in SessionManager) | P1 |
+| Windows VT raw mode | HIGH (without it Windows client unusable) | LOW (crossterm + cfg flag) | P1 |
+| Windows terminal resize | HIGH (fullscreen apps break without it) | LOW (crossterm event + cfg) | P1 |
+| Windows on-disk key signing | HIGH (required for Windows auth) | MEDIUM (ssh-key parse + ed25519 sign) | P1 |
+| Windows TERM/locale propagation | MEDIUM (UX polish) | LOW | P1 |
+| Configurable idle timeout | MEDIUM (operator safety) | LOW (timer in SessionManager) | P2 |
+| Passphrase-encrypted key (Windows) | MEDIUM (most production keys are encrypted) | MEDIUM (interactive prompt) | P2 |
+| Connection status indicator | LOW (UX polish; blocked on M4) | HIGH | P3 |
 
 ---
 
 ## Competitor Feature Analysis
 
-| Feature | Mosh | Eternal Terminal | nosh M0–M2 spike | nosh full (M7) |
-|---------|------|-----------------|-----------------|----------------|
-| Raw-mode PTY + TERM | Yes | Yes | Yes | Yes |
-| Window resize | Yes | Yes | Yes | Yes |
-| Exit code propagation | No (always 0) | Yes | Yes | Yes |
-| Roaming / IP-change survival | Yes (custom UDP) | Yes (TCP reconnect) | No | Yes (QUIC migration) |
-| Cold-reattach / resume | No | Yes (BackedReader) | No | Yes (1-RTT sequence) |
-| Predictive local echo | Yes (excellent) | No | No | Yes |
-| Native scrollback | No | Yes | No | Yes |
-| SSH agent forwarding | No | Yes | No | Yes |
-| Port forwarding | No | Yes | No | Yes |
-| Session multiplexing | No | Partial (tmux CC) | No | Yes |
-| UDP/443 (firewall-safe) | No (60000–61000 range) | No (TCP/2022) | Yes | Yes |
-| Existing SSH keys | Partial | Yes (SSH handshake) | Yes | Yes |
-| Hardware key (YubiKey) | No | No | Yes (ssh-agent) | Yes |
-| Windows native | No | No | No | Yes (M6) |
+| Feature | Mosh | Eternal Terminal | nosh v1.1 |
+|---------|------|-----------------|-----------|
+| Roaming / IP-change survival | Yes — detects new source addr, re-sends within seconds; brief stall visible to user | Yes — TCP drop + reconnect; user sees "reconnecting" briefly | Yes — QUIC migration, zero extra round trips, completely invisible to user |
+| Session persistence (server survives client disconnect) | Yes — mosh-server runs until shell exits; no idle timeout by default; no reattach possible; orphaned sessions accumulate | Yes — etserver daemon persists; idle timeout configurable | Yes — SessionManager in-process; idle timeout off by default; per-identity cap |
+| Cold reattach | No — cannot reattach to a detached mosh session; each `mosh` invocation starts a new session | Yes — BackedReader/BackedWriter byte-offset sequence numbers; client reconnects with same client-id; server replays missing bytes; RETURNING_CLIENT response | Yes — 1-RTT `Reattach{token, last_acked_seq}`; server replays undelivered output; identity check required |
+| Reattach authorization | N/A | Session password (separate from SSH key; not bound to user's identity) | SSH identity binding (same key used for initial auth; token + identity check both required) |
+| Transport | Custom UDP SSP; server opens port range 60000–61000; NAT/firewall hostile | TCP with reconnect; head-of-line blocking | QUIC/UDP/443; HTTP/3 wire shape; NAT/firewall friendly |
+| Windows client | No native client | Limited; primarily WSL | Native Windows client (crossterm + on-disk key); no WSL required |
+| Auth model | SSH key at bootstrap only; SSP session key thereafter | SSH key at bootstrap; session key thereafter | SSH key throughout TLS handshake via SPKI pinning; reattach also bound to SSH identity |
+| Predictive echo | Yes (excellent, Mosh's killer feature) | No | Deferred to M4 |
+| Firewall-friendly port | No (60000–61000 range) | No (TCP/2022 default) | Yes (UDP/443 only) |
+| Hardware key (YubiKey) | No | No | Yes via ssh-agent (Linux); on-disk key only (Windows v1.1) |
 
 ---
 
 ## Sources
 
-- INIT.md (project brief §3 goals, §8 feature checklist, §12 quicshell prior art)
-- .planning/PROJECT.md (Active requirements, Out of Scope)
-- Mosh paper: https://mosh.org/mosh-paper-draft.pdf
-- Mosh SSH agent issue (open since 2012): https://github.com/mobile-shell/mosh/issues/120
-- HN: Mosh vs ET user discussion: https://news.ycombinator.com/item?id=34069759
-- portable-pty API: https://docs.rs/portable-pty/latest/portable_pty/
-- RFC 4254 (SSH Connection Protocol — exit status, signal delivery): https://datatracker.ietf.org/doc/html/rfc4254
-- quicshell spec (env sanitization, resize coalescing, control-first channels): borrowed via §12 of INIT.md
-- SEI CERT C ENV03-C (env sanitization rationale): https://wiki.sei.cmu.edu/confluence/display/c/ENV03-C.+Sanitize+the+environment+when+invoking+external+programs
+- INIT.md §3 (goals), §8 (feature checklist), §10 (milestone path with M3 detail), §12 (quicshell prior art)
+- .planning/PROJECT.md (Active requirements, Out of Scope, Key Decisions)
+- .planning/milestones/v1.0-research/FEATURES.md (v1.0 feature research; deferred items now in scope)
+- .planning/MILESTONES.md (v1.0 shipped state, v1.1 active)
+- Mosh session persistence / orphan issues: https://github.com/mobile-shell/mosh/issues/394 and https://github.com/mobile-shell/mosh/issues/806
+- Mosh idle timeout configuration (MOSH_SERVER_NETWORK_TMOUT): https://manpages.debian.org/unstable/mosh/mosh-server.1.en.html
+- Eternal Terminal protocol (BackedReader/BackedWriter, SequenceHeader, CatchupBuffer, RETURNING_CLIENT): https://github.com/MisterTea/EternalTerminal/blob/master/docs/protocol.md
+- ET how it works: https://eternalterminal.dev/howitworks/
+- QUIC connection migration transparent to application: https://pulse.internetsociety.org/blog/how-quic-helps-you-seamlessly-connect-to-different-networks
+- quic-go migration docs (PATH_CHALLENGE/PATH_RESPONSE, automatic NAT rebind): https://quic-go.net/docs/quic/connection-migration/
+- quinn ServerConfig::migration API: https://docs.rs/quinn/latest/quinn/struct.ServerConfig.html
+- crossterm raw mode and resize events (Windows INPUT_RECORD / WINDOW_BUFFER_SIZE_RECORD): https://docs.rs/crossterm/latest/crossterm/terminal/index.html
+- Windows VT processing console modes (ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING): https://github.com/PowerShell/Win32-OpenSSH/issues/1310
+- ssh-key 0.6.7 private key parsing and signing: https://docs.rs/ssh-key/latest/ssh_key/
 
 ---
-*Feature research for: nosh — QUIC-based roaming remote shell (architecture-validation spike)*
-*Researched: 2026-05-29*
+*Feature research for: nosh v1.1 — M3 Roaming + Windows Client*
+*Researched: 2026-05-30*

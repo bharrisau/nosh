@@ -1,294 +1,265 @@
 # Stack Research
 
-**Domain:** QUIC-based roaming remote shell (Rust) — M0–M2 architecture-validation spike
-**Researched:** 2026-05-29
-**Confidence:** HIGH (all crate versions verified against docs.rs/crates.io live data)
+**Domain:** QUIC-based roaming remote shell (Rust) — v1.1 M3 Roaming + Windows Client
+**Researched:** 2026-05-30
+**Confidence:** HIGH (all crate versions and APIs verified against docs.rs live data)
 
 ---
 
-## Recommended Stack
+## Existing Validated Stack (v1.0 — DO NOT RE-RESEARCH)
 
-### Core Technologies
-
-| Technology | Version | Purpose | Why Recommended |
-|------------|---------|---------|-----------------|
-| `quinn` | 0.11.9 | QUIC transport (client + server) | Only mature async/tokio QUIC crate in Rust; RFC 9221 datagram support built in; `rustls` backend is first-class; active maintenance (quinn-rs org) |
-| `rustls` | 0.23.40 | TLS 1.3 (used via quinn's crypto layer) | RFC 7250 raw public key support shipped in 0.23.16 (Oct 2024); `AlwaysResolvesServerRawPublicKeys` and `AlwaysResolvesClientRawPublicKeys` ready to use; custom `SigningKey`/`Signer` traits enable ssh-agent delegation |
-| `tokio` | 1.52.x (LTS until Mar 2027) | Async runtime | quinn's default and only production-quality async I/O for QUIC; 1.47.x and 1.51.x are current LTS lines |
-| `portable-pty` | 0.9.0 | Cross-platform PTY (Linux + future Windows) | wezterm's battle-tested PTY abstraction; trait-based so ConPTY can drop in for M6; `native_pty_system()` → `openpty()` → `spawn_command()` pattern is clean |
-| `ssh-key` | 0.6.7 | Parse OpenSSH public/private keys, authorized_keys, known_hosts | RustCrypto project; pure Rust; parses all common key types (Ed25519, ECDSA, RSA); `authorized_keys` and `known_hosts` module support built in; `ed25519` feature enables keygen/sign/verify |
-| `ssh-agent-client-rs` | 1.1.2 | ssh-agent protocol client | Provides `Client::sign(&mut self, key: impl Into<Identity>, data: &[u8]) -> Result<Signature>`; connects via Unix socket; synchronous API suitable for use inside blocking `rustls::sign::Signer::sign()` |
-
-### Supporting Libraries
-
-| Library | Version | Purpose | When to Use |
-|---------|---------|---------|-------------|
-| `ed25519-dalek` | 2.2.0 | Ed25519 public key material (verify agent signatures in tests; derive SPKI) | Use stable 2.2.0; 3.0.0-pre.7 exists (2026-05-06) but is pre-release — avoid in spike |
-| `rcgen` | 0.14.8 | Generate ephemeral self-signed X.509 certs (cert-pinning fallback) | Use if RPK config is too involved for initial spike — see RPK vs Cert-Pinning section below |
-| `vte` | 0.15.0 | VT/ANSI parser for server-side terminal state model | Alacritty project; implements Paul Williams state machine; use for M2 terminal model; `Perform` trait is the extension point |
-| `bytes` | 1.x | Zero-copy byte buffer (already a quinn transitive dep) | Frame serialisation / datagram payload handling |
-| `tracing` | 0.1.x | Structured async logging (already a quinn transitive dep) | Prefer over `log` for async spans |
-
-### Development Tools
-
-| Tool | Purpose | Notes |
-|------|---------|-------|
-| `cargo nextest` | Faster test runner | Parallel test execution; useful for integration tests that bind ports |
-| `quinn` `qlog` feature | QUIC event logging | Enable for transport-level debugging during spike; `TransportConfig` events |
-| OpenSSL or ssh-keygen | Generate test keys | Generate Ed25519 test keys for authorized_keys/known_hosts fixtures; no Rust dep needed |
+| Technology | Pinned Version | Role |
+|------------|---------------|------|
+| `quinn` | 0.11.9 | QUIC transport |
+| `rustls` | 0.23.x | TLS 1.3 (via quinn) |
+| `tokio` | 1.52.x | Async runtime |
+| `portable-pty` | 0.9.0 | PTY (Linux) |
+| `ssh-key` | 0.6.7 | Key parsing / authorized_keys / known_hosts |
+| `ssh-agent-client-rs` | 1.1.x | Agent signing (Linux) |
+| `ed25519-dalek` | 2.2.0 | Ed25519 material |
+| `vte` | 0.15.0 | VT parser |
+| `rcgen` | 0.14.x | Ephemeral self-signed certs |
+| `crossterm` | 0.28.1 | Client terminal raw mode + event reading |
+| `postcard` + `serde` | 1.x / 1.x | Frame serialization |
+| `bytes`, `tracing`, `anyhow`, `thiserror`, `clap` | — | Shared utilities |
+| `uuid` | 1.x (v4) | Session IDs (server) |
+| `nix` | 0.29 | Signal handling (server, Linux) |
+| `dirs` | 5.x | Platform path resolution |
+| `x509-parser` | 0.18 | SPKI extraction from TLS certs |
 
 ---
 
-## Cargo.toml Sketch
+## v1.1 Stack Additions and Changes
+
+### 1. QUIC Connection Migration (quinn 0.11.9)
+
+**No new crate required.** Migration is already implemented inside quinn 0.11.9. The findings below are the authoritative API surface.
+
+#### How migration works in quinn 0.11.9
+
+**NAT rebinding (passive — zero code change needed):** When the client's source UDP 4-tuple changes due to NAT rebind, the server receives packets from the new address. With `ServerConfig::migration(true)` (the DEFAULT), quinn-proto automatically runs PATH_CHALLENGE/PATH_RESPONSE on the new path. If path validation succeeds, the connection migrates. No application-level call is needed on either side. `Connection::remote_address()` will reflect the new address after migration. This is the behavior that handles Wi-Fi→cellular IP change at the OS/NAT level.
+
+**Deliberate interface switch (active — client must call `Endpoint::rebind`):** When the client deliberately switches to a new network interface (e.g., binding a new local UDP socket), the application must call `Endpoint::rebind(socket: UdpSocket) -> Result<()>` or `Endpoint::rebind_abstract(socket: Arc<dyn AsyncUdpSocket>) -> Result<()>`. These methods replace the underlying UDP socket live across all active connections, sending a `ConnectionEvent::Rebind` to each connection driver. The QUIC layer then probes the new path with PATH_CHALLENGE.
+
+**Warning from docs:** `Endpoint::rebind` — "Incoming connections and connections to servers unreachable from the new address will be lost." This is expected: the intent is exactly to change the local socket when the network interface changes.
+
+#### Exact method signatures (verified, quinn 0.11.9)
+
+```rust
+// On Endpoint
+pub fn rebind(&self, socket: UdpSocket) -> Result<()>
+pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> Result<()>
+pub fn local_addr(&self) -> Result<SocketAddr>
+
+// On ServerConfig
+pub fn migration(&mut self, value: bool) -> &mut ServerConfig  // default: true
+
+// On Connection (complete method list — no migrate/set_path/network_path exist)
+pub fn remote_address(&self) -> SocketAddr   // updates after migration
+pub fn local_ip(&self) -> Option<IpAddr>     // local side; may be None on some platforms
+pub fn rtt(&self) -> Duration
+pub fn stats(&self) -> ConnectionStats       // includes PathStats (rtt, cwnd, lost_packets, current_mtu)
+pub fn stable_id(&self) -> usize             // stable for connection lifetime; use as session map key
+// ... open_bi, accept_bi, open_uni, accept_uni, send_datagram, read_datagram, close, etc.
+```
+
+**Methods that do NOT exist in 0.11.9:**
+- `Connection::migrate()` — does not exist
+- `Connection::set_path()` — does not exist
+- `Connection::network_path()` — does not exist
+- `Connection::path()` — does not exist
+
+#### TransportConfig knobs affecting migration quality
+
+```rust
+let mut tc = quinn::TransportConfig::default();
+// Keep-alive prevents idle timeout during quiescent network change
+tc.keep_alive_interval(Some(Duration::from_secs(15)));
+// Generous idle timeout gives cold-reconnect window (Mosh-style persistence)
+tc.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap()));
+// MTU discovery adapts to new path characteristics after migration
+tc.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
+```
+
+#### Connection ID management
+
+`EndpointConfig::cid_generator()` allows custom CID generation (e.g., for load balancers). The default `HashedConnectionIdGenerator` is appropriate for nosh. `Connection::stable_id()` returns a usize that is stable for the lifetime of the connection and is the correct handle for the server-side orphaned-session registry key.
+
+**Confidence: HIGH** — verified from docs.rs/quinn 0.11.9 Connection method enumeration, Endpoint source, quinn-proto connection/mod.rs path migration logic.
+
+---
+
+### 2. Windows Client — Terminal I/O
+
+**`crossterm` already in the tree at 0.28.1. Upgrade to 0.29.0 is recommended.**
+
+#### crossterm 0.28.1 → 0.29.0 upgrade
+
+0.29.0 (released April 5, 2025) adds OSC52 clipboard support (useful for M5), keyboard enhancement flag queries, and rustix 1.0. No breaking API changes for the existing raw-mode + event loop usage. Ratatui and gitui have both bumped to 0.29.0. Recommend bumping crossterm to 0.29.0 in the workspace.
+
+#### Windows MSVC support
+
+crossterm 0.29.0 explicitly lists `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` as supported targets. `enable_raw_mode()` works on Windows 10+ via VT mode; falls back to WinAPI on older systems. Windows 10 is the minimum realistic nosh client target.
+
+#### Async event reading (tokio EventStream)
+
+Enable the `event-stream` feature to get `crossterm::event::EventStream`, which implements `futures::Stream<Item = Result<Event>>` and works with tokio select loops.
 
 ```toml
-[dependencies]
-# Transport
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-
-# TLS / Crypto
-rustls = { version = "0.23", features = [] }  # pulled transitively through quinn; pin here for direct use
-
-# SSH key material
-ssh-key = { version = "0.6", features = ["ed25519", "std"] }
-ssh-agent-client-rs = "1.1"
-ed25519-dalek = "2.2"
-
-# PTY
-portable-pty = "0.9"
-
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# Terminal model (M2)
-vte = "0.15"
-
-# Cert generation fallback
-rcgen = "0.14"
-
-[dev-dependencies]
-# Nothing extra needed for spike tests
+# nosh-client/Cargo.toml
+crossterm = { version = "0.29", features = ["events", "event-stream"] }
+futures = "0.3"  # for StreamExt
 ```
 
-**Note on quinn features:** `rustls-ring` bundles `ring` as the crypto backend; `rustls-aws-lc-rs` is the other option. `ring` is simpler to build on Linux (no system library dependency). Use `aws-lc-rs` later if FIPS is ever required.
+```rust
+use crossterm::event::{EventStream, Event};
+use futures::StreamExt;
+
+let mut event_stream = EventStream::new();
+loop {
+    tokio::select! {
+        Some(Ok(event)) = event_stream.next() => { /* handle */ }
+        // ... other nosh futures
+    }
+}
+```
+
+The existing Linux client already uses crossterm; the same code compiles and runs on Windows MSVC without changes.
+
+**Critical: do NOT enable the `use-dev-tty` feature.** It is Unix-only and breaks the build in combination with `event-stream` (crossterm issue #935). The default Windows path in crossterm does not need this flag.
+
+#### Does quinn/tokio/ring build on `x86_64-pc-windows-msvc`?
+
+Yes. `ring` 0.17.14 ships precompiled assembly objects for `x86_64-windows` in the crates.io package — no NASM assembler required. The only prerequisite is "Build Tools for Visual Studio 2022" with the "Desktop development with C++" workload. `tokio` and `quinn` are pure Rust and build on all MSVC targets. `quinn` uses `socket2` for UDP, which has full Windows support.
+
+**What correctly does NOT build on Windows (excluded from v1.1 Windows client scope):**
+- `nosh-server` — has `portable-pty` (Linux PTY) and `nix` (Unix-only signal/user features)
+- `ssh-agent-client-rs` — Unix socket client; deferred on Windows (Pageant uses named pipes, different protocol)
+
+**Confidence: HIGH** — crossterm 0.29.0 Windows targets verified on docs.rs; ring BUILDING.md precompiled-object claim verified; quinn/tokio known-pure-Rust.
 
 ---
 
-## Critical Design Decisions
+### 3. On-Disk OpenSSH Key Signing (Windows Client)
 
-### RPK vs Self-Signed-Cert Key Pinning
+**No new crate required.** `ssh-key 0.6.7` already in the tree has the complete API.
 
-**Recommendation: Start with cert-pinning (M1), upgrade to RPK in a follow-up.**
-
-**Rationale:**
-
-rustls 0.23.16+ ships `AlwaysResolvesServerRawPublicKeys` and `AlwaysResolvesClientRawPublicKeys`, so RPK is technically available. However, there is a known compliance caveat: GitHub issue #2257 ("UnsolicitedCertificateTypeExtension is not RFC 7250 compliant") was open as of late 2024, indicating the initial 0.23.16 implementation had a wire-format compliance gap. The current 0.23.40 state of that issue is not fully verified.
-
-The cert-pinning path (`rustls::client::danger::ServerCertVerifier` / `rustls::server::danger::ClientCertVerifier` with custom `verify_server_cert()`/`verify_client_cert()` that extract and compare the SubjectPublicKeyInfo rather than walking a PKI chain) is battle-tested, fully supported today, and interoperable with quinn's `dangerous_configuration` feature. It is also what the INIT.md brief calls the "portable fallback" and explicitly accepts as the first implementation path.
-
-**Cert-pinning implementation pattern:**
+#### Loading a private key from disk
 
 ```rust
-// Client side: pin the server's host key
-struct HostKeyVerifier {
-    expected_spki: Vec<u8>, // from known_hosts or TOFU first-contact
-    crypto_provider: Arc<rustls::crypto::CryptoProvider>,
-}
+use ssh_key::PrivateKey;
+use std::path::Path;
 
-impl rustls::client::danger::ServerCertVerifier for HostKeyVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        // Parse cert, extract SPKI, compare to pinned key
-        // Return Ok(ServerCertVerified::assertion()) on match
-    }
-    fn verify_tls12_signature(...) { ... }
-    fn verify_tls13_signature(...) { ... }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> { ... }
-}
+// Requires: ssh-key features "std" (already enabled in the workspace)
+let key = PrivateKey::read_openssh_file(Path::new("/home/user/.ssh/id_ed25519"))?;
+```
 
-// Server side: pin the client key against authorized_keys
-struct AuthorizedKeysVerifier {
-    authorized_keys: Vec<ssh_key::PublicKey>,
-    crypto_provider: Arc<rustls::crypto::CryptoProvider>,
-}
+#### Passphrase-encrypted keys
 
-impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
-    // verify_client_cert: extract SPKI from cert, compare to authorized_keys entries
-    ...
+```rust
+// Requires: ssh-key feature "encryption" (not currently enabled — must add for Windows path)
+if key.is_encrypted() {
+    let passphrase = /* prompt user */;
+    let key = key.decrypt(passphrase.as_bytes())?;
 }
 ```
 
-Wire into quinn:
+The `encryption` feature pulls in `bcrypt-pbkdf`, AES-256-CTR, and ChaCha20Poly1305 — all pure Rust, no native deps, builds on Windows MSVC cleanly. This feature is NOT needed on Linux (where signing goes through ssh-agent), so gate it via `cfg(target_os = "windows")` or a `file-key` Cargo feature to avoid inflating the Linux server binary.
+
+#### Ed25519 signing without ssh-agent
+
+`PrivateKey` implements `signature::Signer` (from the `signature` crate, a transitive dep). For wiring into `rustls::sign::SigningKey`, extract the raw Ed25519 key material and delegate to `ed25519-dalek`:
 
 ```rust
-let rustls_client = rustls::ClientConfig::builder()
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(host_key_verifier))
-    .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(certified_key)));
-    // OR: .with_no_client_auth() for unauthenticated client initially
-
-let quinn_client = quinn::ClientConfig::new(Arc::new(
-    quinn::crypto::rustls::QuicClientConfig::try_from(rustls_client)?
-));
+// Extract dalek SigningKey from ssh_key::PrivateKey
+let ed_kp = private_key.key_data().ed25519()
+    .ok_or(anyhow::anyhow!("not an Ed25519 key"))?;
+// ed_kp.private is the 32-byte seed (+ public key in expanded form)
+// ed25519_dalek::SigningKey::from_bytes(&seed_bytes) gives a dalek key
+// Then implement rustls::sign::Signer::sign(message) via dalek_key.sign(message)
 ```
 
-**Confidence: HIGH** — cert-pinning path is fully documented and used in production (WireGuard-style SSH crates). RPK upgrade is LOW-MEDIUM confidence given the #2257 compliance issue; validate on a later spike branch.
+Signing path: `read_openssh_file → decrypt (if encrypted) → extract Ed25519 bytes → ed25519-dalek::SigningKey → rustls::sign::Signer`. Zero agent round trips. The `WindowsFileSigningKey` struct implementing `rustls::sign::SigningKey` lives in `nosh-auth`, gated on `cfg(windows)` or a `file-key` feature.
+
+**Required feature addition (Windows target only):**
+
+```toml
+# In nosh-auth/Cargo.toml or nosh-client/Cargo.toml, gated:
+[target.'cfg(target_os = "windows")'.dependencies]
+ssh-key = { version = "0.6", default-features = false,
+            features = ["ed25519", "std", "alloc", "encryption"] }
+```
+
+**Confidence: HIGH** — `PrivateKey::read_openssh_file`, `decrypt`, `is_encrypted`, key_data API all verified from docs.rs/ssh-key 0.6.7; encryption feature deps verified from Cargo.toml source.
 
 ---
 
-### ssh-agent → rustls Signing Integration
+### 4. Session Persistence and Reattach Tokens
 
-The `rustls::sign::SigningKey` trait is:
+**No new crates required.** The existing tree already has everything needed.
 
-```rust
-pub trait SigningKey: Debug + Send + Sync {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>>;
-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>>;
-}
+#### Reattach token generation
 
-pub trait Signer: Send + Sync {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error>;
-    fn scheme(&self) -> SignatureScheme;
-}
-```
+`uuid` 1.x with `v4` feature (already in `nosh-server/Cargo.toml`) generates tokens via `Uuid::new_v4()`, which calls `getrandom` internally (CSPRNG-backed OS call). UUID v4 provides 122 bits of entropy — sufficient for an unguessable reattach token. Token is bound to the SSH identity at creation and checked against the re-authenticating peer at reattach time.
 
-`Signer::sign()` is **synchronous and blocking** (rustls doc explicitly acknowledges this as a limitation targeting PKCS#11/HSM scenarios). This matches `ssh-agent-client-rs`, which is also synchronous.
+If 32 bytes of entropy are preferred, `getrandom` is already transitive in the lockfile (0.2.17, 0.3.4, and 0.4.2 all present via ring/ssh-key). `getrandom::fill(&mut [0u8; 32])` — no direct dep addition needed.
 
-**Integration pattern:**
+#### Sequence-numbered resume buffer (ET BackedReader pattern)
 
-```rust
-struct AgentSigningKey {
-    public_key: ssh_key::PublicKey,
-    agent_socket_path: PathBuf,
-    spki_der: Vec<u8>, // cached from public_key
-}
+Application logic over existing quinn streams — no new crate. Pattern:
 
-impl rustls::sign::SigningKey for AgentSigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
-        // For Ed25519: match SignatureScheme::ED25519
-        // For ECDSA P-256: match SignatureScheme::ECDSA_NISTP256_SHA256
-        // For RSA: match SignatureScheme::RSA_PSS_SHA256 or RSA_PKCS1_SHA256
-        if offered.contains(&SignatureScheme::ED25519) {
-            Some(Box::new(AgentSigner {
-                public_key: self.public_key.clone(),
-                socket_path: self.agent_socket_path.clone(),
-                scheme: SignatureScheme::ED25519,
-            }))
-        } else { None }
-    }
+- Server maintains a `VecDeque<(seq: u64, Bytes)>` per orphaned session, bounded by a max-bytes cap (e.g., 1 MiB)
+- Each outbound frame carries an incrementing `seq` field in the nosh-proto envelope (postcard + serde already serializes this)
+- On reattach, client sends `ReattachRequest { session_token, last_acked_seq: u64 }` over a new authenticated connection
+- Server verifies the token matches the claiming identity, then replays `seq > last_acked_seq` frames on the new stream
 
-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
-        Some(SubjectPublicKeyInfoDer::from(self.spki_der.as_slice()))
-    }
-}
+#### Session identity threading (v1.0 seam)
 
-impl rustls::sign::Signer for AgentSigner {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
-        let mut client = ssh_agent_client_rs::Client::connect(&self.socket_path)
-            .map_err(|_| rustls::Error::General("agent connect failed".into()))?;
-        let identity = ssh_key::PublicKey::from(/* ... */);
-        let sig = client.sign(identity, message)
-            .map_err(|_| rustls::Error::General("agent sign failed".into()))?;
-        // Extract raw signature bytes from ssh_key::Signature
-        Ok(sig.as_bytes().to_vec())
-    }
+After handshake: `connection.peer_identity()` returns `Option<Box<dyn Any + Send>>`. For quinn's rustls backend, downcast to `Vec<CertificateDer>`. Extract SPKI with `x509-parser` (already in `nosh-auth`). Parse to `ssh_key::PublicKey`. Store in `Session.identity`. All existing crates; no new deps.
 
-    fn scheme(&self) -> SignatureScheme { self.scheme }
-}
-```
+`Connection::stable_id()` (usize, stable for connection lifetime) is the correct live-connection key for the session map; replaced by the reattach token on disconnect.
 
-**Key notes:**
-- Ed25519: `SignatureScheme::ED25519` maps directly; ssh-agent signs with Ed25519 natively.
-- ECDSA P-256: `SignatureScheme::ECDSA_NISTP256_SHA256`; ssh-agent `sign` flag `0` (default).
-- RSA: ssh-agent uses `sign` flag `4` for `rsa-sha2-256` (maps to `RSA_PSS_SHA256` or `RSA_PKCS1_SHA256`). Flag `8` for `rsa-sha2-512`. The `ssh-agent-client-rs` `sign()` method accepts the identity but does not currently expose flags in the public API (v1.1.2); may need to call the lower-level protocol directly or use `ssh-agent-lib` for RSA flag control.
-- The blocking `sign()` call happens inside the TLS handshake on a tokio thread; wrap in `tokio::task::spawn_blocking` at the point where you drive the quinn/rustls handshake if needed, or accept the brief block on the handshake task.
+#### Per-identity session cap
 
-**Confidence: MEDIUM-HIGH** — Ed25519 path is straightforward; RSA flag handling needs validation against `ssh-agent-client-rs` v1.1.2 source.
+`HashMap<ssh_key::Fingerprint, VecDeque<OrphanedSession>>` in the server, bounded by count or total buffer bytes. `ssh_key::PublicKey::fingerprint(HashAlg::Sha256)` provides the identity hash. No new crates.
+
+**Confidence: HIGH** — uuid v4 → getrandom path verified in lockfile; postcard/serde already used for proto frames; Connection::stable_id and peer_identity verified from docs.rs.
 
 ---
 
-### QUIC DATAGRAM Configuration (RFC 9221)
+## Summary of Cargo.toml Changes
 
-Datagrams are **disabled by default** in quinn. Enable by setting a non-None receive buffer size on `TransportConfig`:
+### Workspace `Cargo.toml`
 
-```rust
-let mut transport = quinn::TransportConfig::default();
-// Enable incoming datagrams with a 1 MiB receive buffer
-transport.datagram_receive_buffer_size(Some(1 << 20)); // 1 MiB
-transport.datagram_send_buffer_size(1 << 20);          // 1 MiB send buffer
-// Tune keep-alive and idle timeout for the spike
-transport.keep_alive_interval(Some(Duration::from_secs(15)));
-transport.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
-
-let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-    quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server_config)?
-));
-server_config.transport_config(Arc::new(transport));
+```toml
+[workspace.dependencies]
+# Add futures for crossterm EventStream (tokio-based async event reading)
+futures = "0.3"
+# Bump crossterm from 0.28.1 to 0.29.0
+crossterm = { version = "0.29", features = ["events"] }
 ```
 
-**Sending/receiving datagrams alongside streams:**
+### `nosh-client/Cargo.toml`
 
-```rust
-// Same Connection object — streams and datagrams are multiplexed automatically
-let conn: quinn::Connection = /* ... */;
+```toml
+# Add event-stream feature (was missing in 0.28.1 entry)
+crossterm = { workspace = true, features = ["event-stream"] }
+futures = { workspace = true }
 
-// Send unreliable datagram
-conn.send_datagram(Bytes::from(payload))?;  // non-blocking, drops if buffer full
-// or:
-conn.send_datagram_wait(Bytes::from(payload)).await?;  // back-pressures
-
-// Receive datagram
-let datagram: Bytes = conn.read_datagram().await?;
-
-// Open reliable bidirectional stream on the same connection
-let (mut send, mut recv) = conn.open_bi().await?;
+# Windows-only: on-disk key signing with passphrase support
+[target.'cfg(target_os = "windows")'.dependencies]
+ssh-key = { version = "0.6", default-features = false,
+            features = ["ed25519", "std", "alloc", "encryption"] }
+# Remove ssh-agent-client-rs from Windows target (Unix socket only)
 ```
 
-`conn.max_datagram_size()` returns `None` if the peer didn't negotiate datagram support or if `datagram_receive_buffer_size` is None on the local endpoint. Always check before sending.
+### `nosh-server/Cargo.toml`
 
-**Confidence: HIGH** — verified from quinn 0.11 docs and TransportConfig API.
+No new dependencies for roaming or session persistence. `uuid` v4 already present.
 
----
+### `nosh-auth/Cargo.toml`
 
-### PTY Spawn and I/O (portable-pty 0.9.0)
-
-```rust
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-let pty_system = native_pty_system();
-let pair = pty_system.openpty(PtySize {
-    rows: 24,
-    cols: 80,
-    pixel_width: 0,
-    pixel_height: 0,
-})?;
-
-// Spawn a login shell
-let mut cmd = CommandBuilder::new("/bin/bash");
-cmd.arg("-l"); // login shell flag; or use "login" as the command
-// Environment sanitization goes here — strip LD_*, BASH_ENV, etc. before spawn
-let mut child = pair.slave.spawn_command(cmd)?;
-
-// I/O handles (the master side)
-let reader = pair.master.try_clone_reader()?;  // Box<dyn Read + Send>
-let writer = pair.master.take_writer()?;       // Box<dyn Write + Send>
-
-// Resize
-pair.master.resize(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 })?;
-
-// Wait for child exit
-let status = child.wait()?;
-```
-
-**Note:** `try_clone_reader()` creates a cloneable reader; `take_writer()` consumes the writer handle (call once). The Read/Write impls are synchronous — bridge to tokio with `tokio::task::spawn_blocking` or `tokio::io::BufReader::new(tokio::fs::File::from_std(...))` via the raw fd (Linux).
-
-**Confidence: HIGH** — verified from docs.rs/portable-pty 0.9.0 API.
+No new crates. Add `WindowsFileSigningKey` implementation gated on `cfg(windows)` using existing `ssh-key` and `ed25519-dalek`.
 
 ---
 
@@ -296,84 +267,61 @@ let status = child.wait()?;
 
 | Category | Recommended | Alternative | Why Not |
 |----------|-------------|-------------|---------|
-| QUIC crate | `quinn` 0.11 | `s2n-quic` (AWS) | s2n-quic is production-grade but uses its own TLS layer (s2n-tls), not rustls — harder to wire ssh-agent signing. quinn's rustls integration is the native path |
-| QUIC crate | `quinn` 0.11 | `quiche` (Cloudflare, via C FFI) | FFI, not pure Rust; async story is messier |
-| Crypto backend | `rustls-ring` | `rustls-aws-lc-rs` | aws-lc-rs requires a C build step (cmake); ring is pure Rust build. For the spike, simpler wins |
-| SSH agent | `ssh-agent-client-rs` | `russh` agent support | russh carries the full SSH protocol implementation; agent-only use pulls in large transitive deps. `ssh-agent-client-rs` is minimal and purpose-built |
-| SSH agent | `ssh-agent-client-rs` | `ssh-agent-lib` | `ssh-agent-lib` is for *writing* an agent server, not a client |
-| PTY | `portable-pty` | `nix` raw pty | nix raw PTY is Linux-only; portable-pty's trait abstraction already bakes in the M6 Windows path |
-| Terminal parser | `vte` | `termwiz` (also wezterm) | termwiz is a full terminal emulator; vte is just the parser state machine. For M2 server-side terminal model, vte + custom `Perform` impl is the right granularity |
-| Cert generation | `rcgen` | `x509-cert` (RustCrypto) | x509-cert is a lower-level DER builder with no signing convenience; rcgen's `SigningKey` trait + `CertificateParams::self_signed()` is ergonomic |
+| Reattach token | `uuid` v4 (already in tree) | `rand::random::<[u8; 32]>()` | uuid already present, formats cleanly, 122-bit entropy sufficient |
+| Reattach token | `uuid` v4 | `getrandom` directly | Both work; uuid more ergonomic for serialization |
+| Resume buffer | Hand-rolled VecDeque | A dedicated replay crate | No such crate exists at the right abstraction; the pattern is ~50 lines |
+| Windows terminal | `crossterm` 0.29 | `windows-rs` console API directly | crossterm abstracts WinAPI/ANSI duality; already in tree; no reason to drop |
+| Windows key signing | `ssh-key` + `ed25519-dalek` (in-process) | `ssh-agent-client-rs` on Windows | Pageant uses named pipes, not Unix sockets; ssh-agent-client-rs is Unix-only |
+| crossterm version | 0.29.0 | Stay at 0.28.1 | 0.29.0 adds OSC52 (useful M5) and rustix 1.0; upgrade cost is minimal |
+| Crypto backend | Keep `rustls-ring` | Switch to `aws-lc-rs` | aws-lc-rs needs CMake on Windows; ring 0.17.14 has precompiled x86_64 objects |
 
 ---
 
-## What NOT to Use
+## What NOT to Add
 
 | Avoid | Why | Use Instead |
 |-------|-----|-------------|
-| `rustls` < 0.23.16 | No RPK support; older API shapes | `rustls` 0.23.40 |
-| `quinn` < 0.11 | Pre-0.11 used a different rustls wiring (`quinn::ServerConfigBuilder`); API completely changed | `quinn` 0.11.x |
-| `ed25519-dalek` 3.0.0-pre.*  | Pre-release API may change | `ed25519-dalek` 2.2.0 (stable) |
-| `rustls-native-certs` for host verification | Platform cert store verifies PKI chains; nosh never uses PKI chains — it pins keys | Custom `ServerCertVerifier` or RPK |
-| `openssh` crate | Spawns a subprocess `ssh`; provides no primitives we need | `ssh-key` + `ssh-agent-client-rs` |
-| `tokio-rustls` directly | Not needed — quinn handles the TLS/QUIC integration internally; tokio-rustls is for TCP+TLS | Only quinn |
-| `mio` or raw `epoll` | quinn requires tokio; mixing runtimes creates pain | tokio only |
+| Any dedicated "session resume" crate | None at the right abstraction; BackedReader is ~50 lines of VecDeque logic | Hand-roll on postcard + serde |
+| `russh` for Windows key signing | Full SSH protocol implementation; pulls large transitive deps | `ssh-key` + `ed25519-dalek` (already in tree) |
+| `crossterm` `use-dev-tty` feature | Unix-only; breaks build combined with `event-stream` (issue #935) | Omit this feature flag |
+| `getrandom` as a direct dependency | Already transitive via ring and uuid; adding a direct dep risks version skew | Use `Uuid::new_v4()` for tokens |
+| `tokio-rustls` | Not needed; quinn handles TLS/QUIC internally | quinn only |
+| `ed25519-dalek` 3.0.0-pre.* | Pre-release API; may change | `ed25519-dalek` 2.2.0 (stable, already in tree) |
 
 ---
 
-## Version Compatibility
+## Version Compatibility (v1.1 additions only)
 
 | Package | Compatible With | Notes |
 |---------|-----------------|-------|
-| `quinn` 0.11.9 | `rustls` 0.23.x | quinn 0.11 requires rustls 0.23; the conversion path is `rustls::ServerConfig` → `quinn::crypto::rustls::QuicServerConfig::try_from()` → `quinn::ServerConfig::with_crypto()` |
-| `quinn` 0.11.9 | `tokio` 1.x | `runtime-tokio` feature; tokio 1.52.x is current |
-| `ssh-key` 0.6.7 | `ed25519-dalek` 2.x | ssh-key's `ed25519` feature pulls `ed25519-dalek` as a transitive dep; pin to same major |
-| `portable-pty` 0.9.0 | `tokio` 1.x | No direct tokio dep; bridge via `spawn_blocking` |
-| `rcgen` 0.14.8 | `rustls` 0.23.x | rcgen 0.14.x integrates with rustls 0.23 `CertifiedKey` |
-
----
-
-## Stack Patterns by Phase
-
-**M0 — QUIC echo spike:**
-- quinn client + server, `rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(rcgen-generated cert)`, datagram + stream on one connection.
-- Goal: confirm RFC 9221 datagrams and bidi streams are independent on one connection.
-
-**M1 — Auth (cert-pinning first):**
-- `AgentSigningKey` / `AgentSigner` delegating to `ssh-agent-client-rs`.
-- Server: custom `ClientCertVerifier` checking presented cert's SPKI against `authorized_keys` entries parsed by `ssh-key`.
-- Client: custom `ServerCertVerifier` checking server cert's SPKI against `known_hosts` (TOFU on first connection).
-- Defer RPK upgrade until after M1 is working end-to-end.
-
-**M2 — PTY session core:**
-- `portable-pty` 0.9.0 on Linux; env sanitization before `spawn_command`.
-- `vte` 0.15.0 for terminal state; `PtySize` resize with ~40 ms burst coalescing.
+| `crossterm` 0.29.0 | `tokio` 1.44+ | EventStream works with tokio 1.44+ (verified dev dep constraint); no breaking changes from 0.28.1 |
+| `crossterm` 0.29.0 | `x86_64-pc-windows-msvc` | Explicit supported target in docs.rs 0.29.0 |
+| `ring` 0.17.14 | `x86_64-pc-windows-msvc` | Precompiled asm objects in crates.io package; no NASM needed |
+| `quinn` 0.11.9 | `x86_64-pc-windows-msvc` | Pure Rust + socket2; confirmed buildable |
+| `ssh-key` 0.6.7 `encryption` feature | `x86_64-pc-windows-msvc` | Pure Rust (bcrypt-pbkdf, AES-CTR); builds on all targets |
 
 ---
 
 ## Sources
 
-- https://docs.rs/crate/quinn/latest (version 0.11.9, features list — verified)
-- https://docs.rs/quinn/latest/quinn/struct.Connection.html (send_datagram, read_datagram, max_datagram_size API — verified)
-- https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html (datagram_receive_buffer_size — verified)
-- https://quinn-rs.github.io/quinn/quinn/certificate.html (QuicServerConfig::try_from wiring pattern — verified)
-- https://docs.rs/rustls/latest/rustls/ (version 0.23.40 confirmed)
-- https://docs.rs/rustls/latest/rustls/client/danger/trait.ServerCertVerifier.html (requires_raw_public_keys, verify_server_cert API — verified)
-- https://docs.rs/rustls/latest/rustls/server/struct.AlwaysResolvesServerRawPublicKeys.html (RPK resolver API — verified)
-- https://docs.rs/rustls/latest/rustls/client/struct.AlwaysResolvesClientRawPublicKeys.html (RPK client resolver — verified)
-- https://docs.rs/rustls/latest/rustls/sign/struct.CertifiedKey.html (CertifiedKey for RPK and cert-pinning — verified)
-- https://github.com/rustls/rustls/releases/tag/v%2F0.23.16 (RPK added in 0.23.16, PR #2062 — verified)
-- https://github.com/rustls/rustls/issues/2257 (RPK compliance caveat — LOW confidence on current resolution status)
-- https://docs.rs/crate/rustls/latest/source/src/manual/howto.rs (custom SigningKey/Signer delegation pattern — verified)
-- https://docs.rs/ssh-agent-client-rs/latest/ssh_agent_client_rs/ (version 1.1.2, sign() method — verified)
-- https://github.com/nresare/ssh-agent-client-rs (sign API, list_identities, synchronous — verified)
-- https://docs.rs/portable-pty/latest/portable_pty/ (version 0.9.0, openpty/spawn_command/resize API — verified)
-- https://docs.rs/ssh-key/latest/ssh_key/ (version 0.6.7, authorized_keys/known_hosts modules — verified)
-- https://docs.rs/crate/rcgen/latest (version 0.14.8, SigningKey trait, self_signed() — verified)
-- https://docs.rs/crate/ed25519-dalek/latest (version 2.2.0 stable; 3.0.0-pre.7 pre-release noted — verified)
-- https://github.com/alacritty/vte (version 0.15.0 current — verified)
-- https://github.com/tokio-rs/tokio/releases (tokio 1.52.x current; 1.47.x and 1.51.x LTS — verified)
+- https://docs.rs/quinn/0.11.9/quinn/struct.Connection.html — complete method list verified; no migrate/set_path/network_path confirmed absent
+- https://docs.rs/quinn/0.11.9/quinn/struct.Endpoint.html — rebind / rebind_abstract signatures verified
+- https://docs.rs/quinn/0.11.9/quinn/struct.ServerConfig.html — migration() method signature and default=true verified
+- https://docs.rs/quinn/0.11.9/quinn/struct.TransportConfig.html — keep_alive_interval, max_idle_timeout, mtu_discovery_config verified
+- https://docs.rs/quinn/0.11.9/quinn/struct.ConnectionStats.html — PathStats fields (rtt, cwnd, lost_packets, current_mtu) verified
+- https://docs.rs/quinn/0.11.9/quinn/struct.EndpointConfig.html — cid_generator; stable_id on Connection verified
+- https://github.com/quinn-rs/quinn/blob/main/quinn/src/endpoint.rs — rebind_abstract implementation; ConnectionEvent::Rebind broadcast
+- https://github.com/quinn-rs/quinn/blob/main/quinn-proto/src/connection/mod.rs — path/prev_path/path_counter fields; PATH_CHALLENGE/PATH_RESPONSE logic
+- https://docs.rs/ssh-key/0.6.7/ssh_key/private/struct.PrivateKey.html — read_openssh_file, is_encrypted, decrypt, sign API verified
+- https://github.com/RustCrypto/SSH/blob/master/ssh-key/Cargo.toml — encryption feature deps (bcrypt-pbkdf, AES-CTR, ChaCha20Poly1305) verified
+- https://docs.rs/crossterm/0.29.0/crossterm/index.html — features (event-stream, events, windows), x86_64-pc-windows-msvc target support verified
+- https://docs.rs/crossterm/latest/crossterm/event/struct.EventStream.html — event-stream feature flag, tokio compatibility, Windows targets verified
+- https://github.com/crossterm-rs/crossterm/releases — 0.29.0 released April 5 2025 confirmed latest
+- https://github.com/crossterm-rs/crossterm/issues/935 — use-dev-tty + event-stream incompatibility documented
+- https://github.com/briansmith/ring/blob/main/BUILDING.md — x86_64-pc-windows-msvc precompiled asm objects (no NASM from crates.io) verified
+- https://docs.rs/getrandom/latest/getrandom/ — getrandom 0.4.2; fill() API; already transitive via ring/uuid in lockfile
+- Cargo.lock (nosh workspace, direct inspection) — uuid 1.23.1 v4 in nosh-server; crossterm 0.28.1 in nosh-client; ring 0.17.14; getrandom 0.2.17/0.3.4/0.4.2 all transitive
 
 ---
-*Stack research for: nosh QUIC remote shell — M0–M2 architecture-validation spike*
-*Researched: 2026-05-29*
+*Stack research for: nosh QUIC remote shell — v1.1 M3 Roaming + Windows Client*
+*Researched: 2026-05-30*

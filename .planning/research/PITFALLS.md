@@ -1,274 +1,334 @@
 # Pitfalls Research
 
-**Domain:** QUIC-based roaming remote shell (Rust) — M0–M2 architecture spike
-**Researched:** 2026-05-29
-**Confidence:** HIGH (quinn/rustls via Context7 + official docs; PTY and security via official specs + known CVEs)
+**Domain:** QUIC-based roaming remote shell (Rust) — v1.1 M3 Roaming + Windows Client
+**Researched:** 2026-05-30
+**Confidence:** HIGH (quinn/rustls official docs; RFC 9000; ssh-key crate docs; Windows terminal research; QUIC path validation research)
 
 ---
 
-## MUST-ADDRESS IN THIS MILESTONE — Security Footguns
+## CRITICAL PITFALLS
 
-These three are non-negotiable for M2 (session core). They are privilege-escalation vectors that become much harder to retrofit once "it works."
-
-### FOOTGUN-1: Environment Variable Injection into the Shell
+### Pitfall 1: `ServerConfig::migration` Not Set — Migration Silently Disabled on the Server
 
 **What goes wrong:**
-The server spawns a login shell with environment variables inherited from the client's session-open request. If the client can supply `LD_PRELOAD`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PYTHONPATH`, `NODE_OPTIONS`, or similar, an attacker who compromises the client transport can inject arbitrary code into the server process or any process that shell spawns.
+The client IP changes (Wi-Fi→cellular, NAT rebind), quinn sends updated packets from the new address, but the server drops them. The session stalls, then times out. `quinn`'s `ServerConfig::migration` defaults to `true`, but if anyone explicitly set it to `false` for an earlier test or security audit, the server silently refuses all client address changes.
 
 **Why it happens:**
-Developers building the "environment passthrough" feature (forwarding `TERM`, `LC_*`, `TZ` so the remote shell looks right) pass the whole env dict rather than a filtered whitelist.
+Migration is a server-side gate: `ServerConfig::migration(bool)`. Even if the client correctly uses a fresh connection ID on the new path (as RFC 9000 §9.3 requires), the server will ignore address changes when migration is disabled. The failure looks like a network drop, not a config error.
 
 **How to avoid:**
-Implement a **deny-all, explicit-allow-list** approach. On shell/exec open, construct the server-side environment from scratch:
-- Allow: `TERM`, `LC_ALL`, `LC_CTYPE`, `LC_MESSAGES`, `LC_COLLATE`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, `LANG`, `TZ`
-- Deny everything else the client sends, including any var matching `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PYTHONPATH`, `NODE_OPTIONS`, `RUBYLIB`, `PERL5LIB`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JAVA_OPTIONS`
-- Merge with the server's own minimal environment (PATH, HOME, USER, SHELL sourced from `/etc/passwd`)
-- Never pass the client env dict to `CommandBuilder` directly
+- Confirm `ServerConfig::migration(true)` is set explicitly, not just relying on the default.
+- Add an integration test: establish a connection on loopback `127.0.0.1`, then force the client to rebind to `127.0.0.2` (or use a dual-interface test) and assert the connection survives.
+- In headless CI, simulate migration by changing the client socket binding mid-session; verify no `ConnectionError::ConnectionClosed` results.
 
 **Warning signs:**
-Any code path that does `cmd.env(client_supplied_key, client_supplied_val)` without filtering, or uses `std::env::vars()` to forward current process env.
+Session drops immediately after a network interface switch; `ConnectionError::TimedOut` rather than continued operation; migration test passes on loopback but fails on real interfaces.
 
 **Phase to address:**
-M2 (session core) — must exist before the first PTY spawn. This is not a "clean up later" item.
+Phase 1 (migration) — first thing to verify before any other migration work.
 
 ---
 
-### FOOTGUN-2: SSH_AUTH_SOCK Forwarded via Environment
+### Pitfall 2: Path Validation Anti-Amplification Stall After Migration
 
 **What goes wrong:**
-The remote shell process has `SSH_AUTH_SOCK` in its environment pointing to a Unix socket on the server. Any process or user on the server who can read that process's `/proc/<pid>/environ` can hijack the socket and use your SSH keys to authenticate anywhere those keys work. Root on the server can always do this.
+After the client migrates to a new IP, the server is subject to the anti-amplification limit on the new path: it may send at most 3× the bytes it has received from that address until path validation completes (RFC 9000 §9.4). In a shell session with large server output (e.g. `cat bigfile`), the server stalls mid-stream waiting for the client to send enough data to raise the amplification limit, even though the connection is alive. This manifests as an output pause of 1–2 RTTs after every migration.
 
 **Why it happens:**
-`SSH_AUTH_SOCK` is a normal env var that the user's local shell has set. Environment passthrough naively includes it.
+RFC 9000 mandates this limit to prevent amplification attacks. On migration, the client's new address is initially unvalidated. The server sends PATH_CHALLENGE and waits for PATH_RESPONSE before fully lifting the limit. Any large burst of server output during this validation window is throttled.
 
 **How to avoid:**
-`SSH_AUTH_SOCK` must be explicitly excluded from the allowed-list above — it never passes through the env path. In a future milestone (M5), agent forwarding is implemented as a dedicated QUIC stream with an explicit protocol; the server binds a new local socket and sets `SSH_AUTH_SOCK` to *that* socket, scoped to the session, rather than forwarding the client's existing socket path.
+- Send a small PING or control frame from the client immediately after detecting that migration has occurred (to quickly advance the amplification budget for the server).
+- In the migration test, pipe a large payload from server→client and assert no gap longer than 2 RTTs appears in the output stream after a simulated path change.
+- Do not attempt to pre-validate an alternate path before the migration (multipath) — that is a separate QUIC extension not in scope for v1.1.
 
 **Warning signs:**
-Any test that verifies `SSH_AUTH_SOCK` is present in the spawned shell's environment is a bug, not a success.
+Terminal output pauses for ~100–500 ms after a network change; `cat`/`tail -f` pauses then resumes; no connection error, just a delay.
 
 **Phase to address:**
-M2 — the deny-all env whitelist handles this automatically if `SSH_AUTH_SOCK` is simply not in the allow list.
+Phase 1 (migration) — validate with an output-heavy stream test around migration events.
 
 ---
 
-### FOOTGUN-3: Unauthenticated Connection Memory Exhaustion
+### Pitfall 3: Connection ID Linkability — Not Rotating CIDs on Migration
 
 **What goes wrong:**
-QUIC's handshake involves multiple round trips during which the server holds per-connection state. An attacker flooding the server with half-open connections can exhaust server memory before any authentication check runs. CVE-2024-22189 (quic-go) demonstrated a real variant: flooding `NEW_CONNECTION_ID` frames causes unbounded memory growth.
+The client migrates to a new IP but keeps using the same connection ID. An eavesdropper on both the old and new network paths (e.g. a corporate VPN and a cellular carrier) can correlate the two paths to the same user session. RFC 9000 §9.5 explicitly requires that a migrating endpoint use a new connection ID to prevent linkability.
 
 **Why it happens:**
-Connection state is allocated before authentication succeeds.
+quinn manages CID rotation automatically if the endpoint has been supplied with enough CIDs via `NEW_CONNECTION_ID` frames. The failure mode is: the server runs out of CIDs to issue (because `EndpointConfig` sets a low `cid_generator` limit or no fresh CIDs are issued), so the client is forced to reuse the current CID. The functional behavior is correct but the privacy property is broken.
 
 **How to avoid:**
-- Cap the number of simultaneous in-progress (pre-auth) connections — start with a hard limit of ~256 or a configurable value
-- Use quinn's `max_concurrent_uni_streams` / `max_concurrent_bidi_streams` to limit stream proliferation per connection
-- Apply per-IP rate limiting on connection initiation (even a simple token bucket in front of `Endpoint::accept()`)
-- Complete auth within a timeout (e.g. 10 seconds from connection open); abort with `connection.close()` on timeout
+- Ensure the server issues new CIDs proactively via quinn's built-in mechanism. The default `EndpointConfig` generates new CIDs automatically.
+- After a migration, verify (in tests with QUIC event logging enabled) that the new-path packets use a CID different from those on the old path.
+- Enable quinn's `qlog` feature during integration testing and inspect `connection_id_updated` events around path changes.
 
 **Warning signs:**
-No limit on `Endpoint::accept()` loop; no timeout on auth completion; unbounded `Vec` or `HashMap` keyed on connection ID.
+QUIC qlog shows no `new_connection_id` events around migration; the same CID appears in packets on both the old and new local address.
 
 **Phase to address:**
-M1 (auth) — structure the accept loop with a bound before the first auth check. Reinforce in M2.
+Phase 1 (migration) — validate via qlog inspection, not just functional correctness.
 
 ---
 
-## Critical Pitfalls
-
-### Pitfall 1: Datagrams Silently Disabled — `datagram_receive_buffer_size` Defaults to `None`
+### Pitfall 4: Keep-Alive and Migration Interact — Session Drops Immediately After IP Change if Keep-Alive Is on the Wrong Side or Misconfigured
 
 **What goes wrong:**
-`Connection::max_datagram_size()` returns `None`, `send_datagram()` returns `SendDatagramError::UnsupportedByPeer`, and all datagram sends are silently dropped or return errors. The streams work fine; you never see datagrams at all.
+After migration, the old path is dead. If the server is sending keep-alive PINGs and the client is not, the server continues PINGing the old address (it may not have received the path-change notification yet). The client, now on a new address, gets no PING ACKs. Both sides' idle timers start counting. If the session idle timeout is shorter than the path-validation round trip, the session drops before migration completes.
 
 **Why it happens:**
-`TransportConfig::datagram_receive_buffer_size` defaults to `None`, which **disables incoming datagrams entirely**. Both endpoints must set a non-`None` value for datagrams to flow. If either side leaves the default, datagrams are refused at the QUIC layer — the peer is forbidden from sending them. This is the M0 spike's primary gotcha.
+Keep-alive is configured on the **client** per the v1.0 design. However, there is a gap: during the migration window, the server may not immediately begin sending on the new path. If the client has migrated but the keep-alive interval fires before path validation is complete (and the PING goes to the new path but gets no ACK because path is still validating), the client may prematurely declare timeout.
 
 **How to avoid:**
-Explicitly set `datagram_receive_buffer_size` on **both** client and server `TransportConfig` before establishing the connection:
-```rust
-transport_config.datagram_receive_buffer_size(Some(1024 * 1024)); // e.g. 1 MiB
-```
-In M0, assert that `connection.max_datagram_size()` returns `Some(_)` as the first test after connection establishment.
+- Keep the client-side `keep_alive_interval` at 15 s and `max_idle_timeout` at 300 s (as established in v1.0), with the idle timeout large enough to survive multi-second path validation.
+- Do not reduce idle timeout for "faster failure detection" during migration testing — this is the most common footgun.
+- Set `max_idle_timeout` on both sides to at least 60 s during migration tests; reduce only after migration is proven stable.
 
 **Warning signs:**
-`max_datagram_size()` returns `None` after a successful handshake; `send_datagram()` returns `UnsupportedByPeer`.
+Session drops with `ConnectionError::TimedOut` within 1–5 s of an IP change; reducing keep-alive interval "fixes" it (a lie — you've just made keep-alive fire more often than the timeout).
 
 **Phase to address:**
-M0 — this is the literal first thing the spike tests.
+Phase 1 (migration) — verify idle timeout survives a 5–10 s simulated path change window.
 
 ---
 
-### Pitfall 2: Datagram Size Exceeds Per-Path MTU — Silent Drop or Error
+### Pitfall 5: Orphaned Session Memory Growth Without a Cap — Per-Identity Limit Is the Safety Valve
 
 **What goes wrong:**
-A terminal state-sync datagram larger than the current path MTU estimate is either silently dropped (by the OS UDP layer with fragmentation blocked) or causes `SendDatagramError::TooLarge`. The session appears to stall or lose updates without any clear error.
+Server-side sessions persist after client disconnect (Mosh-style). Without a per-identity cap, a user who connects and disconnects repeatedly (or a client that crashes in a loop) accumulates orphaned sessions. Each holds a live PTY, a shell process, and buffered output. Memory grows without bound. At 10 sessions of ~5 MB each, that is 50 MB per user; at 100 sessions it is a denial-of-service against the server.
 
 **Why it happens:**
-`max_datagram_size()` fluctuates during the connection lifetime as quinn's DPLPMTUD binary-search probes the path. The minimum guaranteed value is "a little over a kilobyte" (~1200 bytes overhead-adjusted). On degraded paths or after black-hole detection resets the estimate, the limit can drop. Sending a fixed-size payload without checking the current limit causes intermittent failures that are hard to reproduce.
+The idle timeout defaults to 0 (disabled) per the v1.1 design decision. This is correct for the UX goal but means no automatic session eviction. Without an explicit cap, every disconnect becomes a permanent resource leak until the shell inside exits.
 
 **How to avoid:**
-- Always call `connection.max_datagram_size()` before each `send_datagram()` call and fragment or discard the payload if it exceeds the limit
-- For the terminal state-sync object, design the payload to be compressible to under ~1100 bytes under any circumstance (reserve headroom for QUIC framing)
-- Do not send datagrams larger than the minimum guaranteed size (~1200 bytes) in protocol design; anything larger must use streams
-- quinn's `MtuDiscoveryConfig` can tune DPLPMTUD behaviour; keep the default (starts at 1200, binary-searches up)
+- Implement the per-identity cap before enabling session persistence. The cap should be configurable (default 5 sessions per identity); any new connection that would exceed the cap must either reject the reattach, evict the oldest orphan, or be explicitly documented.
+- Store orphaned sessions in a `HashMap<SshIdentityFingerprint, VecDeque<OrphanedSession>>` with a max-len guard on insert.
+- Log a warning whenever the cap is hit; do not silently evict.
 
 **Warning signs:**
-Intermittent `SendDatagramError::TooLarge`; terminal updates stalling on poor Wi-Fi; screen state diverges without reconnect.
+Server memory grows monotonically under stress; `ps aux` shows many shell processes per SSH fingerprint; no limit in the orphan map data structure.
 
 **Phase to address:**
-M0 (must be aware in spike); M4 (must be enforced in predictive-echo state-sync design).
+Phase 2 (session persistence) — the cap must exist before first orphan is stored, not added later.
 
 ---
 
-### Pitfall 3: Idle Timeout Fires on an Interactive Shell That Is "Quiet"
+### Pitfall 6: Zombie Shell Processes When PTY Outlives the QUIC Connection
 
 **What goes wrong:**
-The QUIC connection drops with `ConnectionError::TimedOut` during an interactive session where the user is reading output but not typing — e.g. watching `tail -f`, waiting for a build, or pausing at a prompt. This manifests as the session dying silently on slow/idle workloads.
+The server's QUIC connection closes (clean or abrupt). The server stores the orphaned session (PTY + shell PID). If the shell eventually exits but the server never calls `Child::wait()` (or equivalent), the process enters zombie state: the OS keeps the exit-status entry in the process table. At scale, a server accumulates thousands of zombie entries.
 
 **Why it happens:**
-`max_idle_timeout` defaults to 30 seconds. The idle clock resets on any QUIC frame — streams, datagrams, ACKs — but if neither side sends application data and `keep_alive_interval` is not set (default: `None`), the connection expires. For a remote shell, "quiet" is normal. 
+`portable-pty`'s `Child` trait requires explicit `wait()` or `try_wait()` calls; there is no auto-reaping. The orphaned session struct holds the `Child` handle. If the `OrphanedSession` is dropped without calling `wait()`, the zombie persists until the server process exits.
 
 **How to avoid:**
-Set `keep_alive_interval` on the **client** side only (one side is sufficient per the quinn docs):
-```rust
-transport_config.keep_alive_interval(Some(Duration::from_secs(15)));
-```
-Set `max_idle_timeout` to something session-appropriate (e.g. several minutes for a shell, not 30 seconds):
-```rust
-transport_config.max_idle_timeout(Some(Duration::from_secs(300).try_into()?));
-```
-Do not set `max_idle_timeout(None)` (infinite) — the docs warn this can cause permanently hung futures if the path malfunctions.
+- Run a background task (e.g. `tokio::spawn`) that periodically calls `child.try_wait()` on all orphaned sessions and removes entries where the shell has exited.
+- In `OrphanedSession`'s `Drop` impl, send SIGHUP to the shell if the shell is still running and the session is being evicted.
+- Write a test: create an orphaned session, let the shell exit, assert that `ps aux | grep Z` shows no zombie within 5 s.
 
 **Warning signs:**
-Session drops after ~30 seconds of no typing; error is `ConnectionError::TimedOut` not `Reset`; happens reliably when watching long-running commands.
+`ps aux | grep defunct` shows entries accumulating over time; shell exit is not logged by the server even though the PTY master fd is readable.
 
 **Phase to address:**
-M0 (set reasonable defaults in spike); validate in M2 with interactive shell testing.
+Phase 2 (session persistence) — implement the reaper task immediately alongside the orphan store.
 
 ---
 
-### Pitfall 4: ALPN Mismatch Fails the QUIC Handshake with a Cryptic Error
+### Pitfall 7: SIGHUP Sent to Shell on Client Disconnect — Session Terminates Instead of Persisting
 
 **What goes wrong:**
-The quinn connection fails at the TLS handshake with a `no_application_protocol` alert (QUIC error code 0x178). Both sides think they have a valid QUIC setup but the connection never opens.
+The client QUIC connection closes. The server closes the PTY master fd (e.g. by dropping the `MasterPty` handle). The kernel detects no open master fd for the PTY and delivers SIGHUP to the shell (session leader). The shell exits. The session does not persist — the user's long-running job is killed.
 
 **Why it happens:**
-QUIC mandates ALPN; if the server's `alpn_protocols` list and the client's list share no entry, the handshake is aborted per RFC 9001. Developers often forget to set ALPN on one side, or set different byte strings (`b"nosh"` vs `b"nosh/1"`). This is distinct from the TLS certificate verification error — the handshake never gets that far.
+SIGHUP is sent by the kernel to the PTY session leader when the controlling terminal is "hung up" — which is exactly what happens when the last open master fd is closed. This is the correct Unix behavior for a session that ends, but the wrong behavior for a session that should persist.
 
 **How to avoid:**
-Define a single canonical ALPN identifier constant (e.g. `pub const ALPN: &[u8] = b"nosh/0";`) shared by client and server, imported from a `proto` module. Set it on both sides before first use:
-```rust
-// server
-rustls_server_config.alpn_protocols = vec![ALPN.to_vec()];
-// client
-rustls_client_config.alpn_protocols = vec![ALPN.to_vec()];
-```
-In M0, assert after handshake that `handshake_data.protocol == Some(ALPN.to_vec())`.
+- Do not close the `MasterPty` handle when the client disconnects. Instead, move the `MasterPty` (and the `Child`) into the `OrphanedSession` struct. Keep the master fd open.
+- The server process must hold the master fd open for the lifetime of the orphaned session. This is what prevents SIGHUP.
+- Verify by running a shell that prints a message on SIGHUP (`trap 'echo got SIGHUP' HUP`), disconnecting the client, and asserting the message does not appear.
 
 **Warning signs:**
-`ConnectionError` or `TransportError` during handshake with error code 0x178; "no application protocol" in error message.
+Shell exits immediately when the client disconnects; log shows "session terminated" at client disconnect time rather than at shell exit time.
 
 **Phase to address:**
-M0 — define the ALPN constant on day one.
+Phase 2 (session persistence) — this is the core correctness requirement; get it right before any reconnect work.
 
 ---
 
-### Pitfall 5: Custom `ServerCertVerifier` / `ClientCertVerifier` That "Pins the Key" But Skips Signature Validation
+### Pitfall 8: Cold Reattach Token Bound to Transport Layer, Not SSH Identity — Session Hijacking Risk
 
 **What goes wrong:**
-The custom verifier returns `Ok(ServerCertVerified::assertion())` from `verify_server_cert` after checking the public key, but `verify_tls13_signature` is implemented as a stub that also returns `Ok(HandshakeSignatureValid::assertion())` — meaning the peer's `CertificateVerify` signature is never actually checked. A MITM can present a cert with the correct pinned public key but sign the handshake transcript with any private key.
+The reattach token is issued to a connection (e.g. derived from the QUIC connection ID or a random nonce stored per-connection) rather than bound to the authenticated SSH identity. An attacker who learns the token (e.g. from a server log, a side channel, or a compromised network path) can reattach to the session without possessing the SSH private key.
 
 **Why it happens:**
-The canonical "skip PKI" example in the quinn docs (`SkipServerVerification`) is intentionally all-stubs because it's a dev/testing helper. Developers copy it as the starting point for key-pinning auth without realising that the signature methods must be properly implemented.
+The natural implementation is: "on disconnect, store the session with a random token; on reattach, check the token." The token check replaces auth. This is wrong for nosh — the token must be a secondary check; the primary check is that the reconnecting client can prove it holds the same SSH identity.
 
 **How to avoid:**
-The correct "pin the key" verifier must:
-1. In `verify_server_cert`: extract the public key from the raw certificate/SubjectPublicKeyInfo, compare it to the pinned value, return `Err` on mismatch.
-2. In `verify_tls13_signature`: call `rustls_platform_verifier` or delegate to the `CryptoProvider`'s signer — do not stub this. Use `provider.signature_verification_algorithms` to verify the transcript signature against the extracted public key.
-3. In `supported_verify_schemes`: return only the schemes your keys actually support (e.g. only `Ed25519` if only Ed25519 keys are used).
-
-Additionally: for ECDSA keys in TLS 1.3, rustls **does not enforce curve matching** for you — if `ECDSA_NISTP256_SHA256` is returned by `supported_verify_schemes`, your `verify_tls13_signature` implementation must check that the public key is actually on P-256, not merely that it's an ECDSA key.
+- Reattach authorization is a **two-factor check**: (1) the new QUIC connection must complete the same mutual SSH-key TLS handshake as the original connection — the same `authorized_keys` check runs; (2) the `ReattachRequest` control message must carry the session token AND the SSH identity fingerprint from step 1 must match the fingerprint stored in the orphaned session.
+- The session token prevents reattaching to the wrong session (session selector), but the SSH handshake prevents theft.
+- If either check fails, close the connection with an error; do not reveal whether a session with that token exists (oracle leak).
 
 **Warning signs:**
-Tests pass against a deliberately invalid key; `verify_tls13_signature` is a one-liner returning `Ok(assertion())`.
+Reattach is implemented without re-running the TLS mutual auth; a test that reattaches with a correct token but a different key succeeds.
 
 **Phase to address:**
-M1 — auth is the milestone where the verifier is written. Write tests that present a cert with the right key but a forged signature.
+Phase 3 (cold reattach) — the identity check must be in the design from the start; it cannot be retrofitted without changing the protocol.
 
 ---
 
-### Pitfall 6: RFC 7250 Raw Public Key — `requires_raw_public_keys()` Opt-In is Separate from Verifier Logic
+### Pitfall 9: Sequence-Number Resync Delivers Duplicate or Missing Output on Reattach
 
 **What goes wrong:**
-You implement a custom `ClientCertVerifier` (server-side) and `ServerCertVerifier` (client-side) designed to accept raw public keys, but the TLS handshake still negotiates X.509 and sends self-signed certs (or fails with `UnsolicitedCertificateTypeExtension`). The RPK extension is never activated.
+The client reconnects and sends a `ReattachRequest{last_seen_sequence: N}`. The server resumes from sequence N+1. However:
+- If the server's "sent up to sequence M" counter is not the same as "acknowledged by client up to sequence N" (because the sequence space is not continuously tracked), the server may re-send output the client already displayed, or skip output the client never received.
+- If sequence numbers are 32-bit and the session generates enough output between connections, wrap-around causes the comparison to be incorrect.
 
 **Why it happens:**
-rustls exposes `requires_raw_public_keys()` as a provided method on `ClientCertVerifier` / `ResolvesClientCert::only_raw_public_keys()`. These must return `true` to signal RPK intent in the ClientHello/ServerHello extensions. If left at the default `false`, the RPK extension is not advertised, and the handshake falls back to X.509 — or fails with the RFC 7250 § 4.2 compliance bug (issue #2257): a server that gets a ClientHello advertising both X.509 and RPK may send `UnsolicitedCertificateTypeExtension` instead of accepting X.509.
+Sequence numbers in a reattach protocol are easy to get wrong because they cover the boundary between two different QUIC connections — reliable delivery within a connection is handled by QUIC streams, but the cross-connection gap must be handled by the application layer.
 
 **How to avoid:**
-If using RPK:
-- Override `requires_raw_public_keys()` → `true` in both client and server verifiers
-- Use `CertificateDer` wrapping a `SubjectPublicKeyInfo` DER blob, not a full X.509 cert
-- Verify that the rustls version in use has resolved issue #2257 (check the changelog); fall back to self-signed-cert pinning if not
-
-If using the self-signed-cert-pinning fallback (acceptable for M1):
-- Keep `requires_raw_public_keys()` at `false`
-- Generate an ephemeral self-signed X.509 cert whose Subject Public Key Info embeds the SSH public key
-- The verifier skips chain validation but verifies the SPKI matches the pinned key
+- Use a monotonically increasing, never-resetting u64 sequence number for server→client output. Assign sequence numbers per-byte or per-message at the application layer (not QUIC stream offset, which resets per connection).
+- The server maintains a ring buffer of the last N bytes of output (for scrollback on reconnect). On reattach, it replays from `last_seen_sequence + 1` up to the current tail.
+- On initial connection, `last_seen_sequence = 0` (no replay). On reattach, the client supplies its last acknowledged sequence.
+- Write a test: disconnect mid-stream during a large output run; reconnect; verify the combined output on the client matches the full server-side output with no gaps or duplicates.
 
 **Warning signs:**
-Handshake fails with `UnsolicitedCertificateTypeExtension`; `CertificateVerify` contains a full cert chain rather than a raw key blob; verifier's `verify_server_cert` receives a cert with unexpected structure.
+Duplicate lines appear after reconnect; output from before disconnect is missing; scrollback is inconsistent between connect and reconnect paths.
 
 **Phase to address:**
-M1 — design decision: start with self-signed-cert-pinning (simpler, no RPK bug exposure), add RPK in a follow-up once rustls RPK maturity is confirmed.
+Phase 3 (cold reattach) — sequence numbering must be designed before any reconnect message is defined.
 
 ---
 
-### Pitfall 7: ssh-agent RSA Key Returns `ssh-rsa` (SHA-1) When `rsa-sha2-256`/`rsa-sha2-512` Was Required
+### Pitfall 10: Reattach Race — Two Clients Claim the Same Session
 
 **What goes wrong:**
-The agent signing call returns a signature using the legacy `ssh-rsa` algorithm (SHA-1), but the TLS `CertificateVerify` message requires `rsa-sha2-256` or `rsa-sha2-512` (the SHA-2 family). The signature verification fails on the peer side, and the handshake is rejected.
+A client disconnects but the QUIC connection is not yet fully dead (still in the idle-timeout window). A second client (or the same client reconnecting quickly) sends a `ReattachRequest` for the same session. Both connections are briefly active; the old connection's event loop is still reading from the PTY master fd. The shell receives garbled input from two readers; the new client gets incomplete output.
 
 **Why it happens:**
-The OpenSSH agent protocol's `SSH_AGENTC_SIGN_REQUEST` message includes a flags field. To request SHA-2 variants, the caller must explicitly set flag `SSH_AGENT_RSA_SHA2_256` (0x2) or `SSH_AGENT_RSA_SHA2_512` (0x4). Older agent code or wrappers that omit the flags field default to the legacy algorithm. The `ssh-agent-client-rs` or `russh` agent implementations may or may not set these flags correctly by default — verify at implementation time.
+The original connection is in a zombie state: the application layer has not yet received `ConnectionError` (the idle timeout hasn't fired). The server's orphan store doesn't yet have the session (it is still attached to the old connection). The new reattach request arrives before the original disconnect is fully processed.
 
 **How to avoid:**
-- For RSA keys, always request the signing operation with explicit `rsa-sha2-256` or `rsa-sha2-512` flags in the agent sign request
-- Map the TLS `SignatureScheme` to the correct agent flag: `RSA_PKCS1_SHA256` → flag 0x2, `RSA_PKCS1_SHA512` → flag 0x4
-- After receiving the signature from the agent, verify the returned algorithm name matches what was requested before inserting it into the TLS message
-- For Ed25519 and ECDSA keys, no flag is needed — the algorithm is fixed
+- The server must atomically transition a session from "connected" to "orphaned" to "reconnected." Use a state machine with explicit states: `Active(connection_id)`, `Orphaned(token, fingerprint)`, `Reconnecting(token, fingerprint, new_connection_id)`.
+- Only transition to `Reconnecting` if the session is in `Orphaned` state. If `Active`, send a `ReattachConflict` error.
+- On the original connection's final close (however it arrives), the state transition from `Active` to `Orphaned` must run exactly once.
+- A session in `Active` state is not reattachable — the reattach request must wait until the session becomes `Orphaned` or fail fast.
 
 **Warning signs:**
-Agent returns signature type `ssh-rsa` when `rsa-sha2-256` was expected (this may appear as a warning log in some agent implementations); TLS handshake failure on RSA host keys but not Ed25519 keys.
+Two simultaneous connections produce garbled shell output; reattach succeeds when the original client is still connected; no state machine around session lifecycle.
 
 **Phase to address:**
-M1 — test with RSA keys specifically, not just Ed25519.
+Phase 3 (cold reattach) — the state machine is the protocol; implement it before any reconnect logic.
 
 ---
 
-### Pitfall 8: TLS Transcript Signed via ssh-agent Uses the Wrong Bytes
+### Pitfall 11: `Session.identity` Fingerprint Captured Before Handshake Completes
 
 **What goes wrong:**
-The `CertificateVerify` signature verification fails even though the agent signing call succeeded. The agent signed the correct private key but over the wrong input: the raw transcript hash rather than the TLS 1.3 `CertificateVerify` message structure, or vice versa.
+The `Session.identity` field is populated from the peer cert during connection setup, but the code path that reads `connection.peer_identity()` or the equivalent is called before the TLS handshake completes. The result is `None` or the previous connection's identity (if the connection object is reused). Reattach authorization then either panics, silently succeeds with no identity check, or compares against stale data.
 
 **Why it happens:**
-TLS 1.3 `CertificateVerify` signs a specific structure: 64 space bytes, a context string (`TLS 1.3, client CertificateVerify` or `TLS 1.3, server CertificateVerify`), a 0x00 separator, then the transcript hash (RFC 8446 §4.4.3). The agent only signs raw bytes — it has no knowledge of TLS framing. Passing only the transcript hash (without the prefix structure) or computing the hash at the wrong point in the handshake produces a structurally correct but cryptographically invalid signature.
+`quinn`'s `Connecting::await` completes when the QUIC handshake finishes, but the peer certificate is not available until `connection.peer_identity()` is called after `Connecting` resolves. If the auth code calls this method too early (on a `Connecting` future, not a fully established `Connection`), it gets nothing or garbage.
 
 **How to avoid:**
-Construct the full `CertificateVerify` input per RFC 8446 §4.4.3 before passing to the agent:
-```
-input = repeat(0x20, 64) || context_string || 0x00 || transcript_hash
-```
-Where `transcript_hash = Hash(Handshake Context)`. This entire input — not just the hash — is what gets signed. The agent call then signs this byte string as-is (for Ed25519/ECDSA) or hashes-and-signs it (for RSA with rsa-sha2-256).
-
-Note: rustls's `verify_tls13_signature` passes the pre-constructed message (already including the prefix) to your verifier. Match the signer to produce bytes in the same format.
+- Extract `Session.identity` exactly once, immediately after `connecting.await?` resolves to a `Connection`, before any application data is processed.
+- Encapsulate the extraction in a `NoshSession::from_authenticated_connection(conn: Connection) -> Result<NoshSession>` constructor that extracts and validates identity, returning `Err` if absent.
+- Write a test that asserts `session.identity` equals the fingerprint of the key that was presented in the handshake (not just that it is non-empty).
+- Never allow a `Session` struct to exist without a populated identity field — use a type-level guarantee (the `identity` field is not `Option<T>`, it is `T`, populated at construction).
 
 **Warning signs:**
-Auth works with a software key (where you control the signing path) but fails when routed through ssh-agent; `CertificateVerify` parse errors on the peer; signature mismatch errors that are key-type-agnostic.
+`session.identity` is `Option<_>` and code does `unwrap_or_default()` or `unwrap_or(EMPTY)`; identity is populated in a separate `init()` method called after construction.
 
 **Phase to address:**
-M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify input by hand and verifies agent round-trip.
+Phase 4 (identity threading) — this unblocks the rest of v1.1; address in the first phase before migration or persistence work.
+
+---
+
+### Pitfall 12: Windows On-Disk Private Key — Key Material Remaining in Process Memory After Use
+
+**What goes wrong:**
+The Windows client reads the private key from disk with `PrivateKey::read_openssh_file()`, uses it to sign the TLS handshake, and then drops the `PrivateKey` struct. However, due to Rust's memory model (no guarantee of memory scrubbing on drop by default), the raw key bytes may remain in process memory and be visible in a crash dump, core dump, or via process memory inspection.
+
+**Why it happens:**
+`ssh-key`'s `PrivateKey` struct uses `Zeroizing<Vec<u8>>` for key material internally, which scrubs memory on drop. However, the decrypted key bytes may have been copied into intermediate buffers (e.g. during passphrase decryption, DER encoding, or signature algorithm lookup) that are not zeroized. This is a best-effort mitigation, not a guarantee.
+
+**How to avoid:**
+- Sign only inside a narrow scope: load, sign, drop immediately. Do not hold the `PrivateKey` across async await points.
+- Use `let key = ...; let sig = key.sign(...)?;` — the key is dropped at end of the block, not after the connection's lifetime.
+- For passphrase-protected keys, use `PrivateKey::decrypt()` inside the same narrow scope.
+- Explicitly document that Windows key-file signing is a temporary exception to the "never handle the private key directly" invariant, with a code comment pointing to the M5/M6 Windows agent integration path.
+- Do not log, trace, or serialize the private key at any level.
+
+**Warning signs:**
+`PrivateKey` stored in a struct field that lives for the connection duration; passphrase or key bytes appear in `tracing` spans.
+
+**Phase to address:**
+Phase 5 (Windows client) — this design discipline must be baked in before first implementation; not a refactor.
+
+---
+
+### Pitfall 13: Windows File Permission Check for Private Key Uses `std::fs::Permissions` — ACLs Not Checked
+
+**What goes wrong:**
+The Windows client loads the private key from disk and optionally warns if permissions are too open. Using `std::fs::metadata().permissions().readonly()` only checks `FILE_ATTRIBUTE_READONLY` — it does not evaluate Windows ACLs. A key file readable by other users on the system (via ACL) passes the check and no warning is issued.
+
+**Why it happens:**
+`std::fs::Permissions` on Windows wraps `FILE_ATTRIBUTE_READONLY` only. The Rust standard library explicitly documents that it does not read ACLs. OpenSSH for Windows (`Win32-OpenSSH`) uses `GetNamedSecurityInfo` + `GetSecurityDescriptorDacl` to verify that only the key owner has access. Rust's `std::fs` cannot replicate this.
+
+**How to avoid:**
+- For v1.1, emit a warning at startup if the key file is world-readable by `std::fs` check, but clearly document that the ACL check is not implemented and the user should manually verify.
+- Do not claim the permission check is comprehensive; treat it as best-effort.
+- Optionally use `windows-acl` crate or raw Win32 API (via `windows` crate) for a real ACL check — but this is optional scope for v1.1.
+- Document this gap as a known limitation in the Windows client.
+
+**Warning signs:**
+Code uses `fs::metadata().permissions().readonly()` and claims it has validated key security; no documentation of the ACL limitation.
+
+**Phase to address:**
+Phase 5 (Windows client) — at minimum emit the best-effort warning and document the gap.
+
+---
+
+### Pitfall 14: Windows Client Resize Events — WINDOW_BUFFER_SIZE_RECORD vs. SIGWINCH
+
+**What goes wrong:**
+The Windows client needs to detect terminal resize and send a resize message to the server. On Linux, this is `SIGWINCH`. On Windows, there is no `SIGWINCH` — resize events arrive as `WINDOW_BUFFER_SIZE_RECORD` records in `ReadConsoleInputW`, or in VT mode are not delivered at all. A Windows client that waits for `SIGWINCH` (or the `crossterm` Unix path) never sends resize messages; the server PTY stays at its initial size.
+
+**Why it happens:**
+`crossterm` handles resize events on both platforms, but the mechanism is fundamentally different. On Windows, resize events can be confused with scroll events (`WINDOW_BUFFER_SIZE_RECORD` is emitted for both). Additionally, `crossterm::terminal::size()` in some Windows Terminal versions returns the buffer size (including scrollback) rather than the viewport size when the terminal is not in VT mode.
+
+**How to avoid:**
+- Use `crossterm::event::EventStream` to poll resize events — it abstracts the platform difference. On Windows, this polls `ReadConsoleInputW` internally.
+- After any resize event, double-check the dimensions with `crossterm::terminal::size()` and send the authoritative size, not the event's delta.
+- Test resize behavior specifically inside Windows Terminal (not just in cmd.exe or PowerShell): start a session, resize the window, verify the server PTY reflects the new size within 100 ms.
+- Do not implement a SIGWINCH listener on Windows — it does not exist.
+
+**Warning signs:**
+Resize events are never sent from the Windows client; `vim` or `less` does not reflowing content on terminal resize; resize works on Linux client but not Windows.
+
+**Phase to address:**
+Phase 5 (Windows client) — write a resize integration test that is Windows-only.
+
+---
+
+### Pitfall 15: Windows Client CRLF / Codepage — Raw Mode Breaks or Output Is Garbled
+
+**What goes wrong:**
+The Windows client enters raw mode (disables `ENABLE_PROCESSED_INPUT` and `ENABLE_LINE_INPUT`). The server sends VT/ANSI escape sequences for the remote terminal. Windows Terminal handles these natively, but cmd.exe and older PowerShell hosts do not enable `ENABLE_VIRTUAL_TERMINAL_PROCESSING` by default. Result: escape sequences are printed verbatim rather than interpreted, and the terminal output is unreadable garbage.
+
+**Why it happens:**
+`ENABLE_VIRTUAL_TERMINAL_PROCESSING` must be explicitly set on the Windows console output handle before escape sequences are interpreted. `crossterm` sets this flag when entering raw mode, but only for the console it controls — not for inherited console handles. Additionally, the default Windows codepage is not UTF-8 (it is typically CP1252 or similar); non-ASCII characters in the remote shell output are misinterpreted.
+
+**How to avoid:**
+- Call `crossterm::terminal::enable_raw_mode()` — it handles `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and `ENABLE_PROCESSED_OUTPUT` flags.
+- At startup, check the current output codepage via `GetConsoleOutputCP()` (accessible via the `windows` crate) and emit a warning if it is not 65001 (UTF-8). Ideally, set it via `SetConsoleOutputCP(65001)` or instruct the user.
+- Test the client in both Windows Terminal and a legacy cmd.exe window to verify both work (or at least fail gracefully).
+
+**Warning signs:**
+Escape sequences printed as literal `^[[H^[[2J` strings; non-ASCII characters replaced with `?` or `â€`; output is correct in Windows Terminal but garbled in cmd.exe.
+
+**Phase to address:**
+Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 ---
 
@@ -276,11 +336,13 @@ M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify
 
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| `SkipServerVerification` stub as the actual verifier | Unblocks M0 quickly | No auth at all; MITM trivial | M0 spike only, never land on main with this active |
-| Full environment passthrough from client to server | Simpler session-open protocol | Privilege escalation footgun | Never; whitelist from day one |
-| `max_idle_timeout(None)` (infinite) | No dropped sessions in testing | Hung futures on broken paths | Never in production; use long but finite timeout |
-| Hard-coded datagram buffer size without checking `max_datagram_size()` | Simpler send path | Silent drops or errors on constrained paths | Only for M0 where path is loopback; must fix in M2 |
-| Not calling `portable-pty`'s `wait()` before dropping the PTY pair | Simpler cleanup | Zombie child processes accumulate | Never; implement Drop properly |
+| Skip per-identity session cap for now | Simpler orphan store | Unbounded memory growth under crash/reconnect abuse | Never; cap must exist before first orphan is stored |
+| Session state machine as ad-hoc `Option<Connection>` flags | Simpler code | Reattach race condition; two clients one session | Never; use explicit state enum |
+| Hold `PrivateKey` for the lifetime of the connection | Simpler key-loading code | Key material in memory longer than needed; visible in dumps | Never; narrow-scope load-sign-drop |
+| Check file permissions with `std::fs` on Windows | Cross-platform code path | ACLs not checked; false security assurance | Acceptable for v1.1 with explicit documentation |
+| `crossterm` resize polling without double-check of `terminal::size()` | Simpler event loop | Stale size sent to server on fast consecutive resizes | Only if resize accuracy is not critical |
+| Reattach token without re-running SSH auth | Simpler reconnect flow | Session hijacking if token is leaked | Never; auth runs on every connection |
+| Store orphaned sessions in a global `Mutex<HashMap>` | Trivial to implement | Contention at scale; hard to integrate per-identity cap | Only if sessions per server is very small (< 10) |
 
 ---
 
@@ -288,12 +350,15 @@ M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify
 
 | Integration | Common Mistake | Correct Approach |
 |-------------|----------------|------------------|
-| quinn + rustls ALPN | Forgetting to set `alpn_protocols` on one side | Define `ALPN` constant in `proto` crate, set on both sides in every config |
-| rustls dangerous verifier | Copying `SkipServerVerification` verbatim for key pinning | Implement real signature verification in `verify_tls13_signature` |
-| ssh-agent RSA signing | Not setting SHA-2 flags in sign request | Map `SignatureScheme` → agent flags before every RSA sign call |
-| quinn datagrams | Leaving `datagram_receive_buffer_size` at `None` | Explicitly set non-`None` on both endpoints |
-| portable-pty + tokio | Calling blocking `Child::wait()` on the async thread | Spawn `wait()` in `tokio::task::spawn_blocking` |
-| PTY client raw mode | Not restoring terminal on panic or network drop | Use RAII guard implementing `Drop` to call `disable_raw_mode()` |
+| quinn migration | Not setting `ServerConfig::migration(true)` explicitly | Assert migration is enabled in server config constructor; add integration test |
+| QUIC path validation | Assuming anti-amplification is transparent | Factor in 1–2 RTT stall after migration in output-heavy test assertions |
+| Session orphan store | Inserting session before verifying identity is threaded | Use `NoshSession::from_authenticated_connection()` constructor that panics if identity absent |
+| Cold reattach auth | Checking token only, not re-running SSH handshake | Two-factor check: SSH handshake + token + identity fingerprint match |
+| Windows key loading | Holding `PrivateKey` in a `Connection` struct | Narrow scope: load in signing function, drop before first `await` |
+| Windows resize | Using `SIGWINCH` handler on Windows | Use `crossterm::event::EventStream` which abstracts platform |
+| Windows raw mode | Assuming `enable_raw_mode()` handles VT processing | Test in both Windows Terminal and cmd.exe; VT processing may be off in legacy hosts |
+| Zombie orphan cleanup | No periodic `try_wait()` on orphaned child processes | Background reaper task polls all orphaned sessions |
+| Sequence resync | Using QUIC stream offsets as sequence numbers | Use application-layer u64 monotonic counter; QUIC offsets reset per connection |
 
 ---
 
@@ -301,10 +366,10 @@ M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify
 
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| SIGWINCH burst on window drag fires a resize per pixel row | PTY resize floods the QUIC stream; interactive latency spikes | Coalesce resize events with a 30–50 ms debounce timer | Immediate; any drag of the terminal window |
-| Polling `MasterPty::read()` in a tight loop | 100% CPU on the server | Use `tokio::io::AsyncReadExt` on the PTY master fd | Always; even in spike |
-| Sending datagrams without checking `max_datagram_size()` in a loop | Intermittent `TooLarge` errors on path-MTU reduction | Check before send; clamp or skip | On lossy/constrained network paths |
-| Reading large `recv_datagram()` in the async executor without yielding | Starves other tasks sharing the executor | Use `tokio::task::spawn_blocking` or bounded buffer | With large terminal output bursts |
+| PATH_CHALLENGE flood attack per Seemann 2023 | Server memory grows unbounded if attacker sends many PATH_CHALLENGEs | quinn 0.11.x limits queued PATH_RESPONSE frames to 256 per connection — verify the version in use includes this fix | Under deliberate attack; quinn >= 0.10.4 has the fix |
+| Orphaned session ring buffer unbounded growth | Server memory grows proportional to shell output × session count | Cap ring buffer at a fixed size (e.g. 64 KB per session); this bounds the reattach replay size | When many sessions are orphaned and shells produce high output |
+| Resize coalescing not applied on Windows | Resize flood on window drag on Windows too | Apply same 30–50 ms debounce as Linux path | Any window drag on Windows client |
+| Cold reattach replays entire ring buffer on reconnect | Reconnect latency grows with buffer size | Only replay unacknowledged bytes (from `last_seen_sequence`), not the full buffer | If ring buffer is large and reconnect is frequent |
 
 ---
 
@@ -312,13 +377,13 @@ M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify
 
 | Mistake | Risk | Prevention |
 |---------|------|------------|
-| Env passthrough includes `LD_PRELOAD` / `BASH_ENV` | Arbitrary code execution in shell context | Deny-all env whitelist at session open (MUST-ADDRESS M2) |
-| `SSH_AUTH_SOCK` forwarded via env | SSH key hijacking by server root | Exclude from env whitelist; agent forwarding uses dedicated stream in M5 |
-| `verify_tls13_signature` stubbed as `Ok(assertion())` | MITM can forge any handshake | Delegate to `CryptoProvider` signature verification algorithms |
-| ECDSA curve not checked in custom verifier | Cross-curve signature forgery | Check curve in `verify_tls13_signature` for ECDSA — rustls does not do this for you |
-| Unlimited half-open connections | Memory exhaustion DoS (CVE-2024-22189 pattern) | Cap pre-auth connections; abort on auth timeout (MUST-ADDRESS M1) |
-| Infinite `max_idle_timeout` | Hung futures on broken path | Use a finite timeout (minutes, not infinite) |
-| PTY spawned without setsid / controlling terminal isolation | Shell signals can escape to server process | Verify `portable-pty` calls `setsid()` on slave side (it does on Linux); do not give child a reference to server's controlling terminal |
+| Reattach token replaces SSH auth (not supplements it) | Token theft = session hijacking without key possession | SSH handshake runs on every connection; token is a session selector only |
+| Session token logged or included in error messages | Token exposure via log aggregators | Never log the token; use session IDs (non-secret) for logging |
+| Oracle: reveal whether session token exists on mismatch | Attacker enumerates valid tokens | Return same error for "bad token" and "bad identity" |
+| Windows private key in memory beyond signing scope | Key visible in dumps/memory probes | Narrow scope; `Zeroizing` types in `ssh-key` help but are not a guarantee |
+| Windows key file world-readable (ACL gap) | Any user on the system can read the private key | Warn if `FILE_ATTRIBUTE_READONLY` is not set; document ACL limitation |
+| CID reuse across migration paths | Correlates user across networks | Rely on quinn's automatic CID rotation; verify with qlog |
+| Orphaned session not bound to SSH identity | Any authenticated user can reattach to any orphan | Identity fingerprint stored in `OrphanedSession`; checked on reattach |
 
 ---
 
@@ -326,24 +391,29 @@ M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify
 
 | Pitfall | User Impact | Better Approach |
 |---------|-------------|-----------------|
-| Client terminal left in raw mode after abrupt disconnect | Shell appears broken (no echo, garbled input) after `nosh` exits | RAII guard on client that calls `disable_raw_mode()` in `Drop` |
-| Exit code not propagated from PTY child | Callers (`make`, scripts) see exit 0 on remote failure | Poll `Child::try_wait()` in the event loop; forward exit code in session-close control message |
-| SIGWINCH not sent after reconnect | Remote editor/pager wrong size after cold reattach | Send a resize event as part of session resume handshake |
-| Shell output after "connection closed" races with terminal restore | Garbled output on exit | Flush and drain the PTY master before restoring terminal mode |
+| No resize event sent on cold reattach | Remote editor/pager wrong size after reconnect | Send a resize message as part of the `ReattachRequest` or immediately after reattach completes |
+| Reattach latency hides behind "connecting..." | User unsure if reconnect is working or hung | Emit a brief client-side status message: "Reconnecting..." then "Session resumed." |
+| Windows codepage warning on every startup | Annoys users who already have UTF-8 set | Only warn once; cache the check; suppress if codepage is already 65001 |
+| Orphan eviction kills a running job silently | User loses work | Log a message when an orphan is evicted due to the per-identity cap; make the cap configurable |
+| Session token visible in process arguments | Leaks token to other local users via `ps` | Pass token via control message on the QUIC stream, not as a command-line argument |
 
 ---
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **Datagrams enabled:** Assert `connection.max_datagram_size()` returns `Some(_)` — if `None`, one side left `datagram_receive_buffer_size` at default
-- [ ] **Auth actually authenticates:** Test that a connection attempt with an unknown key is rejected — not just that a known key is accepted
-- [ ] **Signature actually verified:** Test that a cert with the correct pinned key but a forged `CertificateVerify` signature is rejected
-- [ ] **RSA key path tested:** If only tested with Ed25519, the agent RSA SHA-2 flag path is untested
-- [ ] **Terminal raw mode restored:** Kill the client process with SIGKILL during a session; verify the local terminal is still usable
-- [ ] **Zombie cleanup:** Disconnect mid-session; verify `ps aux | grep Z` shows no zombie PTY children
-- [ ] **Env whitelist enforced:** Start a session, check the shell's environment for `LD_PRELOAD` and `SSH_AUTH_SOCK` — both must be absent
-- [ ] **ALPN validated post-handshake:** Log `handshake_data.protocol` and assert it equals the expected ALPN token
-- [ ] **Keep-alive configured:** Leave a connected session idle for 60 seconds with no input; it must not drop
+- [ ] **Migration enabled:** Assert `ServerConfig::migration(true)` is set; run a test that migrates the client IP and verifies the session survives.
+- [ ] **CID rotation on migration:** Inspect QUIC qlog; verify new CIDs are used on the new path.
+- [ ] **Anti-amplification stall test:** Run a large server→client output stream through a simulated migration; assert no pause longer than 3 RTTs.
+- [ ] **Session persists through disconnect:** Disconnect client mid-session; verify server-side shell is still running; verify no SIGHUP delivered.
+- [ ] **Per-identity cap enforced:** Create more sessions than the cap for one identity; verify new connections are rejected or oldest orphan is evicted.
+- [ ] **Zombie reaper running:** Let multiple orphaned shells exit; within 10 s, verify `ps aux | grep defunct` shows no zombies.
+- [ ] **Reattach requires SSH re-auth:** Reattach with a valid token but a different key; verify the connection is rejected.
+- [ ] **Reattach with correct identity and token succeeds:** Full happy-path reconnect test; verify output is replayed correctly from `last_seen_sequence`.
+- [ ] **Sequence resync: no duplicates, no gaps:** Disconnect during large output; reconnect; diff combined output against full server-side log.
+- [ ] **Identity threaded:** After handshake, log `session.identity`; assert it equals the expected SSH fingerprint.
+- [ ] **Windows key-file narrow scope:** Confirm `PrivateKey` is not stored in any long-lived struct; code review the signing path.
+- [ ] **Windows resize works:** In Windows Terminal, resize the window during a running session; verify the server PTY reflects the new size.
+- [ ] **Windows VT processing:** Run the client in cmd.exe; verify escape sequences are interpreted, not printed literally.
 
 ---
 
@@ -351,12 +421,13 @@ M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| Datagrams silently disabled | LOW | Add `datagram_receive_buffer_size(Some(N))` to TransportConfig on both sides; retest M0 |
-| ALPN mismatch | LOW | Introduce shared `ALPN` constant; update both sides |
-| Auth verifier stub in production | HIGH | Full rewrite of verifier; audit all connections made during the window |
-| Env sanitization missing | HIGH | Add whitelist + test; audit server for signs of exploitation before shipping |
-| Zombie PTY children | MEDIUM | Add explicit `Drop` impl calling `kill()` + `wait()` on the child |
-| Terminal raw mode not restored | MEDIUM | Add RAII guard with `Drop`; test with deliberate panic |
+| `ServerConfig::migration` off — sessions drop on IP change | LOW | Add `.migration(true)` to server config; re-run migration integration test |
+| Orphan SIGHUP kills shell on disconnect | HIGH (protocol redesign) | Restructure session ownership: `MasterPty` must be moved to orphan struct, not dropped |
+| Reattach token without SSH re-auth shipped | HIGH (security incident) | Add SSH handshake check before honoring token; audit any sessions that reattached during the window |
+| Sequence number wrap-around causes output corruption | MEDIUM | Upgrade u32 to u64; bump protocol version; add wrap detection test |
+| Windows key file held too long — key in memory dump | MEDIUM | Refactor signing path to narrow scope; key-dropping is a code change only |
+| Zombie accumulation — reaper not implemented | MEDIUM | Add `try_wait()` background task; force-kill orphans above a threshold |
+| Windows VT processing not enabled — garbled output | LOW | `crossterm::terminal::enable_raw_mode()` sets the flag; verify it is called before first byte of output |
 
 ---
 
@@ -364,42 +435,41 @@ M1 — write an explicit unit test that constructs the TLS 1.3 CertificateVerify
 
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| Datagrams silently disabled | M0 | Assert `max_datagram_size()` returns `Some(_)` in M0 integration test |
-| Datagram size exceeds MTU | M0 (awareness) / M4 (enforcement) | Test on loopback (always passes) and across a simulated constrained path |
-| Idle timeout drops quiet session | M0 (set keep-alive) / M2 (validate) | Leave interactive session idle 2× timeout; session must survive |
-| ALPN mismatch | M0 | Post-handshake ALPN assertion in M0 test |
-| Verifier stub passes forged signatures | M1 | Negative test: forged CertificateVerify must be rejected |
-| RPK vs self-signed-cert path confusion | M1 | Decide early; one path only in spike |
-| ssh-agent RSA SHA-1 fallback | M1 | Explicit RSA key test with SHA-2 verification |
-| TLS transcript bytes wrong | M1 | Unit test: known key + known transcript + expected signature |
-| Env variable injection (FOOTGUN-1) | M2 | Integration test: attempt to inject `LD_PRELOAD`; verify absent from shell env |
-| SSH_AUTH_SOCK via env (FOOTGUN-2) | M2 | Integration test: verify `SSH_AUTH_SOCK` absent from shell env |
-| Half-open connection DoS (FOOTGUN-3) | M1 | Load test: flood with unauthenticated connections; memory must stay bounded |
-| Terminal raw mode not restored | M2 | Kill client with SIGKILL mid-session; verify local terminal usable |
-| Zombie PTY children | M2 | Disconnect mid-session; verify no zombies |
-| SIGWINCH burst storms | M2 | Drag terminal window; verify resize events coalesced |
-| Exit code not propagated | M2 | `exit 42` in remote shell; local client must report exit 42 |
+| `ServerConfig::migration` not set | Phase 1 (migration) | Integration test: IP change during active session; session must survive |
+| Anti-amplification stall after migration | Phase 1 (migration) | Large-output stream test through migration event |
+| CID linkability across migration | Phase 1 (migration) | qlog inspection: new CIDs on new path |
+| Keep-alive/idle timeout misconfig during migration | Phase 1 (migration) | 5–10 s simulated path change; no `TimedOut` |
+| Orphaned session memory growth (no cap) | Phase 2 (session persistence) | Stress test: many disconnects; memory stays bounded |
+| Zombie shell processes | Phase 2 (session persistence) | Orphan then exit shell; `ps aux | grep defunct` = empty |
+| SIGHUP kills shell on disconnect | Phase 2 (session persistence) | Disconnect client; shell still running after 5 s |
+| Reattach token without SSH re-auth | Phase 3 (cold reattach) | Negative test: correct token, wrong key → rejected |
+| Sequence number resync (duplicates/gaps) | Phase 3 (cold reattach) | Diff combined output against full server log |
+| Reattach race (two clients one session) | Phase 3 (cold reattach) | Concurrent reattach test; only one must succeed |
+| `Session.identity` not threaded | Phase 4 (identity threading) | Assert `session.identity` matches presented key fingerprint |
+| Windows key material in memory | Phase 5 (Windows client) | Code review + test: `PrivateKey` not in long-lived structs |
+| Windows file permission ACL gap | Phase 5 (Windows client) | Document limitation; best-effort `readonly()` warning |
+| Windows resize (no SIGWINCH) | Phase 5 (Windows client) | Windows-only resize integration test |
+| Windows VT processing off in legacy hosts | Phase 5 (Windows client) | Test in cmd.exe; escape sequences interpreted not printed |
 
 ---
 
 ## Sources
 
-- Quinn 0.11.8 `TransportConfig` docs (Context7 + docs.rs): `datagram_receive_buffer_size` defaults to `None`; `max_idle_timeout` defaults to 30 s; `keep_alive_interval` defaults to `None` — https://docs.rs/quinn/0.11.8/quinn/struct.TransportConfig.html
-- Quinn `Connection::max_datagram_size()` docs (Context7): returns `None` when disabled locally or by peer — https://docs.rs/quinn/0.11.8/quinn/struct.Connection.html
-- rustls `ServerCertVerifier` trait docs: ECDSA curve enforcement not done by rustls — https://docs.rs/rustls/latest/rustls/client/danger/trait.ServerCertVerifier.html
-- rustls issue #2257: `UnsolicitedCertificateTypeExtension` non-compliance with RFC 7250 — https://github.com/rustls/rustls/issues/2257
-- Quinn certificate guide: `SkipServerVerification` pattern and `dangerous()` API — https://quinn-rs.github.io/quinn/quinn/certificate.html
-- OpenSSH agent RSA SHA-2 flags (asyncssh issue #795): `SSH_AGENT_RSA_SHA2_256` flag 0x2, `SSH_AGENT_RSA_SHA2_512` flag 0x4 — https://github.com/ronf/asyncssh/issues/795
-- CVE-2024-22189: QUIC `NEW_CONNECTION_ID` frame flooding → memory exhaustion — https://ogma.in/cve-2024-22189-mitigating-memory-exhaustion-attack-in-quic-s-connection-id-mechanism
-- RFC 8446 §4.4.3: TLS 1.3 `CertificateVerify` input construction (64 spaces + context + 0x00 + transcript hash)
-- RFC 9221: Unreliable Datagram Extension to QUIC — https://datatracker.ietf.org/doc/html/rfc9221
-- QUIC ALPN mandatory (`no_application_protocol` error 0x178): QUIC base-drafts wiki — https://github.com/quicwg/base-drafts/wiki/ALPN-IDs-used-with-QUIC
-- SSH agent forwarding socket hijacking — https://rabexc.org/posts/pitfalls-of-ssh-agents
-- portable-pty zombie process pitfall — https://docs.rs/portable-pty/latest/portable_pty/
-- Terminal raw mode not restored on SIGKILL — https://github.com/slopus/happy/issues/423
-- LD_PRELOAD privilege escalation mechanics — https://www.elttam.com/blog/env
-- INIT.md §5, §12, §13 (quicshell env sanitization and DoS hardening design notes)
+- Quinn `ServerConfig` docs — `migration()` method and default (enabled): https://docs.rs/quinn/latest/quinn/struct.ServerConfig.html
+- Quinn `TransportConfig` docs — `keep_alive_interval`, `max_idle_timeout` defaults: https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html
+- RFC 9000 §9.4 — Anti-amplification limit on new paths (3× bytes received): https://www.rfc-editor.org/rfc/rfc9000.html
+- RFC 9000 §9.5 — CID rotation requirement on migration for privacy: https://www.rfc-editor.org/rfc/rfc9000.html
+- Marten Seemann — PATH_CHALLENGE flood attack, 256-frame cap fix: https://seemann.io/posts/2023-12-18---exploiting-quics-path-validation/
+- ssh-key `PrivateKey` docs — `Zeroizing` types, `read_openssh_file`, signing: https://docs.rs/ssh-key/latest/ssh_key/private/struct.PrivateKey.html
+- Windows OpenSSH private key permissions — ACL vs FILE_ATTRIBUTE_READONLY: https://github.com/PowerShell/Win32-OpenSSH/wiki/Security-protection-of-various-files-in-Win32-OpenSSH
+- Rust `std::fs::Permissions` docs — ACLs not read: https://doc.rust-lang.org/std/fs/struct.Permissions.html
+- Windows Terminal — no VT encoding for resize events; WINDOW_BUFFER_SIZE_RECORD quirks: https://github.com/microsoft/terminal/issues/394
+- crossterm resize events on Windows — `WINDOW_BUFFER_SIZE_RECORD` vs SIGWINCH: https://github.com/crossterm-rs/crossterm/issues/165
+- crossterm window size on Windows Terminal returns buffer not viewport: https://github.com/crossterm-rs/crossterm/issues/1021
+- QUIC multipath — simultaneous both-endpoint migration via CID distinction: https://quicwg.org/multipath/draft-ietf-quic-multipath.html
+- INIT.md §9 (session persistence, cold reattach design) — authoritative source for sequence-number reattach model
+- INIT.md §5 (security invariants) — env sanitization, no SSH_AUTH_SOCK in env, privilege-escalation footguns
 
 ---
-*Pitfalls research for: QUIC-based roaming remote shell (nosh), M0–M2 spike surface*
-*Researched: 2026-05-29*
+*Pitfalls research for: QUIC-based roaming remote shell (nosh), v1.1 M3 Roaming + Windows Client*
+*Researched: 2026-05-30*

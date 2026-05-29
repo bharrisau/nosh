@@ -1,290 +1,226 @@
 # Project Research Summary
 
 **Project:** nosh — QUIC-based roaming remote shell
-**Domain:** Network transport / interactive terminal / systems Rust
-**Researched:** 2026-05-29
+**Domain:** v1.1 M3 Roaming + Windows Client (incremental milestone on a working Rust QUIC shell)
+**Researched:** 2026-05-30
 **Confidence:** HIGH
 
 ## Executive Summary
 
-nosh is a roaming-tolerant remote shell that routes an interactive PTY over a single QUIC connection on UDP/443, using the user's existing SSH keys for mutual authentication. The M0–M2 milestone is an architecture-validation spike with a hard sequential dependency chain: prove QUIC datagrams and streams coexist (M0), prove SSH-key mutual auth gates the connection at the TLS layer (M1), prove a live PTY session rides the authenticated connection (M2). All four research streams agree this chain is tractable with well-understood Rust crates, and the spike scope is deliberately narrow — Linux only, no roaming, no predictive echo, no forwarding.
+nosh v1.1 adds two orthogonal but architecturally well-understood capabilities to an already working QUIC shell: QUIC connection migration (roaming) and a bounded Windows-client slice. The research finding that changes the implementation order is that `Session.identity` threading is a prerequisite for nearly everything in this milestone — session persistence, reattach authorization, and the per-identity cap all depend on the authenticated peer SPKI being extracted from the TLS handshake and stored in `Session.identity`. This seam was deliberately deferred in v1.0 and must be the first implementation task. Migration, by contrast, requires almost no application code: `ServerConfig::migration(true)` is the effective totality of the QUIC-layer change, and the pump tasks continue transparently.
 
-The recommended approach is: quinn 0.11.x as the QUIC layer (the only mature async/tokio QUIC crate), rustls 0.23.x as the TLS 1.3 backend, and self-signed-cert key-pinning (custom `ServerCertVerifier` / `ClientCertVerifier`) as the M1 auth path — not RFC 7250 raw public keys (RPK), which are technically available in rustls 0.23.16+ but carry a known compliance caveat (issue #2257) whose current resolution status is unconfirmed. RPK is the right long-term target; cert-pinning is the right spike target. Signing routes through `ssh-agent-client-rs` (synchronous, purpose-built, v1.1.2) so the private key is never handled directly and hardware keys work without extra effort.
+The recommended build order groups work around its dependencies: identity threading first (unblocks everything), then session persistence and the session state machine (precondition for reattach), then cold reattach protocol (the primary implementation complexity), then connection migration validation (nearly independent, lightest by implementation weight), then Windows client (isolated behind `#[cfg]` gates, can overlap with Phases 3-4 once nosh-auth's FileSigner is stable). The stack requires no new crates beyond a `crossterm` bump from 0.28.1 to 0.29.0 and adding `futures = "0.3"` for EventStream; all other building blocks (uuid, ssh-key, ed25519-dalek, postcard) are already in the lockfile.
 
-The primary risks fall into two categories. First, there are correctness gotchas at the quinn/rustls boundary that silently pass if you do not test for them: datagrams are disabled by default and must be explicitly enabled on both endpoints; keep-alive is off by default and the 30 s idle timeout will kill a quiet interactive session; the custom cert verifier must not stub out `verify_tls13_signature` or it provides no authentication at all; and the TLS 1.3 `CertificateVerify` input is not just the transcript hash. Second, there are three non-negotiable security items that belong in M2, not later: environment-variable injection (strip `LD_*`, `BASH_ENV`, etc.; deny-all whitelist); `SSH_AUTH_SOCK` forwarded via environment (explicit exclusion from the whitelist); and unbounded pre-auth connection state (cap half-open connections, abort on auth timeout).
-
----
+The main implementation risk is the cold reattach subsystem: the `SequencedOutputBuffer` ring buffer plus the session state machine (Active → Orphaned → Reconnecting) must be correct before any reconnect logic is exercised, and the two-factor reattach authorization (SSH handshake identity check AND session token) must be designed in from the start — retrofitting the identity check after a token-only implementation requires a protocol change. The secondary risk is Windows platform behavior: resize events arrive as `WINDOW_BUFFER_SIZE_RECORD` (not SIGWINCH), VT processing must be explicitly enabled in legacy console hosts, and the file-permission check cannot read Windows ACLs and must be documented as best-effort.
 
 ## Key Findings
 
 ### Recommended Stack
 
-The stack is well-understood and all versions are verified against current crates.io / docs.rs data. The quinn 0.11.x series requires rustls 0.23.x (via `quinn::crypto::rustls::QuicServerConfig::try_from()`); these two are the non-negotiable core. Everything else follows directly from the design goals. The `rustls-ring` crypto backend is preferred over `rustls-aws-lc-rs` for the spike because ring builds without a C toolchain dependency.
+The v1.1 stack is additive on top of the locked v1.0 crates. The single dependency change is bumping `crossterm` from 0.28.1 to 0.29.0 (OSC52 support useful for M5; rustix 1.0; no breaking API changes) and adding `futures = "0.3"` for the `EventStream` async trait bound. All session persistence, reattach token generation, and output buffering logic is implemented over existing crates (`uuid`, `postcard`, `bytes`, `VecDeque`). The Windows on-disk key signing path is pure Rust (`ssh-key` 0.6.7 `encryption` feature + `ed25519-dalek` 2.2.0), requires no C build toolchain, and builds cleanly on `x86_64-pc-windows-msvc` once `ring` 0.17.14's precompiled assembly objects are in place.
 
-**Core technologies:**
+**Core technologies (v1.1 additions and confirmations):**
 
-| Crate | Version | Purpose |
-|-------|---------|---------|
-| `quinn` | 0.11.9 | QUIC transport — only mature async/tokio QUIC crate; RFC 9221 datagram support built in |
-| `rustls` | 0.23.40 | TLS 1.3 via quinn's crypto layer; custom verifier traits enable SSH-key pinning |
-| `tokio` | 1.52.x | Async runtime (LTS until Mar 2027); quinn's only supported runtime |
-| `portable-pty` | 0.9.0 | PTY abstraction (wezterm); `native_pty_system()` already returns ConPTY on Windows for M6 |
-| `ssh-key` | 0.6.7 | Parse Ed25519/ECDSA/RSA OpenSSH public keys, `authorized_keys`, `known_hosts` |
-| `ssh-agent-client-rs` | 1.1.2 | Synchronous ssh-agent client; matches rustls's synchronous `Signer::sign()` trait |
-| `ed25519-dalek` | 2.2.0 | Ed25519 key material (use stable 2.2.0; 3.0.0-pre.7 is pre-release — avoid) |
-| `rcgen` | 0.14.8 | Generate ephemeral self-signed X.509 certs for the cert-pinning path |
-| `vte` | 0.15.0 | VT/ANSI parser for server-side terminal state model (M2+) |
-
-**Do not use:** `rustls` < 0.23.16 (no RPK), `quinn` < 0.11 (different API), `openssh` crate (spawns subprocess), `tokio-rustls` directly (quinn handles TLS/QUIC integration), `rustls-native-certs` (for PKI chains only), `ssh-agent-lib` (for writing agent servers, not clients).
-
-**Auth path decision — cert-pinning first, RPK as follow-up:**
-
-The cert-pinning path uses `rustls::client::danger::ServerCertVerifier` / `rustls::server::danger::ClientCertVerifier` with custom `verify_server_cert()`/`verify_client_cert()` that extract and compare `SubjectPublicKeyInfo` rather than walking a PKI chain. This is battle-tested, fully supported, and is what quinn's `dangerous_configuration` feature is designed for. The RPK path (`AlwaysResolvesServerRawPublicKeys` / `AlwaysResolvesClientRawPublicKeys`, available since rustls 0.23.16) is the preferred long-term target, but rustls issue #2257 (RPK wire-format non-compliance) was open as of late 2024; its status in 0.23.40 is not confirmed. Start with cert-pinning; validate RPK on a dedicated follow-up branch.
-
-**ssh-agent to rustls signing:** `rustls::sign::Signer::sign()` is synchronous (matching `ssh-agent-client-rs`). The integration pattern is `AgentSigningKey` + `AgentSigner` that open a new socket connection to the agent per signing call. Ed25519 path is straightforward. RSA path requires explicit `SSH_AGENT_RSA_SHA2_256` (flag 0x2) or `SHA2_512` (flag 0x4) in the sign request — the `ssh-agent-client-rs` 1.1.2 public API does not expose these flags; validate at implementation time or fall back to `ssh-agent-lib` for RSA.
-
-**QUIC datagram configuration:** Datagrams are disabled by default in quinn. Both endpoints must set `transport_config.datagram_receive_buffer_size(Some(1 << 20))`. Fail to do this and `conn.max_datagram_size()` returns `None` silently and all datagram sends fail. This is the M0 spike's first test assertion.
-
-**PTY I/O bridge:** `portable_pty::MasterPty::try_clone_reader()` returns a blocking `Box<dyn Read + Send>`. Bridge to tokio with `tokio::task::spawn_blocking` per read chunk (correct and simple for the spike) or `tokio::io::unix::AsyncFd` wrapping the raw PTY fd (lower overhead, valid for M2+).
+- `quinn` 0.11.9: migration is `ServerConfig::migration(true)` on the server; `Endpoint::rebind()` for deliberate interface switches on the client; `Connection::stable_id()` is the correct live-session map key before orphaning. Methods `Connection::migrate()`, `set_path()`, `network_path()`, `path()` do NOT exist — do not search for them.
+- `crossterm` 0.29.0: Windows raw mode, resize events, and EventStream; upgrade from 0.28.1; do NOT enable `use-dev-tty` (Unix-only, breaks Windows build with `event-stream` per issue #935)
+- `ssh-key` 0.6.7 + `encryption` feature: on-disk private key loading with passphrase decryption for Windows client; gate the `encryption` feature behind `cfg(target_os = "windows")` to avoid inflating the Linux server binary
+- `ed25519-dalek` 2.2.0: Ed25519 signing inside `FileSigner` for Windows; already in tree; do not upgrade to 3.0.0-pre (pre-release API)
+- `uuid` 1.x v4: session token generation (already in nosh-server); 122 bits of CSPRNG entropy sufficient for reattach tokens
+- `rustls-ring` (not `aws-lc-rs`): ring 0.17.14 ships precompiled x86_64-windows assembly — no NASM, no CMake; keep this backend for the Windows build path
 
 ### Expected Features
 
-**Spike table-stakes (M0–M2 — must exist for the session to be real):**
+**Must have (table stakes for v1.1 launch):**
 
-- QUIC datagram + stream coexistence on one connection (M0)
-- SSH-key mutual auth via TLS handshake (M1) — self-signed-cert-pinning path; signing via ssh-agent
-- Server-side PTY allocation and login shell spawn (M2)
-- Client raw-mode terminal + keystroke delivery + shell output delivery (M2)
-- `TERM` propagation and correct initial PTY size (M2)
-- Window resize propagation / SIGWINCH to `PtyBridge.resize()` with burst coalescing (M2)
-- Exit code propagation: `Child::wait()` to `SessionClose { exit_code }` control frame to client `process::exit()` (M2)
-- Clean connection close (ordered QUIC stream FIN + connection close) (M2)
-- Env-var sanitization: deny-all whitelist on shell spawn (M2)
+- `Session.identity` threaded from authenticated TLS cert — fills the explicit v1.0 seam at `session.rs:119`; prerequisite for all other persistence and reattach features
+- Server-side session persistence — PTY + shell survive QUIC connection drop; sessions enter orphaned state; `idle_timeout` default 0 (disabled); per-identity cap (default 5) is the memory bound
+- Cold reattach (1-RTT) — `Reattach{token, last_acked_seq}` on the new connection's first stream; server validates identity + token; replays buffered output; 2 RTTs total client-perceived (handshake + 1 message)
+- Reattach authorization bound to SSH identity — two-factor: TLS handshake re-runs on every reconnect (same `authorized_keys` check); token is a session selector, not a credential
+- QUIC connection migration — headless CI test via `Endpoint::rebind()`; `ServerConfig::migration(true)` set explicitly; real Wi-Fi→cellular is a human live-check complement
+- Windows client: VT raw mode and terminal resize — `crossterm::terminal::enable_raw_mode()` on startup; `Event::Resize` via `EventStream`; SIGWINCH handler gated `#[cfg(unix)]`
+- Windows client: on-disk Ed25519 key signing — `ssh-key` parse → optional passphrase decrypt → `ed25519-dalek` sign → `FileSigner` implementing `RawEd25519Signer`
+- Windows client: TERM and locale propagation — `TERM` defaulting to `xterm-256color`; `LANG=en_US.UTF-8` if unset
 
-**Cheap now, painful later — pull into spike to avoid retrofit:**
+**Should have (competitive differentiation):**
 
-- **Server-side session struct**: `{ session_id: Uuid, ssh_identity, pty_handle, shell_pid, idle_since }` defined at M2; M3 cold-reattach wraps it in a `SessionStore` without refactoring the connection handler
-- **Exit-code forwarding via explicit `SessionClose` control frame**: define the close protocol now; distinguishes clean exit from network drop in all future features
-- **Resize-burst coalescing**: 30–50 ms debounce on `SIGWINCH`; cheap now, entangled with migration logic at M3
-- **Structured per-session logging**: one `tracing` span per session with `session_id`, `peer_addr`, `username`; zero cost in release builds
-- **Locale / `LC_*` pass-through**: part of the env whitelist; missing it causes non-ASCII corruption immediately
+- Headless migration CI test — makes the "zero-RTT invisible roaming" differentiator testable vs Mosh (seconds-visible stall) and ET (reconnection dialog)
+- Native Windows client without WSL — first among Mosh/ET successors; opens the tool to Windows-first developers
+- Reattach authorization via SSH identity (not a session password) — stronger than ET's separate session password; reattach is as secure as the original login
 
-**Deferred differentiators (M3–M7, not in spike):**
+**Defer (post-v1.1):**
 
-- M3: Roaming / QUIC connection migration; cold-reattach (sequence-numbered session)
-- M4: Predictive local echo (requires VT state model on client; hardest UX correctness problem)
-- M5: Native scrollback, agent forwarding, port forwarding, channel multiplexing, OSC 52
-- M6: Windows native (ConPTY — `portable-pty` already abstracts it)
-- M7: WebTransport / NAT hole-punch / relay; happy-eyeballs transport selection
-
-**Anti-features (explicitly rejected):**
-
-- Being a terminal emulator (nosh is a transport layer; the local emulator renders)
-- Application-layer cipher/algorithm negotiation (TLS 1.3 handles this; negotiation is a downgrade surface)
-- 0-RTT (replayable; the one use case is dwarfed by Wi-Fi/DHCP bring-up time)
-- Inbound server port range (Mosh model — NAT/firewall-hostile)
-- `SSH_AUTH_SOCK` via environment (dedicated agent channel in M5; never env)
-- Custom UDP protocol (QUIC RFC 9221 provides this free)
+- Windows ssh-agent / Pageant integration — named-pipe IPC; out of scope for bounded Windows slice
+- Passphrase-encrypted key interactive prompt — P2; unencrypted keys work for v1.1
+- 0-RTT reattach — replay-safety burden; gain dwarfed by Wi-Fi/DHCP bring-up; deferred per INIT.md
+- Named/numbered session selection — M5+
+- Connection status bar — only meaningful with M4 predictive echo latency data
 
 ### Architecture Approach
 
-nosh is structured as a Cargo workspace with four crates: `nosh-proto` (shared message types, codec, ALPN constant — no external nosh deps), `nosh-auth` (shared SSH-key verifiers and agent signing key — depends only on proto), `nosh-server` (the `noshd` binary — depends on proto + auth), and `nosh-client` (the `nosh` binary — depends on proto + auth). This layering means protocol changes are reviewable in one place, both binaries share identical key-parsing logic, and the server's PTY spawning logic never leaks into the client binary.
+v1.1 inserts a `SessionRegistry` between the accept loop and the per-connection session pump, decoupling the QUIC `Connection` lifetime from the `Session` (PTY + child) lifetime. The `SessionSlot` wraps a replaceable `conn: Option<Connection>`, the existing `Session`, and a new `SequencedOutputBuffer` ring buffer. The `Message` enum gains four variants: `SessionOpened`, `Reattach`, `ReattachOk`, `ReattachErr`. The signing abstraction (`RawEd25519Signer` trait) already exists; v1.1 adds `FileSigner` alongside `AgentSigner`. Platform `#[cfg]` gates are confined to `nosh-client/src/main.rs` (SIGWINCH handler and Windows resize polling); no forks needed in nosh-proto, nosh-auth, or nosh-server.
 
 **Major components:**
 
-1. **Transport layer** (`quinn::Endpoint` + `quinn::Connection`) — UDP socket, QUIC connection lifecycle, stream multiplexing, datagram delivery; owns nothing above the wire
-2. **Auth layer** (`nosh-auth`) — `SshKeyServerVerifier` (client-side: pins server host key vs `known_hosts`/TOFU), `SshKeyClientVerifier` (server-side: checks client key vs `authorized_keys`), `AgentSigningKey`/`AgentSigner` (delegates TLS `CertificateVerify` signing to ssh-agent); auth happens inside the TLS handshake, before any session code runs
-3. **Protocol framing** (`nosh-proto`) — typed `ControlMsg` enum (`Resize`, `Signal`, `EnvVar`, `ShellOpen`, `SessionClose`), `ShellData`, ALPN constant `b"nosh/0"`, length-prefixed codec; seams pre-cut for `DatagramMsg` (M4) and `ChannelOpen/Accept/Reject` (M5)
-4. **Session layer** (`ShellSession` in `nosh-server`) — owns the `quinn::Connection` ref, three async tasks (`net_to_pty`, `pty_to_net`, `control_loop`), and the `SanitizedEnv`; the session struct is the seam for M3 cold-reattach (`SessionStore: HashMap<SessionToken, Arc<Mutex<ShellSession>>>`)
-5. **PTY abstraction** (`PtyBridge` in `nosh-server`) — wraps `portable-pty`; `spawn()` / `reader()` / `writer()` / `resize()` / `kill()`; `native_pty_system()` call isolated here for the M6 ConPTY swap
-6. **Environment sanitization** (`nosh::env` in `nosh-server`) — deny-all whitelist on shell spawn; pure function, testable independently
-7. **Terminal proxy** (`TerminalProxy` in `nosh-client`) — raw-mode stdin/stdout, `SIGWINCH` to debounced `ControlMsg::Resize` via `tokio::sync::mpsc`
+1. `SessionRegistry` (`nosh-server/src/registry.rs`, new) — authoritative map of live and orphaned sessions; `open()` / `reattach()` / `mark_idle()` / `remove()` operations; per-identity cap enforced on insert; `Arc<SessionRegistry>` shared into every connection handler task
+2. `SessionSlot` (`nosh-server/src/registry.rs`, new) — wraps `Session` + replaceable `quinn::Connection` + `SequencedOutputBuffer`; identity bound at creation; drives the Active → Orphaned → Reconnecting state machine; pump task `AbortHandle`s aborted on disconnect, restarted on reattach
+3. `SequencedOutputBuffer` (`nosh-server/src/registry.rs`, new) — monotonic u64 sequence counter; `VecDeque<(u64, Bytes)>` ring bounded at 64 KiB; `push()` archives each outgoing PTY chunk; `since(last_acked_seq)` produces the replay slice for cold reattach
+4. Identity threading (`nosh-server/src/server.rs`, modified) — `conn.peer_identity()` downcast to `Vec<CertificateDer<'static>>` → `extract_spki_from_cert` → `nosh_key_from_spki` (exposed from `nosh-auth/src/keys.rs`) immediately after handshake, before any message is read
+5. `FileSigner` (`nosh-auth/src/signer.rs`, new) — `RawEd25519Signer` impl for on-disk OpenSSH private keys; `ZeroizeOnDrop` on the key field; narrow scope: load → sign → drop before first `await`
 
-**Key patterns:**
-- Auth-before-session: reject unknown keys inside the TLS handshake; unauthenticated connections never reach session code
-- Session as owned async task tree: three `tokio::spawn` tasks per session, selected over in the accept loop; any one completing triggers cleanup of the others
-- Blocking PTY I/O via `spawn_blocking`: PTY master fd is not async-native; bridge via `tokio::task::spawn_blocking` (spike) or `AsyncFd` (M2+)
-- Session keyed on SSH identity fingerprint, not QUIC connection ID (connection IDs rotate; addresses change on migration)
+**Recommended build order:**
 
-**Stream / datagram assignment:**
-
-| Channel | QUIC primitive | Why |
-|---------|---------------|-----|
-| Shell I/O (stdin/stdout) | Reliable bidi stream | Shell output is stateful; ordering required |
-| Control (resize, signals) | Reliable bidi stream | Must not be lost or reordered |
-| State-sync object (M4) | Unreliable datagram | Latest-wins terminal diffs; loss-tolerant |
-| Agent forwarding (M5) | Reliable bidi stream (per request) | Request-response protocol |
-
-**Build order (dependency-driven):**
-
-1. `nosh-proto` — no nosh deps; defines types and codec
-2. `nosh-auth` — depends on proto; testable in isolation with test key fixtures
-3. Transport skeleton — quinn endpoints, echo over stream, datagram round-trip (M0)
-4. Auth wired into transport — mutual key auth, unknown keys rejected (M1)
-5. `PtyBridge` + env sanitization — server spawns PTY; env stripped (M2 prep)
-6. `ShellSession` tasks wired together — live interactive shell over QUIC (M2)
-7. Terminal resize — SIGWINCH to coalesced ControlMsg to PTY resize (M2)
+1. nosh-proto: add 4 new `Message` variants
+2. nosh-auth: add `FileSigner`; expose `nosh_key_from_spki`
+3. nosh-server: `SessionRegistry` + `SessionSlot` + `SequencedOutputBuffer` (independently unit-testable)
+4. nosh-server: identity threading in `handle_connection`
+5. nosh-server: reattach dispatch (branch on first message: `SessionOpen` vs `Reattach`)
+6. nosh-client: `--identity-file` flag; store `session_token`; send `Reattach` on reconnect; `#[cfg]` gates
+7. Migration headless test (`Endpoint::rebind()`)
+8. Windows cross-compile check (`cargo check --target x86_64-pc-windows-gnu`)
 
 ### Critical Pitfalls
 
-**Security footguns — must address this milestone (non-negotiable):**
+1. **SIGHUP kills shell on client disconnect** — Do NOT close `MasterPty` when the QUIC connection drops. The kernel delivers SIGHUP to the shell session leader when the last open master fd is closed. `MasterPty` must move into `SessionSlot` and remain open for the entire orphan lifetime. This is the core correctness requirement for session persistence and cannot be restructured after the fact.
 
-1. **Env-var injection into the shell** (FOOTGUN-1, M2): passing the client's env dict to `CommandBuilder` allows `LD_PRELOAD`, `BASH_ENV`, `IFS`, etc. to inject code into the shell. Mitigation: deny-all whitelist (`TERM`, `LC_*`, `LANG`, `TZ`, `COLORTERM`, `DISPLAY`); construct server env from scratch; never pass `SSH_AUTH_SOCK`.
+2. **Reattach token as sole auth factor (session hijacking)** — The reattach flow must run the full mutual TLS handshake on every new connection. The `session_token` is a session selector, not a credential. Both the identity fingerprint match AND the token check must pass. Return the same error for bad-token and bad-identity to prevent oracle enumeration. Never log the token.
 
-2. **`SSH_AUTH_SOCK` forwarded via environment** (FOOTGUN-2, M2): any process on the server that can read `/proc/<pid>/environ` can hijack the agent socket. Mitigation: `SSH_AUTH_SOCK` is absent from the env whitelist. Agent forwarding via dedicated stream is M5.
+3. **`Session.identity` populated before handshake completes** — Call `conn.peer_identity()` only after `connecting.await?` resolves to a `Connection`. Wrap extraction in a constructor that returns `Err` if identity is absent. Make `identity` a non-optional `NoshPublicKey` field, not `Option<T>`, so the type system enforces the invariant.
 
-3. **Unbounded pre-auth connection state** (FOOTGUN-3, M1): CVE-2024-22189 pattern. Cap simultaneous in-progress connections (~256); enforce auth timeout (10 s); use `max_concurrent_bidi_streams` to limit stream proliferation.
+4. **No per-identity session cap before first orphan** — The cap must exist before the first orphaned session is stored. With `idle_timeout = 0` (the correct default), there is no automatic eviction. Also run a background reaper task calling `child.try_wait()` on all orphaned sessions to prevent zombie accumulation.
 
-**Correctness gotchas — silently pass if not tested:**
-
-4. **Custom verifier stubs out `verify_tls13_signature`** (M1): copying `SkipServerVerification` as the starting point leaves signature verification as `Ok(assertion())` — a MITM can present the correct pinned key but forge the `CertificateVerify` signature. Mitigation: delegate `verify_tls13_signature` to the `CryptoProvider`'s signature verification algorithms; write a test that presents a cert with the right key but a forged signature and asserts rejection.
-
-5. **TLS 1.3 `CertificateVerify` input is not just the transcript hash** (M1): the agent must sign `repeat(0x20, 64) || context_string || 0x00 || transcript_hash` (RFC 8446 §4.4.3), not the raw hash. rustls passes the pre-constructed message to `verify_tls13_signature`; the signer must produce bytes in the same format.
-
-6. **QUIC datagrams silently disabled** (M0): `datagram_receive_buffer_size` defaults to `None`; `conn.max_datagram_size()` returns `None`; all datagram sends fail silently. Mitigation: set `datagram_receive_buffer_size(Some(1 << 20))` on both endpoints' `TransportConfig`; assert `max_datagram_size()` returns `Some(_)` as the first M0 test.
-
-7. **30 s idle timeout kills a quiet interactive session** (M0): `max_idle_timeout` defaults to 30 s; `keep_alive_interval` defaults to `None`. Watching a build or `tail -f` drops the session. Mitigation: set `keep_alive_interval(Some(Duration::from_secs(15)))` on the client side; set `max_idle_timeout` to several minutes. Never set `max_idle_timeout(None)` (causes hung futures on broken paths).
-
-8. **ECDSA curve not checked in custom verifier** (M1): rustls does not enforce that the public key curve matches the claimed `SignatureScheme`. If `ECDSA_NISTP256_SHA256` is in `supported_verify_schemes`, the verifier must explicitly check the key is on P-256.
-
-9. **ssh-agent RSA returns SHA-1 signature** (M1): OpenSSH agent defaults to legacy `ssh-rsa` (SHA-1) unless the sign request explicitly sets flag `0x2` (`rsa-sha2-256`) or `0x4` (`rsa-sha2-512`). `ssh-agent-client-rs` 1.1.2 may not expose these flags — validate at implementation time; test with RSA keys specifically.
-
-10. **ALPN mismatch fails handshake with cryptic error** (M0): QUIC mandates ALPN; `b"nosh/0"` vs `b"nosh"` produces `no_application_protocol` (error 0x178). Mitigation: define a single `ALPN` constant in `nosh-proto`; import on both sides; assert `handshake_data.protocol` post-handshake.
-
----
+5. **`ServerConfig::migration` not set explicitly** — Set it explicitly even though the default is `true`, to guard against future default changes and to document intent. Validate with an integration test: `Endpoint::rebind()` mid-session → assert the active stream continues without `ConnectionError`.
 
 ## Implications for Roadmap
 
-Based on research, the spike decomposes naturally into three sequential phases with no parallelism possible across the M0→M1→M2 chain.
+Based on the dependency graph in the research, the milestone maps to five phases. Phases 4 and 5 can run in parallel with or after Phase 3 once the nosh-auth boundary is stable.
 
-### Phase 1 (M0): QUIC Transport Skeleton
+### Phase 1: Identity Threading
 
-**Rationale:** The foundational hypothesis — that RFC 9221 unreliable datagrams and reliable bidi streams coexist independently on one QUIC connection — must be proven before any higher-level work. Auth and PTY both depend on a working connection. Nothing can be built in parallel.
+**Rationale:** The explicit v1.0 seam. Session persistence keying, reattach authorization, and per-identity cap all require `Session.identity`. Nothing else in v1.1 can be correctly built without it. The implementation touches three files and is the lowest-risk place to start — it is a seam fill, not new design.
 
-**Delivers:** quinn `Endpoint` on both sides; echo bytes over a bidi stream; datagram round-trip; ALPN constant defined in `nosh-proto` and asserted post-handshake; datagrams explicitly enabled and verified via `max_datagram_size()`; keep-alive and idle-timeout set to session-appropriate values.
+**Delivers:** `Session.identity: NoshPublicKey` populated from the TLS handshake on every new connection; existing handshake tests still pass; `identity` is a non-optional field (type-level invariant).
 
-**Addresses:** QUIC datagram + stream coexistence (primary spike hypothesis); ALPN constant (nosh-proto skeleton); datagram silently disabled pitfall; idle timeout pitfall.
+**Addresses:** Prerequisite for all reattach and persistence features.
 
-**Avoids:** Datagrams-disabled gotcha (assert `Some(_)` in first test); ALPN mismatch (shared constant from day one); idle timeout drops quiet session (set keep-alive in TransportConfig).
+**Avoids:** Pitfall 11 (identity captured before handshake completes); precondition for avoiding Pitfall 8 (token-only reattach).
 
-**Research flag:** Well-documented patterns; no deeper research needed.
+**Research flag:** Standard patterns; no additional research needed. Implementation: `conn.peer_identity()` → downcast → `extract_spki_from_cert` → `nosh_key_from_spki`; expose from `nosh-auth/src/keys.rs`.
 
----
+### Phase 2: Session Persistence
 
-### Phase 2 (M1): SSH-Key Mutual Auth
+**Rationale:** Sessions must survive connection drop before there is anything to reattach to. All three correctness requirements (keep MasterPty open to prevent SIGHUP, enforce per-identity cap before first orphan, run zombie reaper) must be in place before this phase is complete. The `SequencedOutputBuffer` must also start accumulating output from session open — it cannot be added retroactively when cold reattach arrives.
 
-**Rationale:** Auth is a hard prerequisite for M2. It must complete before PTY work begins because auth-before-session is a fundamental design principle: unknown keys must be rejected inside the TLS handshake, before session code runs. Also addresses FOOTGUN-3 (unbounded pre-auth connections).
+**Delivers:** `SessionRegistry` + `SessionSlot`; orphaned sessions survive QUIC disconnect; PTY + shell continue running; per-identity cap enforced; zombie reaper running; all outgoing PTY chunks assigned monotonic u64 sequence numbers from the moment of session open.
 
-**Delivers:** `nosh-auth` crate with `SshKeyServerVerifier`, `SshKeyClientVerifier`, `AgentSigningKey`, `AgentSigner`; `known_hosts` parser + TOFU logic; `authorized_keys` parser; self-signed-cert-pinning path wired into quinn; connection rejected for unknown client keys; `verify_tls13_signature` properly delegated (not stubbed); pre-auth connection cap + auth timeout.
+**Addresses:** Server-side session persistence; per-identity session cap; configurable idle timeout (default off); output ring-buffer for replay (prerequisite for Phase 3).
 
-**Uses:** `rustls` 0.23.40 custom verifier traits; `ssh-key` 0.6.7; `ssh-agent-client-rs` 1.1.2; `rcgen` 0.14.8 for ephemeral certs.
+**Avoids:** Pitfall 7 (SIGHUP kills shell); Pitfall 5 (unbounded orphan memory); Pitfall 6 (zombie shell processes).
 
-**Implements:** Auth layer component; `nosh-auth` crate.
+**Research flag:** Standard patterns. `SessionRegistry` and `SequencedOutputBuffer` are fully specified in the architecture research with complete struct definitions. Unit-testable independently of the full server.
 
-**Avoids (must test explicitly):** Verifier-stubs-signature-check pitfall (negative test: forged `CertificateVerify` must be rejected); TLS transcript bytes wrong pitfall (unit test: known key + known transcript + expected signature); RSA SHA-1 fallback (test with RSA keys specifically); unbounded pre-auth connections (load test).
+### Phase 3: Cold Reattach Protocol
 
-**Decision point:** Cert-pinning only for this phase. RPK (`requires_raw_public_keys()`) is explicitly deferred until rustls issue #2257 resolution is confirmed on a dedicated follow-up branch.
+**Rationale:** The highest-complexity deliverable. Requires the state machine (Active → Orphaned → Reconnecting) to prevent the two-clients-one-session race, and requires the two-factor authorization to be correct from the first implementation. The `Message` variants are added early in the build order, but the reattach dispatch and replay logic is the principal new protocol work.
 
-**Research flag:** The `verify_tls13_signature` delegation pattern and RSA agent flag handling are non-trivial. Plan for a focused implementation spike on the signing path before declaring M1 done. Ed25519-only is acceptable as the first passing state; RSA must be tested before M1 is closed.
+**Delivers:** New QUIC connection from same SSH identity sends `Reattach{token, last_acked_seq}`; server validates identity + token; replays buffered output; session rebound; pump tasks restarted; headless positive test passes; negative test (correct token, wrong key) rejected.
 
----
+**Addresses:** Cold reattach 1-RTT (table stakes); reattach authorization bound to SSH identity (table stakes); output sequence numbering and replay (table stakes).
 
-### Phase 3 (M2): PTY Session Core
+**Avoids:** Pitfall 8 (token without SSH re-auth); Pitfall 9 (sequence resync duplicates/gaps); Pitfall 10 (reattach race — two clients one session).
 
-**Rationale:** PTY requires an authenticated connection (M1). The "cheap now, painful later" items (session struct, exit-code protocol, env sanitization, resize coalescing) belong here because they become architecturally invasive to retrofit once the session lifecycle has state (M3 reattach, M4 datagram, M5 channels).
+**Research flag:** Needs careful implementation against the state machine spec. The PITFALLS.md "Looks Done But Isn't" checklist has the definitive test matrix for this phase (13 items).
 
-**Delivers:** `PtyBridge` wrapping `portable-pty`; `SanitizedEnv` (deny-all whitelist); `ShellSession` with three async tasks; `TerminalProxy` (client raw mode, SIGWINCH to debounced resize); `SessionClose { exit_code, reason }` control frame in protocol; server-side session struct with UUID; structured `tracing` spans per session; interactive shell works (`vim`, `htop`, `bash` readline); resize propagates; exit code propagates; env whitelist enforced.
+### Phase 4: Connection Migration Validation
 
-**Uses:** `portable-pty` 0.9.0; `vte` 0.15.0 (terminal state); `tokio::task::spawn_blocking` for PTY I/O bridge.
+**Rationale:** Migration requires almost no production code (`ServerConfig::migration(true)` plus an explicit transport config call). The deliverable is the test suite. Placed after Phase 3 so migration tests run against a server with full session registry — this validates that migration does not disturb the session slot state.
 
-**Implements:** Session layer, PTY abstraction, environment sanitization, terminal proxy, protocol message definitions.
+**Delivers:** `ServerConfig::migration(true)` explicit; headless migration test via `Endpoint::rebind()`; large-output-stream test through simulated migration (measures anti-amplification stall); qlog inspection confirming CID rotation on path change; human-verified Wi-Fi→cellular live check.
 
-**Avoids (must test explicitly):** Env injection (assert `LD_PRELOAD`, `BASH_ENV`, `SSH_AUTH_SOCK` absent from shell env); terminal raw mode not restored (kill client with SIGKILL; verify local terminal usable); zombie PTY children (disconnect mid-session; verify no zombies); SIGWINCH burst storm (drag window; verify coalescing); exit code not propagated (`exit 42`; verify client exits 42).
+**Addresses:** Connection migration NAT rebind (table stakes); connection migration explicit path switch (table stakes); migration invisible to user; QUIC migration as headline differentiator over Mosh and ET.
 
-**Cheap-now items that MUST be in M2 (not deferred):**
+**Avoids:** Pitfall 1 (migration flag not set); Pitfall 2 (anti-amplification stall); Pitfall 3 (CID linkability); Pitfall 4 (keep-alive/idle timeout misconfig during migration).
 
-- `SessionStore` stub: define the struct and UUID-keyed map even though reattach is not implemented; otherwise M3 requires refactoring the connection handler
-- `SessionClose` control frame: define the close protocol now or M3/M5 features cannot distinguish clean exit from network drop
-- Resize-burst coalescing: 30–50 ms debounce; entangled with migration logic at M3
-- Env whitelist (`LC_*`, `LANG`, `TZ` must be in the allow-list alongside `TERM`)
-- Per-session `tracing` spans
+**Research flag:** Standard patterns; implementation is largely test authorship. Anti-amplification stall duration should be measured empirically in the test environment.
 
-**Research flag:** PTY async bridging has well-documented patterns; no research needed. The three-task `ShellSession` structure is standard tokio design.
+### Phase 5: Windows Client
 
----
+**Rationale:** Isolated behind `#[cfg]` gates; shares nosh-proto message types and the existing connection/auth path. Can proceed in parallel with Phases 3-4 once Phase 2's nosh-auth boundary (FileSigner, crossterm bump) is stable. Platform-specific work is confined to nosh-client: SIGWINCH gating, Windows resize via EventStream, `FileSigner` behind `cfg(windows)`, `--identity-file` CLI flag.
+
+**Delivers:** Native Windows client (no WSL); `cargo check --target x86_64-pc-windows-gnu` clean; on-disk Ed25519 key authenticated against Linux server; raw mode and resize working in Windows Terminal; TERM and locale propagation; best-effort file permission warning with documented ACL gap.
+
+**Addresses:** All four Windows table-stakes features (raw mode, resize, on-disk signing, TERM/locale).
+
+**Avoids:** Pitfall 12 (private key in memory — narrow scope + ZeroizeOnDrop); Pitfall 13 (ACL gap — document limitation); Pitfall 14 (WINDOW_BUFFER_SIZE_RECORD vs SIGWINCH — use EventStream); Pitfall 15 (VT processing in legacy console hosts).
+
+**Research flag:** Standard patterns for nosh-client integration. Windows-specific behavioral gaps (ACL check, codepage, legacy console host VT processing) are documented in PITFALLS.md; implement to the best-effort level specified there and record all limitations.
 
 ### Phase Ordering Rationale
 
-The M0 → M1 → M2 ordering is a strict dependency chain with no flexibility:
-- M0 is a prerequisite for M1 (auth requires a working QUIC connection to wire into)
-- M1 is a prerequisite for M2 (PTY session must not run on unauthenticated connections)
-
-Within each phase, the build order from ARCHITECTURE.md enforces a sub-dependency sequence: `nosh-proto` compiles first (no nosh deps), then `nosh-auth` (depends on proto, testable in isolation), then transport skeleton (M0), then auth wired in (M1), then PTY + env (M2 prep), then session tasks wired together (M2).
-
-The "cheap now, painful later" items are explicitly assigned to M2 (not deferred to M3) because they either must precede the first PTY spawn (env sanitization — security non-negotiable) or become refactor-sized changes the moment M3 adds cold-reattach state (session struct, session-close protocol, resize coalescing).
+- Identity first because it is the prerequisite seam for both persistence and reattach; building either without it produces an anonymous session that cannot be securely reattached.
+- Persistence before reattach because reattach requires an orphaned session to exist, and the `SequencedOutputBuffer` must accumulate from session open.
+- Migration validation after reattach because migration tests are more meaningful against a fully-equipped server, and migration is the lightest phase by production code weight.
+- Windows in parallel after Phase 2 because `FileSigner` and the `cfg` gates are independent of server-side reattach logic once the auth trait boundary is stable.
+- No session-by-name, no 0-RTT, no Pageant — explicitly deferred; these add complexity not validated by this milestone's architecture-validation goal.
 
 ### Research Flags
 
-Phases likely needing deeper research during planning:
+Phases needing closer attention during planning:
 
-- **M1 (ssh-agent signing path):** `verify_tls13_signature` delegation to the `CryptoProvider`, RSA SHA-2 flag handling in `ssh-agent-client-rs` 1.1.2, and the self-signed-cert SPKI extraction pattern are each non-trivial. PITFALLS flags three distinct failure modes here (Pitfalls 5, 7, 8). Plan time for a focused implementation spike on the signing round-trip before declaring M1 done.
-- **RPK follow-up (post-M1):** rustls issue #2257 resolution status is unconfirmed. Before attempting RPK migration, run a small research spike to read the 0.23.40 changelog and test `requires_raw_public_keys()` against actual wire behavior.
+- **Phase 3 (Cold Reattach):** State machine correctness and two-factor authorization are the principal risk. Architecture research specifies exact state transitions; PITFALLS.md has a 13-item "Looks Done But Isn't" checklist — use both as acceptance criteria.
+- **Phase 5 (Windows Client):** Windows platform behavior (ACL permissions, codepage, legacy console VT processing) has known gaps. Plan for Windows-specific integration tests from the start; Linux CI will not catch Windows behavioral issues.
 
-Phases with standard patterns (skip research-phase):
+Phases with standard well-documented patterns:
 
-- **M0 (QUIC transport skeleton):** quinn 0.11 docs are thorough and the `TransportConfig` / `Connection` API is well-understood. Write code, not research.
-- **M2 (PTY + session):** `portable-pty` API is straightforward; `spawn_blocking` bridge is idiomatic tokio. The env whitelist is a known list from SSH hardening practice.
-
----
+- **Phase 1 (Identity Threading):** ~30 lines across three files; grounded in verified quinn/rustls API.
+- **Phase 2 (Session Persistence):** Standard Rust data structures (VecDeque, HashMap); architecture file has complete struct definitions.
+- **Phase 4 (Connection Migration):** One config flag + three test scenarios; test authorship is more effort than the production code change.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | All crate versions verified against docs.rs/crates.io live data. quinn 0.11.9, rustls 0.23.40, portable-pty 0.9.0, ssh-key 0.6.7, ssh-agent-client-rs 1.1.2, ed25519-dalek 2.2.0 confirmed stable. |
-| Features | HIGH | Spike features derived directly from PROJECT.md brief. Done checklist is concrete and verifiable. Deferred features mapped from Mosh/ET public record. |
-| Architecture | HIGH | Component boundaries, crate layout, data flow confirmed against quinn/rustls/portable-pty current APIs. Build order is dependency-driven with no ambiguity. |
-| Pitfalls | HIGH | Transport pitfalls confirmed from quinn 0.11.8 docs (datagram defaults, idle timeout defaults). Security footguns confirmed from CVE record (CVE-2024-22189), RFC 8446 §4.4.3, SSH agent protocol spec. rustls verifier pitfalls confirmed from trait documentation. |
+| Stack | HIGH | All crate versions and APIs verified against docs.rs live data. No new crates needed. ring precompiled-assembly Windows claim verified from BUILDING.md. crossterm 0.29.0 + futures are the only dependency changes. |
+| Features | HIGH | Derived from INIT.md design brief, Mosh/ET public record, QUIC RFC 9000/9221, and the v1.0 validated codebase. Feature dependency graph grounded in actual code file:line citations. |
+| Architecture | HIGH | Every struct, method, and file path grounded in the actual v1.0 codebase with verified line numbers. quinn API surface (`peer_identity`, `stable_id`, `rebind`) verified from docs.rs. |
+| Pitfalls | HIGH | SIGHUP/MasterPty behavior is standard Unix; reattach race and sequence-number design have clear documented mitigations; Windows pitfalls verified from official Microsoft and crossterm issue trackers. |
 
 **Overall confidence:** HIGH
 
 ### Gaps to Address
 
-- **rustls issue #2257 (RPK wire compliance):** Current resolution status in rustls 0.23.40 is unconfirmed. The cert-pinning fallback removes this from the critical path for M1, but a targeted test is needed before any future RPK migration branch. Handle by: run a dedicated research spike on the RPK follow-up branch before committing to RPK.
-
-- **`ssh-agent-client-rs` RSA flag exposure:** The 1.1.2 public API does not visibly expose the `SSH_AGENT_RSA_SHA2_256` / `SSH_AGENT_RSA_SHA2_512` sign-request flags. Ed25519 is unaffected. Handle by: inspect the 1.1.2 source at implementation time; if flags are not exposed, limit M1 auth to Ed25519 keys initially, add RSA in a targeted follow-up before closing M1, or use the lower-level protocol directly.
-
-- **PTY fd async behavior under load:** `spawn_blocking` is the safe baseline for the spike; `AsyncFd` is lower-overhead but has edge cases on some Linux kernels with PTY fds. Handle by: start with `spawn_blocking`; measure in M2 interactive testing; switch to `AsyncFd` only if profiling identifies it as a bottleneck.
-
----
+- **Windows ACL permission check:** `std::fs::Permissions` on Windows does not read ACLs. Emit a best-effort warning based on `FILE_ATTRIBUTE_READONLY` and document the gap. A proper ACL check (`GetNamedSecurityInfo` via the `windows` crate) is optional scope for v1.1.
+- **RPK (RFC 7250) upgrade path:** rustls 0.23.16+ supports raw public keys but v1.0 uses self-signed cert pinning. v1.1 does not require RPK, but the upgrade path should be tracked — it would remove the `rcgen` dependency and simplify the `x509-parser` SPKI extraction. Defer unless the extraction in `handle_connection` proves awkward.
+- **Passphrase-encrypted keys on Windows:** The `ssh-key` `encryption` feature supports decryption but the interactive passphrase prompt is not in scope for v1.1. Unencrypted keys work. Document the limitation; prompt implementation is P2.
+- **Anti-amplification stall duration in practice:** RFC 9000 §9.4 mandates a 1-2 RTT output stall after migration. Actual severity depends on RTT and burst rate in the test environment. The migration headless test should measure this empirically and gate on "no pause longer than 3 RTTs."
 
 ## Sources
 
 ### Primary (HIGH confidence)
 
-- https://docs.rs/quinn/0.11.9/quinn/ — Transport API, Connection methods, TransportConfig defaults (datagram_receive_buffer_size, max_idle_timeout, keep_alive_interval)
-- https://docs.rs/rustls/0.23.40/rustls/ — ServerCertVerifier / ClientCertVerifier traits, CryptoProvider, SigningKey/Signer traits, CertifiedKey, RPK resolvers
-- https://docs.rs/portable-pty/0.9.0/portable_pty/ — MasterPty trait, openpty, spawn_command, resize API
-- https://docs.rs/ssh-key/0.6.7/ssh_key/ — authorized_keys / known_hosts modules, PublicKey parsing
-- https://docs.rs/ssh-agent-client-rs/1.1.2/ssh_agent_client_rs/ — sign() method, list_identities
-- https://docs.rs/rcgen/0.14.8/rcgen/ — SigningKey trait, self_signed(), CertifiedKey integration
-- https://docs.rs/ed25519-dalek/2.2.0/ed25519_dalek/ — stable release confirmed
-- https://quinn-rs.github.io/quinn/quinn/certificate.html — dangerous_configuration pattern, QuicServerConfig::try_from wiring
-- RFC 8446 §4.4.3 — TLS 1.3 CertificateVerify input construction (64 spaces + context + 0x00 + transcript hash)
-- RFC 9221 — Unreliable Datagram Extension to QUIC
+- https://docs.rs/quinn/0.11.9/quinn/struct.Connection.html — complete method list; `peer_identity`, `stable_id`, `remote_address` verified; absence of `migrate()`/`set_path()`/`network_path()` confirmed
+- https://docs.rs/quinn/0.11.9/quinn/struct.ServerConfig.html — `migration()` method and default confirmed
+- https://docs.rs/quinn/0.11.9/quinn/struct.Endpoint.html — `rebind()` / `rebind_abstract()` signatures verified
+- https://docs.rs/quinn/0.11.9/quinn/struct.TransportConfig.html — `keep_alive_interval`, `max_idle_timeout`, `mtu_discovery_config` verified
+- https://docs.rs/rustls/latest/rustls/ — version 0.23.40; `peer_identity` downcast path under rustls-ring backend
+- https://docs.rs/ssh-key/0.6.7/ssh_key/private/struct.PrivateKey.html — `read_openssh_file`, `is_encrypted`, `decrypt`, key_data API; `encryption` feature deps (bcrypt-pbkdf, AES-CTR, ChaCha20Poly1305) pure Rust — all verified
+- https://docs.rs/crossterm/0.29.0/crossterm/ — `event-stream` feature, `x86_64-pc-windows-msvc` target, `enable_raw_mode` verified; 0.29.0 released 2025-04-05
+- https://github.com/crossterm-rs/crossterm/issues/935 — `use-dev-tty` + `event-stream` incompatibility documented
+- https://github.com/briansmith/ring/blob/main/BUILDING.md — x86_64-windows precompiled asm objects; no NASM from crates.io
+- https://www.rfc-editor.org/rfc/rfc9000.html §9.4 — anti-amplification limit on new paths (3x bytes received)
+- https://www.rfc-editor.org/rfc/rfc9000.html §9.5 — CID rotation requirement on migration for privacy
+- Codebase (verified line citations): `session.rs:119` identity seam; `server.rs:101/145/185/264` accept loop / handle_connection / run_session / pump select!; `messages.rs` 4-variant Message enum; `signer.rs:26` RawEd25519Signer trait; `keys.rs:172` extract_spki_from_cert; `verifier.rs:218` parse_ed25519_from_spki; `client.rs:27` ClientIdentity::from_signer; `client.rs:208` RawModeGuard; `main.rs:103` SIGWINCH handler; `transport.rs:28` transport_config
 
 ### Secondary (MEDIUM confidence)
 
-- https://github.com/rustls/rustls/issues/2257 — RPK UnsolicitedCertificateTypeExtension compliance caveat; open as of late 2024; resolution in 0.23.40 not confirmed
-- https://github.com/rustls/rustls/releases/tag/v%2F0.23.16 — RPK added in 0.23.16 (PR #2062)
-- https://eternalterminal.dev/howitworks/ — Session-persistence patterns (used for session-struct seam design)
-- https://github.com/haukened/quicshell — Control-first channel model, env sanitization, per-session flow control
+- https://github.com/mobile-shell/mosh/issues/394 and /806 — Mosh session persistence / orphan issues; UX expectations for idle-timeout-off default
+- https://eternalterminal.dev/howitworks/ and https://github.com/MisterTea/EternalTerminal/blob/master/docs/protocol.md — ET BackedReader/BackedWriter sequence-number reattach model; `RETURNING_CLIENT` response; session-password auth model
+- Marten Seemann 2023 (https://seemann.io/posts/2023-12-18---exploiting-quics-path-validation/) — PATH_CHALLENGE flood attack; 256-frame cap fix in quinn >= 0.10.4
 
-### Tertiary (LOW confidence — needs validation at implementation time)
+### Tertiary (LOW confidence)
 
-- ssh-agent RSA SHA-2 flag behavior in `ssh-agent-client-rs` 1.1.2 — confirm by reading source; flag 0x2 / 0x4 may require lower-level call
-- rustls RPK `requires_raw_public_keys()` behavior in 0.23.40 — confirm by running a targeted test on a follow-up branch
+- https://github.com/rustls/rustls/issues/2257 — RPK compliance caveat; current resolution status unverified
+- https://github.com/microsoft/terminal/issues/394 — Windows Terminal `WINDOW_BUFFER_SIZE_RECORD` quirks; behavior may vary across Windows Terminal versions
 
 ---
-*Research completed: 2026-05-29*
+*Research completed: 2026-05-30*
 *Ready for roadmap: yes*
