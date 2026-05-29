@@ -11,7 +11,7 @@ Requirements for the M3 milestone (roaming + bounded Windows-client slice). Each
 
 Threading the authenticated SSH identity into the server-side session is the architectural prerequisite for persistence and reattach — it fills the deliberate v1.0 seam at `Session.identity`.
 
-- [ ] **IDENT-01**: The server threads the authenticated peer's SSH identity (SPKI extracted from the TLS handshake) into `Session.identity` on every new connection, before any session message is processed
+- [x] **IDENT-01**: The server threads the authenticated peer's SSH identity (SPKI extracted from the TLS handshake) into `Session.identity` on every new connection, before any session message is processed
 - [ ] **IDENT-02**: Cold reattach is authorized by two factors — the full SSH/TLS mutual handshake re-runs on every reconnection, AND the presented reattach token must match an orphaned session bound to that same SSH identity (token is a selector, never a sole credential)
 
 ### Roaming
@@ -86,7 +86,7 @@ Which phases cover which requirements. Phase numbering continues from v1.0 (ende
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| IDENT-01 | Phase 4 | Pending |
+| IDENT-01 | Phase 4 | Complete |
 | IDENT-02 | Phase 6 | Pending |
 | ROAM-01 | Phase 7 | Pending |
 | ROAM-02 | Phase 6 | Pending |

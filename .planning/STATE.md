@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: M3 Roaming + Windows Client
-status: "Roadmap created; ready for /gsd:plan-phase 4"
-stopped_at: Phase 4 context gathered
-last_updated: "2026-05-29T22:47:56.543Z"
-last_activity: 2026-05-30 — v1.1 roadmap (Phases 4-8) written
+status: ready_to_plan
+stopped_at: Phase 4 complete (2/0) — ready to discuss Phase 5
+last_updated: 2026-05-29T22:57:12.294Z
+last_activity: 2026-05-29 -- Phase 4 execution started
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 0
-  completed_plans: 0
+  completed_plans: 2
   percent: 0
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-29)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** v1.1 roadmap created — ready to start Phase 4 (Identity Threading)
+**Current focus:** Phase 5 — session persistence
 
 ## Current Position
 
-Phase: Phase 4 — Identity Threading (not started)
-Plan: —
-Status: Roadmap created; ready for /gsd:plan-phase 4
-Last activity: 2026-05-30 — v1.1 roadmap (Phases 4-8) written
+Phase: 5
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-05-29
 
 ```
 Progress: [          ] 0% (0/5 phases)
@@ -38,7 +38,7 @@ Progress: [          ] 0% (0/5 phases)
 
 **Velocity:**
 
-- Total plans completed: 0 (v1.1)
+- Total plans completed: 2 (v1.1)
 - Average duration: - (see v1.0 archive for historical baseline)
 - Total execution time: 0 hours (v1.1)
 
@@ -51,6 +51,7 @@ Progress: [          ] 0% (0/5 phases)
 | 6. Cold Reattach Protocol | 0/? | - | - |
 | 7. Connection Migration Validation | 0/? | - | - |
 | 8. Windows Client | 0/? | - | - |
+| 4 | 2 | - | - |
 
 **Recent Trend:**
 
