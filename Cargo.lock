@@ -900,9 +900,11 @@ name = "nosh-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "ed25519-dalek",
  "rcgen",
  "rustls",
+ "sha2",
  "ssh-agent-client-rs",
  "ssh-key",
  "tempfile",
