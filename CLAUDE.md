@@ -196,7 +196,18 @@ This milestone is an **architecture-validation spike** (M0–M2 of the full brie
 <!-- GSD:conventions-start source:CONVENTIONS.md -->
 ## Conventions
 
-Conventions not yet established. Will populate as patterns emerge during development.
+### GSD agent model selection
+
+When launching any GSD subagent (planner, researcher, executor, verifier, plan-checker, roadmapper, synthesizer, code-reviewer, etc.), resolve its model from the configured profile **before** spawning and pass it explicitly as `model=`:
+
+```bash
+gsd-sdk query resolve-model gsd-planner   # → {"model": "opus", "profile": "balanced"}
+```
+
+- Use the agent type as a **positional** arg. `--agent` silently falls back to a sonnet default (`"unknown_agent": true`).
+- The profile maps **per-agent**, not globally. On `balanced` (this project): `gsd-planner` → **opus**; executor / verifier / researcher / plan-checker / roadmapper / synthesizer / code-reviewer → **sonnet**. Don't generalize one role's tier to the others or blanket-default to opus or sonnet.
+- When wrapping a GSD skill (e.g. `gsd:plan-phase`) in an `Agent`, let the skill resolve its own subagents' models — do **not** inject a blanket model override into the wrapper prompt (it can downgrade the planner off opus).
+- Profile is changed via `/gsd:set-profile` / `/gsd:settings`; never silently override it.
 <!-- GSD:conventions-end -->
 
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->
