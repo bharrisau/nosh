@@ -20,7 +20,7 @@ Full detail archived at `.planning/milestones/v1.0-ROADMAP.md`.
 
 ### v1.1 M3 Roaming + Windows Client
 
-- [x] **Phase 4: Identity Threading** — Wire `Session.identity` from the authenticated TLS handshake (fills the deliberate v1.0 seam) (completed 2026-05-29)
+- [x] **Phase 4: Identity Threading** — Wire `Session.identity` from the authenticated TLS handshake (fills the deliberate v1.0 seam) (completed 2026-05-30)
 - [ ] **Phase 5: Session Persistence** — Orphaned sessions survive client disconnect; per-identity cap and idle timeout in place before first orphan
 - [ ] **Phase 6: Cold Reattach Protocol** — 1-RTT reconnect to an orphaned session with two-factor authorization (SSH handshake + token)
 - [ ] **Phase 7: Connection Migration Validation** — Explicit migration config plus headless and live test coverage confirming zero-RTT roaming
@@ -91,7 +91,7 @@ Full detail archived at `.planning/milestones/v1.0-ROADMAP.md`.
 | 1. QUIC Transport Skeleton | v1.0 | 4/4 | Complete | 2026-05-29 |
 | 2. SSH-Key Mutual Auth | v1.0 | 4/4 | Complete | 2026-05-29 |
 | 3. PTY Session Core | v1.0 | 3/3 | Complete | 2026-05-29 |
-| 4. Identity Threading | v1.1 | 2/0 | Complete    | 2026-05-29 |
+| 4. Identity Threading | v1.1 | 2/2 | Complete | 2026-05-30 |
 | 5. Session Persistence | v1.1 | 0/? | Not started | - |
 | 6. Cold Reattach Protocol | v1.1 | 0/? | Not started | - |
 | 7. Connection Migration Validation | v1.1 | 0/? | Not started | - |
