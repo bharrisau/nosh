@@ -1,21 +1,37 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-29T11:07:19.559Z",
-  "source": "auto-postool",
-  "partial": true,
+  "timestamp": "2026-05-29T12:25:20.506Z",
   "phase": null,
-  "phase_name": null,
+  "phase_name": "Milestone v1.1 setup — research deferred",
   "phase_dir": null,
   "plan": null,
   "task": null,
   "total_tasks": null,
-  "status": "auto-checkpoint",
-  "completed_tasks": [],
-  "remaining_tasks": [],
+  "status": "paused",
+  "context": "research",
+  "completed_tasks": [
+    {"id": 1, "name": "Scope v1.1 milestone (M3 Roaming + Windows Client) via questioning", "status": "done"},
+    {"id": 2, "name": "Set planning granularity coarse -> balanced for correctness-sensitive roaming work", "status": "done", "commit": "a9961f5"},
+    {"id": 3, "name": "Update PROJECT.md (Current Milestone v1.1, Active reqs, Out of Scope reconciled), reset STATE.md, clear phase dirs", "status": "done", "commit": "a9961f5"},
+    {"id": 4, "name": "Archive v1.0 research to .planning/milestones/v1.0-research/ before overwrite", "status": "done"},
+    {"id": 5, "name": "Stage full v1.1 research brief (4 researchers + synthesizer)", "status": "done", "commit": "f3608f2"}
+  ],
+  "remaining_tasks": [
+    {"id": 6, "name": "Run v1.1 research: spawn 4 gsd:gsd-project-researcher (Stack/Features/Architecture/Pitfalls) in parallel, then gsd:gsd-research-synthesizer for SUMMARY.md", "status": "not_started"},
+    {"id": 7, "name": "Define REQUIREMENTS.md (REQ-IDs, scoped per category) from research + locked scope decisions", "status": "not_started"},
+    {"id": 8, "name": "Spawn gsd:gsd-roadmapper to create v1.1 ROADMAP.md (continue phase numbering from v1.0's phase 3 -> start at phase 4)", "status": "not_started"}
+  ],
   "blockers": [],
   "human_actions_pending": [],
-  "decisions": [],
+  "decisions": [
+    {"decision": "v1.1 scope = M3 roaming on Linux + a bounded Windows-client slice", "rationale": "Roaming is the next headline differentiator on the proven v1.0 foundation; native Windows server (ConPTY) stays M6 to avoid two hard unrelated problems in one milestone", "phase": "v1.1"},
+    {"decision": "Session persistence = Mosh-style (survive until shell exits), configurable idle timeout default 0 (disabled), per-identity cap to bound memory", "rationale": "User preference matches Mosh; cap compensates for the disabled-by-default timeout on a network-facing daemon", "phase": "v1.1"},
+    {"decision": "Cold reattach is 1-RTT, authorization bound to the authenticated SSH identity; 0-RTT stays deferred", "rationale": "Matches brief; 1-RTT dwarfed by Wi-Fi/DHCP bring-up; identity binding prevents session hijack", "phase": "v1.1"},
+    {"decision": "Windows client signs from an on-disk OpenSSH key file (agent integration deferred); temporary Windows-only exception to 'never handle the private key' invariant; Linux ssh-agent path untouched", "rationale": "Smallest viable Windows client slice", "phase": "v1.1"},
+    {"decision": "Roaming validated headless via forced path change; real Wi-Fi->cellular as a human-verified live check", "rationale": "Deterministic, automatable validation; live run confirms reality", "phase": "v1.1"},
+    {"decision": "Granularity set to balanced for v1.1", "rationale": "Roaming has subtle ordering-dependent protocol bugs; finer plan-level checkpoints reduce risk vs the coarse v1.0 spike", "phase": "v1.1"}
+  ],
   "uncommitted_files": [],
-  "next_action": null,
-  "context_notes": ""
+  "next_action": "Run the v1.1 research from .planning/RESEARCH-BRIEF-v1.1.md: spawn the 4 gsd:gsd-project-researcher agents in parallel (use the gsd: namespace prefix — bare names fail after the plugin reload), wait for all 4, then spawn gsd:gsd-research-synthesizer to write SUMMARY.md. Then continue to requirements -> roadmap.",
+  "context_notes": "Mid /gsd:new-milestone for v1.1. Milestone setup (PROJECT.md/STATE.md/config) is committed. Research was deferred at the user's request so it can be triggered later via a one-liner. The research step previously errored ONLY because /reload-plugins re-registered GSD agents under the gsd: namespace mid-session; the staged brief hard-codes the prefixed agent names so the deferred run is unaffected. Roadmap should continue phase numbering (v1.0 ended at phase 3 -> v1.1 starts at phase 4); --reset-phase-numbers was NOT requested."
 }
