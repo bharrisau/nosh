@@ -36,10 +36,7 @@ impl ClientIdentity {
     /// `socket_path` is the agent socket (`SSH_AUTH_SOCK`). `identity_pub`, when
     /// `Some`, selects which agent key to use (path to a `.pub`); when `None`,
     /// the agent's single key is used (error if 0 or >1).
-    pub fn from_agent(
-        socket_path: PathBuf,
-        identity_pub: Option<&Path>,
-    ) -> anyhow::Result<Self> {
+    pub fn from_agent(socket_path: PathBuf, identity_pub: Option<&Path>) -> anyhow::Result<Self> {
         let public_key = match identity_pub {
             Some(p) => ssh_key::PublicKey::read_openssh_file(p)
                 .with_context(|| format!("read identity public key {}", p.display()))?,
@@ -52,9 +49,7 @@ impl ClientIdentity {
                 match ids.len() {
                     1 => ids.remove(0),
                     0 => anyhow::bail!("ssh-agent has no identities; add one with ssh-add"),
-                    n => anyhow::bail!(
-                        "ssh-agent has {n} identities; specify one with --identity"
-                    ),
+                    n => anyhow::bail!("ssh-agent has {n} identities; specify one with --identity"),
                 }
             }
         };
@@ -114,8 +109,8 @@ pub fn make_endpoint(
     known_hosts: PathBuf,
     host: impl Into<String>,
 ) -> anyhow::Result<quinn::Endpoint> {
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-        .context("create client endpoint")?;
+    let mut endpoint =
+        quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).context("create client endpoint")?;
     endpoint.set_default_client_config(build_client_config(identity, known_hosts, host)?);
     Ok(endpoint)
 }
@@ -165,10 +160,7 @@ pub async fn stream_echo_roundtrip(
 
 /// Send a datagram and return the echoed datagram (TRANS-03/04). Asserts
 /// datagrams are enabled (`max_datagram_size().is_some()`) and the payload fits.
-pub async fn datagram_roundtrip(
-    conn: &quinn::Connection,
-    payload: Bytes,
-) -> anyhow::Result<Bytes> {
+pub async fn datagram_roundtrip(conn: &quinn::Connection, payload: Bytes) -> anyhow::Result<Bytes> {
     let max = conn
         .max_datagram_size()
         .context("datagrams not enabled (max_datagram_size is None)")?;
@@ -268,17 +260,18 @@ pub async fn open_session(
 
 /// Send keystrokes (or any input bytes) as a `PtyData` frame.
 pub async fn send_input(send: &mut quinn::SendStream, bytes: &[u8]) -> anyhow::Result<()> {
-    nosh_proto::write_message(send, &Message::PtyData { data: bytes.to_vec() })
-        .await
-        .context("send PtyData")
+    nosh_proto::write_message(
+        send,
+        &Message::PtyData {
+            data: bytes.to_vec(),
+        },
+    )
+    .await
+    .context("send PtyData")
 }
 
 /// Send a window resize (SESS-05).
-pub async fn send_resize(
-    send: &mut quinn::SendStream,
-    cols: u16,
-    rows: u16,
-) -> anyhow::Result<()> {
+pub async fn send_resize(send: &mut quinn::SendStream, cols: u16, rows: u16) -> anyhow::Result<()> {
     nosh_proto::write_message(send, &Message::Resize { cols, rows })
         .await
         .context("send Resize")
@@ -303,9 +296,7 @@ pub async fn run_session_collect(
 
 /// Read frames from `recv`, appending `PtyData` payloads to a buffer, until a
 /// `SessionClose` (returning its exit code) or the stream closes (exit code 0).
-pub async fn collect_until_close(
-    recv: &mut quinn::RecvStream,
-) -> anyhow::Result<(Vec<u8>, i32)> {
+pub async fn collect_until_close(recv: &mut quinn::RecvStream) -> anyhow::Result<(Vec<u8>, i32)> {
     let mut output = Vec::new();
     loop {
         match nosh_proto::read_message(recv).await {

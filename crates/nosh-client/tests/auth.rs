@@ -55,7 +55,8 @@ async fn unknown_client_key_rejected() {
     let authorized = TestKey::generate();
     let intruder = TestKey::generate();
     // Server authorizes `authorized`, but the client uses `intruder`.
-    let server = common::spawn_server(&host_key, &[&authorized.public], AuthLimits::default()).await;
+    let server =
+        common::spawn_server(&host_key, &[&authorized.public], AuthLimits::default()).await;
 
     let dir = tempfile::tempdir().unwrap();
     let kh = dir.path().join("known_hosts");
@@ -88,14 +89,19 @@ async fn host_key_mismatch_aborts() {
     let host_key = TestKey::generate();
     let wrong_host = TestKey::generate();
     let client_key = TestKey::generate();
-    let server = common::spawn_server(&host_key, &[&client_key.public], AuthLimits::default()).await;
+    let server =
+        common::spawn_server(&host_key, &[&client_key.public], AuthLimits::default()).await;
 
     // Pre-seed known_hosts with the WRONG host key for HOST.
     let dir = tempfile::tempdir().unwrap();
     let kh = dir.path().join("known_hosts");
     std::fs::write(
         &kh,
-        format!("{} {}\n", HOST, wrong_host.public.to_openssh_line().unwrap()),
+        format!(
+            "{} {}\n",
+            HOST,
+            wrong_host.public.to_openssh_line().unwrap()
+        ),
     )
     .unwrap();
 
@@ -113,7 +119,8 @@ async fn host_key_mismatch_aborts() {
 async fn tofu_first_contact_records() {
     let host_key = TestKey::generate();
     let client_key = TestKey::generate();
-    let server = common::spawn_server(&host_key, &[&client_key.public], AuthLimits::default()).await;
+    let server =
+        common::spawn_server(&host_key, &[&client_key.public], AuthLimits::default()).await;
 
     let dir = tempfile::tempdir().unwrap();
     let kh = dir.path().join("known_hosts");
@@ -140,7 +147,8 @@ async fn forged_certificate_verify_rejected() {
     let host_key = TestKey::generate();
     // The authorized identity (its public key is what the server pins).
     let authorized = TestKey::generate();
-    let server = common::spawn_server(&host_key, &[&authorized.public], AuthLimits::default()).await;
+    let server =
+        common::spawn_server(&host_key, &[&authorized.public], AuthLimits::default()).await;
 
     // A forging signer: presents the authorized cert (SPKI = authorized key)
     // but signs the CertificateVerify with a DIFFERENT key.

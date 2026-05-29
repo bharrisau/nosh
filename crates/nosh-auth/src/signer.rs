@@ -64,9 +64,12 @@ impl RawEd25519Signer for AgentSigner {
             .sign(self.public_key.clone(), msg)
             .context("ssh-agent sign request failed")?;
         let bytes = sig.as_bytes();
-        bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("ssh-agent returned a {}-byte signature, expected 64", bytes.len()))
+        bytes.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "ssh-agent returned a {}-byte signature, expected 64",
+                bytes.len()
+            )
+        })
     }
 
     fn public_key32(&self) -> [u8; 32] {
@@ -230,7 +233,10 @@ impl NoshServerCertResolver {
 }
 
 impl rustls::server::ResolvesServerCert for NoshServerCertResolver {
-    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         Some(self.certified.clone())
     }
 }

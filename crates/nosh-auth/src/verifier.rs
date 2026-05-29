@@ -35,7 +35,11 @@ pub struct HostKeyVerifier {
 impl HostKeyVerifier {
     /// Build a verifier that pins `host`'s key against the `known_hosts` file,
     /// delegating signature checks to `provider`.
-    pub fn new(known_hosts: PathBuf, host: impl Into<String>, provider: Arc<CryptoProvider>) -> Self {
+    pub fn new(
+        known_hosts: PathBuf,
+        host: impl Into<String>,
+        provider: Arc<CryptoProvider>,
+    ) -> Self {
         Self {
             known_hosts,
             host: host.into(),
@@ -91,7 +95,12 @@ impl ServerCertVerifier for HostKeyVerifier {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
         // REAL signature verification — never stubbed (PITFALL 5).
-        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -101,7 +110,12 @@ impl ServerCertVerifier for HostKeyVerifier {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
         // REAL signature verification — never stubbed (PITFALL 5).
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -170,7 +184,12 @@ impl ClientCertVerifier for AuthorizedKeysVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -181,7 +200,12 @@ impl ClientCertVerifier for AuthorizedKeysVerifier {
     ) -> Result<HandshakeSignatureValid, Error> {
         // REAL signature verification — never stubbed (PITFALL 5). This is what
         // rejects a forged CertificateVerify even when the SPKI matches.
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {

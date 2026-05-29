@@ -173,11 +173,7 @@ pub fn extract_spki_from_cert(cert: &CertificateDer<'_>) -> anyhow::Result<Vec<u
     use x509_parser::prelude::FromDer;
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
         .map_err(|e| anyhow::anyhow!("parse peer certificate: {e}"))?;
-    Ok(parsed
-        .tbs_certificate
-        .subject_pki
-        .raw
-        .to_vec())
+    Ok(parsed.tbs_certificate.subject_pki.raw.to_vec())
 }
 
 #[cfg(test)]
