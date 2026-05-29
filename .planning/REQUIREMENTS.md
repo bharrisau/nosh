@@ -89,33 +89,33 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TRANS-01 | TBD | Pending |
-| TRANS-02 | TBD | Pending |
-| TRANS-03 | TBD | Pending |
-| TRANS-04 | TBD | Pending |
-| TRANS-05 | TBD | Pending |
-| AUTH-01 | TBD | Pending |
-| AUTH-02 | TBD | Pending |
-| AUTH-03 | TBD | Pending |
-| AUTH-04 | TBD | Pending |
-| AUTH-05 | TBD | Pending |
-| SESS-01 | TBD | Pending |
-| SESS-02 | TBD | Pending |
-| SESS-03 | TBD | Pending |
-| SESS-04 | TBD | Pending |
-| SESS-05 | TBD | Pending |
-| SESS-06 | TBD | Pending |
-| SESS-07 | TBD | Pending |
-| SESS-08 | TBD | Pending |
-| SESS-09 | TBD | Pending |
-| SESS-10 | TBD | Pending |
-| SESS-11 | TBD | Pending |
+| TRANS-01 | Phase 1 | Pending |
+| TRANS-02 | Phase 1 | Pending |
+| TRANS-03 | Phase 1 | Pending |
+| TRANS-04 | Phase 1 | Pending |
+| TRANS-05 | Phase 1 | Pending |
+| AUTH-01 | Phase 2 | Pending |
+| AUTH-02 | Phase 2 | Pending |
+| AUTH-03 | Phase 2 | Pending |
+| AUTH-04 | Phase 2 | Pending |
+| AUTH-05 | Phase 2 | Pending |
+| SESS-01 | Phase 3 | Pending |
+| SESS-02 | Phase 3 | Pending |
+| SESS-03 | Phase 3 | Pending |
+| SESS-04 | Phase 3 | Pending |
+| SESS-05 | Phase 3 | Pending |
+| SESS-06 | Phase 3 | Pending |
+| SESS-07 | Phase 3 | Pending |
+| SESS-08 | Phase 3 | Pending |
+| SESS-09 | Phase 3 | Pending |
+| SESS-10 | Phase 3 | Pending |
+| SESS-11 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 21 total
-- Mapped to phases: 0 (set during roadmap creation)
-- Unmapped: 21 ⚠️
+- Mapped to phases: 21
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-05-29*
-*Last updated: 2026-05-29 after initial definition*
+*Last updated: 2026-05-29 after roadmap creation — traceability complete*
