@@ -1,0 +1,102 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-05-29T10:26:13.162Z",
+  "source": "auto-postool",
+  "partial": false,
+  "phase": null,
+  "phase_name": "01 (quic-transport-skeleton) — EXECUTING",
+  "phase_dir": null,
+  "plan": "1",
+  "task": null,
+  "total_tasks": null,
+  "status": "auto-checkpoint",
+  "completed_tasks": [],
+  "remaining_tasks": [],
+  "blockers": [
+    {
+      "description": "Phase 2: `ssh-agent-client-rs` 1.1.2 RSA SHA-2 flag exposure is unconfirmed — inspect source at implementation time; may need to limit to Ed25519 initially",
+      "type": "technical",
+      "workaround": ""
+    },
+    {
+      "description": "Phase 2: `verify_tls13_signature` delegation pattern is non-trivial — plan a focused spike on the signing round-trip before declaring Phase 2 done",
+      "type": "technical",
+      "workaround": ""
+    }
+  ],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "Init: Cert-pinning path for M1 (not RFC 7250 RPK) — rustls issue #2257 resolution unconfirmed in 0.23.40",
+      "rationale": "",
+      "phase": null
+    },
+    {
+      "decision": "Init: Ed25519-first for auth; RSA must be tested before Phase 2 closes",
+      "rationale": "",
+      "phase": null
+    },
+    {
+      "decision": "Init: `spawn_blocking` bridge for PTY I/O in Phase 3 spike (not AsyncFd)",
+      "rationale": "",
+      "phase": null
+    },
+    {
+      "decision": "Init: Session keyed on SSH identity fingerprint (not QUIC connection ID) — M3 reattach seam",
+      "rationale": "",
+      "phase": null
+    }
+  ],
+  "uncommitted_files": [
+    {
+      "status": "M",
+      "path": "Cargo.lock"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-auth/src/lib.rs"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-auth/src/signer.rs"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-client/Cargo.toml"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-client/src/client.rs"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-client/src/main.rs"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-client/tests/transport.rs"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-server/Cargo.toml"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-server/src/main.rs"
+    },
+    {
+      "status": "M",
+      "path": "crates/nosh-server/src/server.rs"
+    },
+    {
+      "status": "??",
+      "path": ".planning/HANDOFF.json"
+    },
+    {
+      "status": "??",
+      "path": "crates/nosh-client/tests/common/"
+    }
+  ],
+  "next_action": "Executing Phase 01",
+  "context_notes": "Status: Executing Phase 01\n\nStopped at: Phase 2 context gathered\n\nRecent commits:\n930c0ad feat(02-02): SSH-key SPKI-pinning verifiers (client TOFU + server authorized_keys)\nd95123e feat(02-01): auth primitives — keys, SPKI, ssh-agent signer, cert minting\n5ba97ed docs(02): research + 4 plans for ssh-key mutual auth\n187c265 docs(state): record phase 2 context session\n6d5b099 docs(02): capture phase context"
+}

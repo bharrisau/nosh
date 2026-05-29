@@ -1,56 +1,118 @@
 //! Server-side QUIC endpoint setup and per-connection echo handlers.
 //!
 //! Exposed as library functions so the integration tests (Plan 04) can drive an
-//! in-process server. Phase 1 uses `with_no_client_auth()` — client auth is
-//! Phase 2.
+//! in-process server. Phase 2 enforces SSH-key mutual auth inside the TLS
+//! handshake (client cert pinned against `authorized_keys`) and caps
+//! concurrent unauthenticated connections.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-/// Build a quinn `ServerConfig`: an ephemeral rcgen self-signed cert, ALPN
-/// `nosh/0`, no client auth (Phase 1), and the shared transport config.
-pub fn build_server_config() -> anyhow::Result<quinn::ServerConfig> {
-    // Ensure a process-wide default CryptoProvider is installed (ring).
+/// Pre-auth DoS limits for the accept loop (decision D-13 / FOOTGUN-3).
+#[derive(Clone, Copy, Debug)]
+pub struct AuthLimits {
+    /// Max concurrent in-progress (pre-auth) handshakes.
+    pub max_concurrent: usize,
+    /// Time a connection has to complete the TLS handshake before being dropped.
+    pub auth_timeout: Duration,
+}
+
+impl Default for AuthLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 64,
+            auth_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Build a quinn `ServerConfig` enforcing SSH-key mutual auth.
+///
+/// - Server presents a self-signed cert whose SPKI is the host key's Ed25519
+///   public key (D-06/D-09); it signs its own `CertificateVerify` with the host
+///   key loaded from `host_key_path`.
+/// - Clients must present a cert whose SPKI is in `authorized_keys_path`
+///   (AUTH-01), enforced by [`AuthorizedKeysVerifier`].
+pub fn build_server_config(
+    host_key_path: &Path,
+    authorized_keys_path: &Path,
+) -> anyhow::Result<quinn::ServerConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
 
-    // Ephemeral self-signed cert for "localhost" (dev placeholder; Phase 2
-    // replaces the trust model with SSH-key pinning).
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .context("generate self-signed cert")?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    // Load the Ed25519 host key (daemon model — from a file, D-06) and mint a
+    // self-signed cert whose SPKI is the host public key.
+    let host_priv = nosh_auth::load_host_key(host_key_path)?;
+    let host_signer: Arc<dyn nosh_auth::RawEd25519Signer> = Arc::new(
+        nosh_auth::InProcessEd25519Signer::from_ssh_private(&host_priv)?,
+    );
+    let host_cert = nosh_auth::mint_self_signed_cert(&host_signer)?;
+    let host_signing_key = Arc::new(nosh_auth::AgentSigningKey::new(host_signer));
+
+    // Authorized client keys (AUTH-01 / D-07).
+    let authorized = nosh_auth::load_authorized_keys(authorized_keys_path)?;
+    let client_verifier = Arc::new(AuthorizedKeysVerifier::new(authorized, provider.clone()));
 
     let mut rustls_cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .context("build rustls server config")?;
+        .with_client_cert_verifier(client_verifier)
+        .with_cert_resolver(Arc::new(NoshServerCertResolver::new(
+            host_cert,
+            host_signing_key,
+        )));
     rustls_cfg.alpn_protocols = vec![nosh_proto::ALPN.to_vec()];
 
     let quic_crypto = QuicServerConfig::try_from(rustls_cfg)
         .context("convert rustls server config to QUIC")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    // Server does not drive keep-alive (the client does).
     server_config.transport_config(Arc::new(nosh_proto::transport_config(false)));
 
     Ok(server_config)
 }
 
-/// Build a quinn server `Endpoint` bound to `addr`.
-pub fn make_endpoint(addr: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
-    let endpoint = quinn::Endpoint::server(build_server_config()?, addr)
-        .with_context(|| format!("bind server endpoint to {addr}"))?;
+/// Build a quinn server `Endpoint` bound to `addr` with the given trust files.
+pub fn make_endpoint(
+    addr: SocketAddr,
+    host_key_path: &Path,
+    authorized_keys_path: &Path,
+) -> anyhow::Result<quinn::Endpoint> {
+    let endpoint = quinn::Endpoint::server(
+        build_server_config(host_key_path, authorized_keys_path)?,
+        addr,
+    )
+    .with_context(|| format!("bind server endpoint to {addr}"))?;
     Ok(endpoint)
 }
 
-/// Accept connections forever, spawning a handler per connection.
-pub async fn run_accept_loop(endpoint: quinn::Endpoint) -> anyhow::Result<()> {
+/// Accept connections forever, capping concurrent half-open handshakes and
+/// enforcing an auth-completion timeout (AUTH-05 / D-13).
+pub async fn run_accept_loop(endpoint: quinn::Endpoint, limits: AuthLimits) -> anyhow::Result<()> {
+    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent));
     while let Some(incoming) = endpoint.accept().await {
+        // Bound concurrent pre-auth connections: if all permits are taken,
+        // refuse rather than allocate unbounded per-connection state.
+        let permit = match permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "pre-auth connection cap ({}) reached; refusing connection",
+                    limits.max_concurrent
+                );
+                incoming.refuse();
+                continue;
+            }
+        };
+        let timeout = limits.auth_timeout;
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming).await {
+            // The permit is held for the whole handshake+session; dropping it
+            // on any exit path releases capacity.
+            let _permit = permit;
+            if let Err(e) = handle_connection(incoming, timeout).await {
                 tracing::warn!("connection handler ended: {e:#}");
             }
         });
@@ -60,8 +122,20 @@ pub async fn run_accept_loop(endpoint: quinn::Endpoint) -> anyhow::Result<()> {
 
 /// Handle one connection: echo bidi-stream bytes and echo datagrams,
 /// concurrently, until the peer closes or the connection times out.
-async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
-    let conn = incoming.await.context("accept connection")?;
+async fn handle_connection(
+    incoming: quinn::Incoming,
+    auth_timeout: Duration,
+) -> anyhow::Result<()> {
+    // AUTH-05: bound the time a connection may stay half-open. The TLS handshake
+    // (including client-cert verification) completes when `incoming` resolves;
+    // if it does not within the timeout, drop the connection.
+    let conn = match tokio::time::timeout(auth_timeout, incoming).await {
+        Ok(res) => res.context("accept connection")?,
+        Err(_) => {
+            tracing::warn!("connection did not complete auth within timeout; dropping");
+            return Ok(());
+        }
+    };
     let peer = conn.remote_address();
 
     // Log the negotiated ALPN for observability.

@@ -4,29 +4,97 @@
 //! Exposed as library functions so the integration tests (Plan 04) reuse them.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
 use bytes::Bytes;
+use nosh_auth::{
+    AgentSigner, AgentSigningKey, HostKeyVerifier, NoshClientCertResolver, RawEd25519Signer,
+};
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig};
-use nosh_auth::PlaceholderServerVerifier;
 
 /// Generous read limit for echoed streams in this skeleton.
 const READ_LIMIT: usize = 64 * 1024;
 
-/// Build a quinn `ClientConfig` using the placeholder server verifier (the
-/// Phase 2 seam), ALPN `nosh/0`, and the shared transport config WITH keep-alive
-/// enabled (the client drives keep-alive — TRANS-05).
-pub fn build_client_config() -> anyhow::Result<quinn::ClientConfig> {
+/// The client's signing identity (Ed25519). The `CertificateVerify` signature
+/// is produced by the inner [`RawEd25519Signer`] — for production this is an
+/// [`AgentSigner`] (ssh-agent; private key never read, AUTH-04).
+pub struct ClientIdentity {
+    signer: Arc<dyn RawEd25519Signer>,
+}
+
+impl ClientIdentity {
+    /// Build an identity from a raw Ed25519 signer (in-process; for tests).
+    pub fn from_signer(signer: Arc<dyn RawEd25519Signer>) -> Self {
+        Self { signer }
+    }
+
+    /// Build an identity backed by ssh-agent.
+    ///
+    /// `socket_path` is the agent socket (`SSH_AUTH_SOCK`). `identity_pub`, when
+    /// `Some`, selects which agent key to use (path to a `.pub`); when `None`,
+    /// the agent's single key is used (error if 0 or >1).
+    pub fn from_agent(
+        socket_path: PathBuf,
+        identity_pub: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let public_key = match identity_pub {
+            Some(p) => ssh_key::PublicKey::read_openssh_file(p)
+                .with_context(|| format!("read identity public key {}", p.display()))?,
+            None => {
+                let mut client = ssh_agent_connect(&socket_path)?;
+                #[allow(deprecated)]
+                let mut ids = client
+                    .list_identities()
+                    .context("list ssh-agent identities")?;
+                match ids.len() {
+                    1 => ids.remove(0),
+                    0 => anyhow::bail!("ssh-agent has no identities; add one with ssh-add"),
+                    n => anyhow::bail!(
+                        "ssh-agent has {n} identities; specify one with --identity"
+                    ),
+                }
+            }
+        };
+        let signer = AgentSigner::new(socket_path, public_key)?;
+        Ok(Self {
+            signer: Arc::new(signer),
+        })
+    }
+}
+
+fn ssh_agent_connect(path: &Path) -> anyhow::Result<ssh_agent_client_rs::Client> {
+    ssh_agent_client_rs::Client::connect(path)
+        .with_context(|| format!("connect ssh-agent at {}", path.display()))
+}
+
+/// Build a quinn `ClientConfig` with SSH-key mutual auth: pin the server host
+/// key against `known_hosts` (TOFU, AUTH-02) and present the agent-signed
+/// client identity cert (AUTH-04). ALPN `nosh/0`; keep-alive enabled (TRANS-05).
+pub fn build_client_config(
+    identity: &ClientIdentity,
+    known_hosts: PathBuf,
+    host: impl Into<String>,
+) -> anyhow::Result<quinn::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = rustls::crypto::CryptoProvider::get_default()
         .context("no default CryptoProvider installed")?
         .clone();
 
+    // Mint the client identity cert whose SPKI is the SSH key (the one agent
+    // signature for the cert self-signature is acceptable — the private key is
+    // still never read by nosh).
+    let cert = nosh_auth::mint_self_signed_cert(&identity.signer)?;
+    let signing_key = Arc::new(AgentSigningKey::new(identity.signer.clone()));
+    let resolver = Arc::new(NoshClientCertResolver::new(cert, signing_key));
+
+    let verifier = Arc::new(HostKeyVerifier::new(known_hosts, host, provider));
+
     let mut rustls_cfg = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PlaceholderServerVerifier::new(provider)))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(resolver);
     rustls_cfg.alpn_protocols = vec![nosh_proto::ALPN.to_vec()];
 
     let quic_crypto =
@@ -38,12 +106,16 @@ pub fn build_client_config() -> anyhow::Result<quinn::ClientConfig> {
     Ok(client_config)
 }
 
-/// Build a client `Endpoint` (bound to an ephemeral local UDP port) with the
-/// nosh client config as its default.
-pub fn make_endpoint() -> anyhow::Result<quinn::Endpoint> {
+/// Build a client `Endpoint` (ephemeral local UDP port) with a nosh client
+/// config (mutual auth) as its default.
+pub fn make_endpoint(
+    identity: &ClientIdentity,
+    known_hosts: PathBuf,
+    host: impl Into<String>,
+) -> anyhow::Result<quinn::Endpoint> {
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .context("create client endpoint")?;
-    endpoint.set_default_client_config(build_client_config()?);
+    endpoint.set_default_client_config(build_client_config(identity, known_hosts, host)?);
     Ok(endpoint)
 }
 
@@ -52,9 +124,10 @@ pub fn make_endpoint() -> anyhow::Result<quinn::Endpoint> {
 pub async fn connect(
     endpoint: &quinn::Endpoint,
     server_addr: SocketAddr,
+    host: &str,
 ) -> anyhow::Result<quinn::Connection> {
     let conn = endpoint
-        .connect(server_addr, "localhost")
+        .connect(server_addr, host)
         .context("start connect")?
         .await
         .context("await connection")?;

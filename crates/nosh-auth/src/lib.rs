@@ -20,6 +20,9 @@ pub mod verifier;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use keys::{NoshPublicKey, ED25519_SPKI_LEN};
-pub use signer::{AgentSigner, AgentSigningKey, InProcessEd25519Signer, RawEd25519Signer};
+pub use keys::{load_authorized_keys, load_host_key, NoshPublicKey, ED25519_SPKI_LEN};
+pub use signer::{
+    mint_self_signed_cert, AgentSigner, AgentSigningKey, InProcessEd25519Signer,
+    NoshClientCertResolver, NoshServerCertResolver, RawEd25519Signer,
+};
 pub use verifier::{AuthorizedKeysVerifier, HostKeyVerifier};

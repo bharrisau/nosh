@@ -212,6 +212,63 @@ impl SigningKey for AgentSigningKey {
     }
 }
 
+/// A `ResolvesServerCert` presenting the nosh host-key identity cert, signing
+/// the server `CertificateVerify` with the host key (D-06, in-process). Reuses
+/// the same Ed25519 [`AgentSigningKey`] wrapper as the client.
+#[derive(Debug)]
+pub struct NoshServerCertResolver {
+    certified: Arc<rustls::sign::CertifiedKey>,
+}
+
+impl NoshServerCertResolver {
+    /// Build from the host identity cert and the host Ed25519 signing key.
+    pub fn new(cert: CertificateDer<'static>, key: Arc<AgentSigningKey>) -> Self {
+        Self {
+            certified: Arc::new(rustls::sign::CertifiedKey::new(vec![cert], key)),
+        }
+    }
+}
+
+impl rustls::server::ResolvesServerCert for NoshServerCertResolver {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.certified.clone())
+    }
+}
+
+/// A `ResolvesClientCert` that always presents the nosh identity cert and signs
+/// the `CertificateVerify` via the inner [`AgentSigningKey`] (Ed25519 only).
+#[derive(Debug)]
+pub struct NoshClientCertResolver {
+    certified: Arc<rustls::sign::CertifiedKey>,
+}
+
+impl NoshClientCertResolver {
+    /// Build from the identity cert and the agent-backed signing key.
+    pub fn new(cert: CertificateDer<'static>, key: Arc<AgentSigningKey>) -> Self {
+        Self {
+            certified: Arc::new(rustls::sign::CertifiedKey::new(vec![cert], key)),
+        }
+    }
+}
+
+impl rustls::client::ResolvesClientCert for NoshClientCertResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if sigschemes.contains(&SignatureScheme::ED25519) {
+            Some(self.certified.clone())
+        } else {
+            None
+        }
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 /// The per-handshake `Signer`. `message` is the fully-built TLS 1.3
 /// CertificateVerify input (PITFALL 8) — signed raw, no reconstruction.
 #[derive(Debug)]

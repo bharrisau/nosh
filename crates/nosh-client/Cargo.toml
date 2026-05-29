@@ -24,7 +24,14 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
+ssh-agent-client-rs = "1.1"
+dirs = "5"
 
 [dev-dependencies]
 nosh-server = { path = "../nosh-server" }
+nosh-auth = { path = "../nosh-auth", features = ["test-support"] }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
+ed25519-dalek = "2.2"
 tokio = { workspace = true }
+tempfile = "3"

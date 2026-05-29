@@ -154,7 +154,7 @@ impl ClientCertVerifier for AuthorizedKeysVerifier {
         let presented = parse_ed25519_from_spki(&spki)
             .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
 
-        if self.authorized.iter().any(|k| *k == presented) {
+        if self.authorized.contains(&presented) {
             Ok(ClientCertVerified::assertion())
         } else {
             // AUTH-01: unknown key rejected at the handshake, before any session.
