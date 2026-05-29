@@ -167,6 +167,20 @@ async fn handle_connection(
     drop(permit);
     let peer = conn.remote_address();
 
+    // D-04/D-05: extract the authenticated peer identity immediately after the
+    // handshake completes — before any session work. AuthorizedKeysVerifier
+    // enforces client auth, so a resolved connection must always have a parseable
+    // peer identity. If extraction nonetheless fails, close with CLOSE_AUTH and
+    // log an error. An unauthenticated session is impossible.
+    let peer_identity = match extract_peer_identity(&conn) {
+        Some(k) => k,
+        None => {
+            tracing::error!(%peer, "connection passed auth but peer identity could not be extracted — closing");
+            conn.close(CLOSE_AUTH.into(), b"peer identity extraction failed");
+            return Ok(());
+        }
+    };
+
     // Log the negotiated ALPN for observability.
     let alpn = conn
         .handshake_data()
@@ -182,7 +196,7 @@ async fn handle_connection(
         Err(e) => return clean_exit(e),
     };
 
-    run_session(conn, peer, send, recv, shell_override).await
+    run_session(conn, peer, peer_identity, send, recv, shell_override).await
 }
 
 /// Drive a single PTY session over the established bidi stream.
