@@ -203,6 +203,7 @@ async fn handle_connection(
 async fn run_session(
     conn: quinn::Connection,
     peer: SocketAddr,
+    identity: nosh_auth::NoshPublicKey,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     shell_override: Option<String>,
@@ -230,7 +231,7 @@ async fn run_session(
 
     let passwd = session::lookup_self(shell_override.as_deref());
     let (mut sess, reader, writer) =
-        session::open(&passwd, &term, cols, rows, &client_env, None).context("open session")?;
+        session::open(&passwd, &term, cols, rows, &client_env, identity).context("open session")?;
 
     let session_id = sess.session_id;
     let username = sess.username.clone();
