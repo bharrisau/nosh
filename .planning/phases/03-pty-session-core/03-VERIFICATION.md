@@ -3,7 +3,16 @@
 **Verified:** 2026-05-29
 **Method:** Goal-backward — start from each SESS requirement and the phase goal, trace to the code and
 the automated test (or the human-verification step) that proves it.
-status: human_needed
+status: passed
+
+> **Human validation (2026-05-29):** The two human-verification items were validated live by the
+> user at a real terminal and PASSED:
+> - SESS-01/04 sanity — `tty` → `/dev/pts/14`, `stty size` → `46 156` (real interactive PTY, size propagated).
+> - SESS-06 — `sleep 100` + Ctrl-C interrupted the foreground process and returned to the prompt.
+> - SESS-03 — after `kill -9` of the client, the local terminal remained usable (cooked, typing echoed)
+>   with no `reset` needed.
+> All 11 SESS requirements are now verified (9 automated + 2 human-validated). Status updated
+> human_needed → passed.
 
 ## Goal
 
