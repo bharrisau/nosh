@@ -235,7 +235,14 @@ async fn run_session(
 
     let session_id = sess.session_id;
     let username = sess.username.clone();
-    let span = tracing::info_span!("session", %session_id, %peer, username = %username);
+    let fingerprint = sess.identity.fingerprint();
+    let span = tracing::info_span!(
+        "session",
+        %session_id,
+        %peer,
+        username = %username,
+        identity = %fingerprint,
+    );
     let _enter = span.enter();
     tracing::info!(%term, cols, rows, child_pid = ?sess.child_pid(), "session open");
 
