@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
+use rustls::pki_types::CertificateDer;
 use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use tokio::sync::mpsc;
@@ -136,6 +137,9 @@ pub async fn run_accept_loop(
 const CLOSE_OK: u32 = 0;
 /// QUIC application close code for a protocol violation (bad first frame).
 const CLOSE_PROTOCOL: u32 = 1;
+/// QUIC application close code for peer identity extraction failure (should
+/// never happen on an AuthorizedKeysVerifier-enforced connection — D-04).
+const CLOSE_AUTH: u32 = 2;
 /// PTY output read chunk size.
 const PTY_CHUNK: usize = 8 * 1024;
 
@@ -364,6 +368,22 @@ async fn run_session(
     output_reader.abort();
     input_writer.abort();
     Ok(())
+}
+
+/// Extract the `NoshPublicKey` from the peer's TLS client cert after the
+/// handshake completes. Returns `None` if the peer has no identity, the
+/// downcast fails, or the cert is not a valid Ed25519 SPKI.
+///
+/// Used by `handle_connection` to enforce D-04/D-05: identity is extracted
+/// before any session work, and the connection is closed if extraction fails.
+fn extract_peer_identity(conn: &quinn::Connection) -> Option<nosh_auth::NoshPublicKey> {
+    let certs = conn
+        .peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?;
+    let leaf = certs.first()?;
+    let spki = nosh_auth::keys::extract_spki_from_cert(leaf).ok()?;
+    nosh_auth::nosh_key_from_spki(&spki)
 }
 
 /// Treat orderly connection teardown as a clean loop exit, not an error.
