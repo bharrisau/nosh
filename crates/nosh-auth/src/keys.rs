@@ -229,6 +229,28 @@ mod tests {
     }
 
     #[test]
+    fn nosh_key_from_spki_roundtrip() {
+        let original = NoshPublicKey::from_raw([42u8; 32]);
+        let spki = original.spki_der();
+        let recovered = nosh_key_from_spki(&spki).expect("valid Ed25519 SPKI must parse");
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn nosh_key_from_spki_rejects_wrong_length() {
+        assert!(nosh_key_from_spki(&[0u8; 43]).is_none(), "43 bytes must be rejected");
+        assert!(nosh_key_from_spki(&[0u8; 45]).is_none(), "45 bytes must be rejected");
+        assert!(nosh_key_from_spki(&[]).is_none(), "empty must be rejected");
+    }
+
+    #[test]
+    fn nosh_key_from_spki_rejects_wrong_prefix() {
+        let mut bad_spki = NoshPublicKey::from_raw([1u8; 32]).spki_der();
+        bad_spki[0] ^= 0xff; // corrupt first byte of prefix
+        assert!(nosh_key_from_spki(&bad_spki).is_none(), "wrong prefix must be rejected");
+    }
+
+    #[test]
     fn fingerprint_format() {
         // SHA256 of 32 zero bytes, base64-no-pad = 43 chars, prefixed with "SHA256:".
         let key = NoshPublicKey::from_raw([0u8; 32]);
