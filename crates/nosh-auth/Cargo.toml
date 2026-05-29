@@ -4,5 +4,21 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exposes `nosh_auth::test_support` (ephemeral ssh-agent harness) to downstream
+# integration tests. Off by default; enabled as a dev-dependency feature.
+test-support = ["dep:tempfile"]
+
 [dependencies]
 rustls = { workspace = true }
+rcgen = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
+ssh-agent-client-rs = "1.1"
+ed25519-dalek = "2.2"
+x509-parser = "0.18"
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
