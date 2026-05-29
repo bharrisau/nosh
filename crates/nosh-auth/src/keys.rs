@@ -207,6 +207,27 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_format() {
+        // SHA256 of 32 zero bytes, base64-no-pad = 43 chars, prefixed with "SHA256:".
+        let key = NoshPublicKey::from_raw([0u8; 32]);
+        let fp = key.fingerprint();
+        assert!(fp.starts_with("SHA256:"), "fingerprint must start with SHA256: — got {fp:?}");
+        let b64_part = &fp["SHA256:".len()..];
+        assert_eq!(b64_part.len(), 43, "SHA256 base64-no-pad is 43 chars — got {b64_part:?}");
+        // Must not contain '=' padding characters.
+        assert!(!b64_part.contains('='), "base64-no-pad must not contain padding: {fp:?}");
+        // The raw key bytes must not appear in the fingerprint output.
+        assert!(!fp.contains('\0'), "raw key bytes must not appear in fingerprint");
+    }
+
+    #[test]
+    fn fingerprint_two_different_keys_differ() {
+        let k1 = NoshPublicKey::from_raw([1u8; 32]);
+        let k2 = NoshPublicKey::from_raw([2u8; 32]);
+        assert_ne!(k1.fingerprint(), k2.fingerprint(), "distinct keys must have distinct fingerprints");
+    }
+
+    #[test]
     fn known_hosts_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");
