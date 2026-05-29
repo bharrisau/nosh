@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: paused
-stopped_at: Phase 3 context gathered
-last_updated: "2026-05-29T10:44:40.589Z"
-last_activity: 2026-05-29 -- Phase 02 executed and verified (passed)
+status: Awaiting next milestone
+stopped_at: v1.0 milestone complete
+last_updated: "2026-05-29T11:35:44.387Z"
+last_activity: 2026-05-29 — Milestone v1.0 completed and archived
 progress:
   total_phases: 3
-  completed_phases: 2
-  total_plans: 8
-  completed_plans: 8
+  completed_phases: 3
+  total_plans: 11
+  completed_plans: 11
   percent: 100
 ---
 
@@ -21,16 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-29)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity.
-**Current focus:** Phase 02 — ssh-key-mutual-auth (COMPLETE, verified passed)
+**Current focus:** v1.0 milestone shipped and archived — planning next milestone (M3 roaming)
 
 ## Current Position
 
-Phase: 02 (ssh-key-mutual-auth) — VERIFIED (passed)
-Plan: 4 of 4 complete
-Status: Phase 2 complete; stopped before any milestone transition / Phase 3
-Last activity: 2026-05-29 -- Phase 02 executed and verified (passed)
-
-Progress: [██████░░░░] 67%
+Phase: Milestone v1.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-05-29 — Milestone v1.0 completed and archived
 
 ## Performance Metrics
 
@@ -91,3 +89,7 @@ Items acknowledged and carried forward from initial scoping:
 Last session: 2026-05-29T10:44:40.559Z
 Stopped at: Phase 3 context gathered
 Resume file: .planning/phases/03-pty-session-core/03-CONTEXT.md
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone
