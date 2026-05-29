@@ -22,4 +22,4 @@ pub mod test_support;
 
 pub use keys::{NoshPublicKey, ED25519_SPKI_LEN};
 pub use signer::{AgentSigner, AgentSigningKey, InProcessEd25519Signer, RawEd25519Signer};
-pub use verifier::PlaceholderServerVerifier;
+pub use verifier::{AuthorizedKeysVerifier, HostKeyVerifier};
