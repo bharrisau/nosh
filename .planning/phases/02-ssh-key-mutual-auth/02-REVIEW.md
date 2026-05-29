@@ -78,7 +78,9 @@ admitted). The behaviour is documented in the inline comment, so it may be
 intentional for the spike; flagging because the variable name and D-13 framing
 imply a pre-auth-only cap. If a pre-auth-only cap is desired, drop the permit
 once `incoming.await` resolves (handshake complete) before running the session.
-No code change applied — needs a product decision, not a safe mechanical fix.
+**FIXED** (commit fix(02): release pre-auth permit on handshake completion):
+the `OwnedSemaphorePermit` is now passed into `handle_connection` and dropped
+the moment the handshake resolves, so the cap bounds pre-auth state only.
 
 ### INFO-01 — `getrandom_seed` reads /dev/urandom directly and panics on failure
 **File:** crates/nosh-auth/src/signer.rs:111-116
