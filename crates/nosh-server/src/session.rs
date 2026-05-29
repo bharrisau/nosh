@@ -154,6 +154,13 @@ impl Session {
         self.child.take()
     }
 
+    /// Mutable borrow of the child, if still present (not yet taken).
+    /// Used by `SessionSlot::try_wait` to non-blockingly poll the exit status
+    /// without taking ownership.
+    pub fn child_mut(&mut self) -> Option<&mut Box<dyn Child + Send + Sync>> {
+        self.child.as_mut()
+    }
+
     /// SIGHUP the shell (best effort). Pair with [`reap_child`] to guarantee no
     /// zombie/orphan remains (SESS-10).
     pub fn sighup(&self) {
