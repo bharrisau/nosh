@@ -48,7 +48,11 @@ Full detail archived at `.planning/milestones/v1.0-ROADMAP.md`.
   3. A configurable idle timeout (default `0` = disabled, Mosh behavior) governs orphaned-session lifetime; the setting is tested at both `0` and a finite duration
   4. A per-identity cap (default 5) is enforced before the first orphaned session is stored; attempting to exceed the cap produces a deterministic error, not a silent drop
   5. A background zombie-reaper task calls `child.try_wait()` on all orphaned sessions; no shell-process zombies accumulate after normal shell exit
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 05-01-PLAN.md — registry.rs foundation: SequencedOutputBuffer (64 KiB sequenced ring), SessionRegistry + SessionSlot, per-identity cap + LRU eviction, zombie/idle reaper (Wave 1)
+- [ ] 05-02-PLAN.md — wire registry into server.rs: thread Arc<SessionRegistry>, feed output buffer, subdivide disconnect outcome (orphan on transport loss, no SIGHUP; teardown on clean close/exit) + integration tests (Wave 2)
+- [ ] 05-03-PLAN.md — server CLI: --idle-timeout-secs (+ NOSH_IDLE_TIMEOUT_SECS env, CLI precedence) and --max-sessions-per-identity, construct registry from config (Wave 3)
 
 ### Phase 6: Cold Reattach Protocol
 **Goal**: A client that disconnected and reconnected can resume its orphaned session in 1 RTT, with output continuity and no possibility of session hijacking
