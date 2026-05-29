@@ -112,4 +112,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-29 after v1.1 milestone start*
+*Last updated: 2026-05-30 after Phase 4 (Identity Threading) complete — Session.identity is non-optional NoshPublicKey, IDENT-01 satisfied*
