@@ -416,3 +416,45 @@ fn clean_exit(e: quinn::ConnectionError) -> anyhow::Result<()> {
         other => Err(other.into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// CLOSE_AUTH defensive branch: verify the building blocks that
+    /// `extract_peer_identity` delegates to correctly return `None` for
+    /// non-Ed25519 / malformed SPKI bytes, triggering the CLOSE_AUTH path.
+    ///
+    /// `extract_peer_identity` itself cannot be called in unit tests because
+    /// `quinn::Connection` is not mockable. This test exercises the exact logic
+    /// path: `nosh_key_from_spki(spki)` returns `None` for bad input, which is
+    /// the condition that drives `handle_connection` to emit CLOSE_AUTH and
+    /// `return Ok(())` without opening a session.
+    #[test]
+    fn extract_peer_identity_none_path_building_blocks() {
+        // Wrong length → None (would trigger CLOSE_AUTH in handle_connection).
+        assert!(
+            nosh_auth::nosh_key_from_spki(&[0u8; 43]).is_none(),
+            "43-byte SPKI must produce None → CLOSE_AUTH"
+        );
+        assert!(
+            nosh_auth::nosh_key_from_spki(&[]).is_none(),
+            "empty SPKI must produce None → CLOSE_AUTH"
+        );
+        // Wrong OID prefix → None.
+        let mut bad_spki = nosh_auth::keys::ed25519_spki_der(&[1u8; 32]);
+        bad_spki[0] ^= 0xff;
+        assert!(
+            nosh_auth::nosh_key_from_spki(&bad_spki).is_none(),
+            "wrong SPKI prefix must produce None → CLOSE_AUTH"
+        );
+        // Valid Ed25519 SPKI → Some (the happy-path: identity extraction succeeds,
+        // CLOSE_AUTH is NOT triggered, and the key matches what was put in).
+        let key = nosh_auth::NoshPublicKey::from_raw([0x55u8; 32]);
+        let spki = key.spki_der();
+        let extracted = nosh_auth::nosh_key_from_spki(&spki)
+            .expect("valid Ed25519 SPKI must extract successfully (no CLOSE_AUTH)");
+        assert_eq!(
+            extracted, key,
+            "extracted identity must equal the original key (IDENT-01)"
+        );
+    }
+}

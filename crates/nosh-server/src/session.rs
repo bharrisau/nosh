@@ -309,4 +309,25 @@ mod tests {
             assert!(!keys.contains(&absent), "{absent} must NOT be present");
         }
     }
+
+    /// IDENT-01 / D-01: `Session.identity` must equal the `NoshPublicKey` passed
+    /// to `session::open`. This is the positive identity-threading invariant: the
+    /// key the verifier authenticated is what ends up in the session struct.
+    #[test]
+    fn session_identity_equals_authenticated_key() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh unavailable");
+            return;
+        }
+        let identity = NoshPublicKey::from_raw([0x42u8; 32]);
+        let passwd = lookup_self(Some("/bin/sh"));
+        let (sess, _reader, _writer) =
+            open(&passwd, "xterm", 80, 24, &[], identity.clone()).expect("session::open");
+        assert_eq!(
+            sess.identity, identity,
+            "Session.identity must equal the NoshPublicKey passed to session::open (IDENT-01/D-01)"
+        );
+        // Clean up: SIGHUP the shell so the test does not leave an orphan.
+        sess.sighup();
+    }
 }
