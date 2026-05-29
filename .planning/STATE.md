@@ -4,8 +4,8 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 1 context gathered
-last_updated: "2026-05-29T09:00:23.177Z"
-last_activity: 2026-05-29 -- Phase 01 planning complete
+last_updated: "2026-05-29T09:00:59.870Z"
+last_activity: 2026-05-29 -- Phase 01 execution started
 progress:
   total_phases: 3
   completed_phases: 0
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-29)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity.
-**Current focus:** Phase 1 — QUIC Transport Skeleton
+**Current focus:** Phase 01 — quic-transport-skeleton
 
 ## Current Position
 
-Phase: 1 of 3 (QUIC Transport Skeleton)
-Plan: 0 of TBD in current phase
-Status: Ready to execute
-Last activity: 2026-05-29 -- Phase 01 planning complete
+Phase: 01 (quic-transport-skeleton) — EXECUTING
+Plan: 1 of 4
+Status: Executing Phase 01
+Last activity: 2026-05-29 -- Phase 01 execution started
 
 Progress: [░░░░░░░░░░] 0%
 
