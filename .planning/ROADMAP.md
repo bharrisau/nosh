@@ -13,7 +13,7 @@ Three sequential phases that prove the architecture's three foundational bets on
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [ ] **Phase 1: QUIC Transport Skeleton** - quinn endpoints, stream echo, datagram round-trip, ALPN, keep-alive, nosh-proto skeleton
-- [ ] **Phase 2: SSH-Key Mutual Auth** - cert-pinning verifiers, ssh-agent signing, known_hosts/authorized_keys, pre-auth DoS cap
+- [x] **Phase 2: SSH-Key Mutual Auth** - cert-pinning verifiers, ssh-agent signing, known_hosts/authorized_keys, pre-auth DoS cap
 - [ ] **Phase 3: PTY Session Core** - PTY spawn, bidirectional I/O, raw mode, resize, signals, env sanitization, exit code, session struct
 
 ## Phase Details
@@ -64,6 +64,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. QUIC Transport Skeleton | 0/TBD | Not started | - |
-| 2. SSH-Key Mutual Auth | 0/TBD | Not started | - |
+| 1. QUIC Transport Skeleton | 4/4 | Complete | 2026-05-29 |
+| 2. SSH-Key Mutual Auth | 4/4 | Complete | 2026-05-29 |
 | 3. PTY Session Core | 0/TBD | Not started | - |

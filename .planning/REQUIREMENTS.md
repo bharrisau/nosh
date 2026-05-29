@@ -17,11 +17,11 @@ v1 = the M0–M2 architecture-validation spike (Linux-only). Hard dependency cha
 
 ### Authentication (M1)
 
-- [ ] **AUTH-01**: Server authorizes the client's public key against `authorized_keys`; unknown keys are rejected during the TLS handshake (before any session is created)
-- [ ] **AUTH-02**: Client verifies the server host key against `known_hosts`, with TOFU on first contact; mismatches abort the connection
-- [ ] **AUTH-03**: Auth reuses existing OpenSSH key material (Ed25519 at minimum), using self-signed-cert key-pinning via custom rustls `ServerCertVerifier`/`ClientCertVerifier` (signature verification delegated to the CryptoProvider — never no-op'd)
-- [ ] **AUTH-04**: The TLS `CertificateVerify` signature is produced via `ssh-agent` (private key never handled directly), signing the correctly-constructed TLS 1.3 CertificateVerify input
-- [ ] **AUTH-05**: The accept loop caps concurrent unauthenticated/half-open connections and enforces an auth-completion timeout (pre-auth DoS hardening)
+- [x] **AUTH-01**: Server authorizes the client's public key against `authorized_keys`; unknown keys are rejected during the TLS handshake (before any session is created)
+- [x] **AUTH-02**: Client verifies the server host key against `known_hosts`, with TOFU on first contact; mismatches abort the connection
+- [x] **AUTH-03**: Auth reuses existing OpenSSH key material (Ed25519 at minimum), using self-signed-cert key-pinning via custom rustls `ServerCertVerifier`/`ClientCertVerifier` (signature verification delegated to the CryptoProvider — never no-op'd)
+- [x] **AUTH-04**: The TLS `CertificateVerify` signature is produced via `ssh-agent` (private key never handled directly), signing the correctly-constructed TLS 1.3 CertificateVerify input
+- [x] **AUTH-05**: The accept loop caps concurrent unauthenticated/half-open connections and enforces an auth-completion timeout (pre-auth DoS hardening)
 
 ### Session (M2)
 
@@ -94,11 +94,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TRANS-03 | Phase 1 | Pending |
 | TRANS-04 | Phase 1 | Pending |
 | TRANS-05 | Phase 1 | Pending |
-| AUTH-01 | Phase 2 | Pending |
-| AUTH-02 | Phase 2 | Pending |
-| AUTH-03 | Phase 2 | Pending |
-| AUTH-04 | Phase 2 | Pending |
-| AUTH-05 | Phase 2 | Pending |
+| AUTH-01 | Phase 2 | Done |
+| AUTH-02 | Phase 2 | Done |
+| AUTH-03 | Phase 2 | Done |
+| AUTH-04 | Phase 2 | Done |
+| AUTH-05 | Phase 2 | Done |
 | SESS-01 | Phase 3 | Pending |
 | SESS-02 | Phase 3 | Pending |
 | SESS-03 | Phase 3 | Pending |

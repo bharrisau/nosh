@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-29T10:26:13.162Z",
+  "timestamp": "2026-05-29T10:29:59.076Z",
   "source": "auto-postool",
   "partial": false,
   "phase": null,
@@ -50,53 +50,29 @@
   "uncommitted_files": [
     {
       "status": "M",
-      "path": "Cargo.lock"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-auth/src/lib.rs"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-auth/src/signer.rs"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-client/Cargo.toml"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-client/src/client.rs"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-client/src/main.rs"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-client/tests/transport.rs"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-server/Cargo.toml"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-server/src/main.rs"
-    },
-    {
-      "status": "M",
-      "path": "crates/nosh-server/src/server.rs"
-    },
-    {
-      "status": "??",
       "path": ".planning/HANDOFF.json"
     },
     {
       "status": "??",
-      "path": "crates/nosh-client/tests/common/"
+      "path": ".planning/phases/02-ssh-key-mutual-auth/02-01-SUMMARY.md"
+    },
+    {
+      "status": "??",
+      "path": ".planning/phases/02-ssh-key-mutual-auth/02-02-SUMMARY.md"
+    },
+    {
+      "status": "??",
+      "path": ".planning/phases/02-ssh-key-mutual-auth/02-03-SUMMARY.md"
+    },
+    {
+      "status": "??",
+      "path": ".planning/phases/02-ssh-key-mutual-auth/02-04-SUMMARY.md"
+    },
+    {
+      "status": "??",
+      "path": ".planning/phases/02-ssh-key-mutual-auth/02-VERIFICATION.md"
     }
   ],
   "next_action": "Executing Phase 01",
-  "context_notes": "Status: Executing Phase 01\n\nStopped at: Phase 2 context gathered\n\nRecent commits:\n930c0ad feat(02-02): SSH-key SPKI-pinning verifiers (client TOFU + server authorized_keys)\nd95123e feat(02-01): auth primitives — keys, SPKI, ssh-agent signer, cert minting\n5ba97ed docs(02): research + 4 plans for ssh-key mutual auth\n187c265 docs(state): record phase 2 context session\n6d5b099 docs(02): capture phase context"
+  "context_notes": "Status: Executing Phase 01\n\nStopped at: Phase 2 context gathered\n\nRecent commits:\nc2bf298 test(02-04): AUTH-01..05 integration tests incl. live ssh-agent handshake\nf730e2e feat(02-03): wire SSH-key mutual auth into endpoints + pre-auth DoS cap\n930c0ad feat(02-02): SSH-key SPKI-pinning verifiers (client TOFU + server authorized_keys)\nd95123e feat(02-01): auth primitives — keys, SPKI, ssh-agent signer, cert minting\n5ba97ed docs(02): research + 4 plans for ssh-key mutual auth"
 }
