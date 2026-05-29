@@ -60,7 +60,7 @@ impl ServerCertVerifier for HostKeyVerifier {
     ) -> Result<ServerCertVerified, Error> {
         let spki = keys::extract_spki_from_cert(end_entity)
             .map_err(|_| Error::InvalidCertificate(CertificateError::BadEncoding))?;
-        let presented = parse_ed25519_from_spki(&spki)
+        let presented = keys::nosh_key_from_spki(&spki)
             .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
 
         match keys::lookup_known_host(&self.known_hosts, &self.host)
@@ -165,7 +165,7 @@ impl ClientCertVerifier for AuthorizedKeysVerifier {
     ) -> Result<ClientCertVerified, Error> {
         let spki = keys::extract_spki_from_cert(end_entity)
             .map_err(|_| Error::InvalidCertificate(CertificateError::BadEncoding))?;
-        let presented = parse_ed25519_from_spki(&spki)
+        let presented = keys::nosh_key_from_spki(&spki)
             .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
 
         if self.authorized.contains(&presented) {
@@ -211,21 +211,6 @@ impl ClientCertVerifier for AuthorizedKeysVerifier {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         vec![SignatureScheme::ED25519]
     }
-}
-
-/// Extract the 32-byte Ed25519 key from a 44-byte Ed25519 SPKI DER, validating
-/// the fixed prefix. Returns `None` for any non-Ed25519 / malformed SPKI.
-fn parse_ed25519_from_spki(spki: &[u8]) -> Option<NoshPublicKey> {
-    if spki.len() != keys::ED25519_SPKI_LEN {
-        return None;
-    }
-    let expected_prefix = keys::ed25519_spki_der(&[0u8; 32]);
-    if spki[..12] != expected_prefix[..12] {
-        return None;
-    }
-    let mut key32 = [0u8; 32];
-    key32.copy_from_slice(&spki[12..]);
-    Some(NoshPublicKey::from_raw(key32))
 }
 
 #[cfg(test)]
