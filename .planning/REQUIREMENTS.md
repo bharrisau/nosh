@@ -9,11 +9,11 @@ v1 = the M0–M2 architecture-validation spike (Linux-only). Hard dependency cha
 
 ### Transport (M0)
 
-- [ ] **TRANS-01**: Client and server establish a QUIC connection over UDP/443 (quinn + rustls, TLS 1.3, shared ALPN constant)
-- [ ] **TRANS-02**: A reliable bidirectional QUIC stream carries application bytes both directions (echo round-trip proves it)
-- [ ] **TRANS-03**: Unreliable datagram frames (RFC 9221) send and receive on the same connection, with the datagram receive buffer explicitly enabled
-- [ ] **TRANS-04**: Datagrams and streams demonstrably coexist on one connection without interfering (concurrent round-trip test passes)
-- [ ] **TRANS-05**: Connection stays alive during interactive idle (keep-alive configured so the default ~30s idle timeout does not drop a quiet shell)
+- [x] **TRANS-01**: Client and server establish a QUIC connection over UDP/443 (quinn + rustls, TLS 1.3, shared ALPN constant)
+- [x] **TRANS-02**: A reliable bidirectional QUIC stream carries application bytes both directions (echo round-trip proves it)
+- [x] **TRANS-03**: Unreliable datagram frames (RFC 9221) send and receive on the same connection, with the datagram receive buffer explicitly enabled
+- [x] **TRANS-04**: Datagrams and streams demonstrably coexist on one connection without interfering (concurrent round-trip test passes)
+- [x] **TRANS-05**: Connection stays alive during interactive idle (keep-alive configured so the default ~30s idle timeout does not drop a quiet shell)
 
 ### Authentication (M1)
 
@@ -27,10 +27,10 @@ v1 = the M0–M2 architecture-validation spike (Linux-only). Hard dependency cha
 
 - [x] **SESS-01**: Server allocates a real PTY (via `portable-pty`) and spawns the user's interactive login shell
 - [x] **SESS-02**: Keystrokes flow client→server to PTY stdin, and shell output flows PTY→server→client, over a reliable stream — interactively usable
-- [~] **SESS-03**: Client puts its local terminal in raw mode and restores it on exit, panic, or abrupt disconnect (RAII guard)
+- [x] **SESS-03**: Client puts its local terminal in raw mode and restores it on exit, panic, or abrupt disconnect (RAII guard)
 - [x] **SESS-04**: `TERM` and the initial window size (rows×cols) propagate to the server PTY at session open, so terminfo-aware and fullscreen programs render correctly
 - [x] **SESS-05**: Window resize (SIGWINCH) propagates to the server PTY, debounced/coalesced (~30–50 ms) to avoid resize storms
-- [~] **SESS-06**: Ctrl-C and other signals reach the foreground process group on the server (verified: e.g. `sleep 100` interrupts)
+- [x] **SESS-06**: Ctrl-C and other signals reach the foreground process group on the server (verified: e.g. `sleep 100` interrupts)
 - [x] **SESS-07**: Client-supplied environment is sanitized at shell open — strip `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PYTHONPATH`, `NODE_OPTIONS`; whitelist `TERM`, `LANG`/`LC_*`, `TZ`; `SSH_AUTH_SOCK` is never forwarded via the environment
 - [x] **SESS-08**: The remote shell's exit code is delivered to the client via an explicit `SessionClose { exit_code, reason }` control frame, and the client process exits with that code
 - [x] **SESS-09**: Connection closes cleanly with a structured reason (shell exited / auth failed / server shutdown) using QUIC application error codes — no hangs or spurious errors
@@ -89,27 +89,27 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TRANS-01 | Phase 1 | Pending |
-| TRANS-02 | Phase 1 | Pending |
-| TRANS-03 | Phase 1 | Pending |
-| TRANS-04 | Phase 1 | Pending |
-| TRANS-05 | Phase 1 | Pending |
-| AUTH-01 | Phase 2 | Done |
-| AUTH-02 | Phase 2 | Done |
-| AUTH-03 | Phase 2 | Done |
-| AUTH-04 | Phase 2 | Done |
-| AUTH-05 | Phase 2 | Done |
-| SESS-01 | Phase 3 | Done |
-| SESS-02 | Phase 3 | Done |
-| SESS-03 | Phase 3 | Human |
-| SESS-04 | Phase 3 | Done |
-| SESS-05 | Phase 3 | Done |
-| SESS-06 | Phase 3 | Human |
-| SESS-07 | Phase 3 | Done |
-| SESS-08 | Phase 3 | Done |
-| SESS-09 | Phase 3 | Done |
-| SESS-10 | Phase 3 | Done |
-| SESS-11 | Phase 3 | Done |
+| TRANS-01 | Phase 1 | Complete |
+| TRANS-02 | Phase 1 | Complete |
+| TRANS-03 | Phase 1 | Complete |
+| TRANS-04 | Phase 1 | Complete |
+| TRANS-05 | Phase 1 | Complete |
+| AUTH-01 | Phase 2 | Complete |
+| AUTH-02 | Phase 2 | Complete |
+| AUTH-03 | Phase 2 | Complete |
+| AUTH-04 | Phase 2 | Complete |
+| AUTH-05 | Phase 2 | Complete |
+| SESS-01 | Phase 3 | Complete |
+| SESS-02 | Phase 3 | Complete |
+| SESS-03 | Phase 3 | Complete (human-verified) |
+| SESS-04 | Phase 3 | Complete |
+| SESS-05 | Phase 3 | Complete |
+| SESS-06 | Phase 3 | Complete (human-verified) |
+| SESS-07 | Phase 3 | Complete |
+| SESS-08 | Phase 3 | Complete |
+| SESS-09 | Phase 3 | Complete |
+| SESS-10 | Phase 3 | Complete |
+| SESS-11 | Phase 3 | Complete |
 
 **Coverage:**
 - v1 requirements: 21 total
@@ -118,4 +118,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-05-29*
-*Last updated: 2026-05-29 after roadmap creation — traceability complete*
+*Last updated: 2026-05-29 after v1.0 milestone completion — all 21 v1 requirements satisfied (audit 21/21 passed)*
