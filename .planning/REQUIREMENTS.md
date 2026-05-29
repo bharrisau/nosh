@@ -82,27 +82,27 @@ Explicitly excluded for v1.1. Documented to prevent scope creep.
 
 ## Traceability
 
-Which phases cover which requirements. Phase numbering continues from v1.0 (ended at Phase 3). Populated during roadmap creation.
+Which phases cover which requirements. Phase numbering continues from v1.0 (ended at Phase 3).
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| IDENT-01 | TBD | Pending |
-| IDENT-02 | TBD | Pending |
-| ROAM-01 | TBD | Pending |
-| ROAM-02 | TBD | Pending |
-| PERSIST-01 | TBD | Pending |
-| PERSIST-02 | TBD | Pending |
-| PERSIST-03 | TBD | Pending |
-| WIN-01 | TBD | Pending |
-| WIN-02 | TBD | Pending |
-| WIN-03 | TBD | Pending |
-| WIN-04 | TBD | Pending |
+| IDENT-01 | Phase 4 | Pending |
+| IDENT-02 | Phase 6 | Pending |
+| ROAM-01 | Phase 7 | Pending |
+| ROAM-02 | Phase 6 | Pending |
+| PERSIST-01 | Phase 5 | Pending |
+| PERSIST-02 | Phase 5 | Pending |
+| PERSIST-03 | Phase 5 | Pending |
+| WIN-01 | Phase 8 | Pending |
+| WIN-02 | Phase 8 | Pending |
+| WIN-03 | Phase 8 | Pending |
+| WIN-04 | Phase 8 | Pending |
 
 **Coverage:**
 - v1.1 requirements: 11 total
-- Mapped to phases: 0 (roadmapper fills this)
-- Unmapped: 11 ⚠️ (resolved at roadmap creation)
+- Mapped to phases: 11
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-05-30*
-*Last updated: 2026-05-30 after v1.1 milestone definition*
+*Last updated: 2026-05-30 after roadmap creation (phases 4-8 assigned)*
