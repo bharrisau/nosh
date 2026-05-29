@@ -99,6 +99,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_variants_round_trip() {
+        let msgs = [
+            Message::SessionOpen {
+                term: "xterm-256color".to_string(),
+                cols: 132,
+                rows: 40,
+                env: vec![
+                    ("LC_ALL".to_string(), "C".to_string()),
+                    ("TZ".to_string(), "UTC".to_string()),
+                ],
+            },
+            Message::PtyData {
+                data: vec![0x03, b'l', b's', b'\n'],
+            },
+            Message::Resize { cols: 100, rows: 50 },
+        ];
+        for msg in msgs {
+            let mut buf: Vec<u8> = Vec::new();
+            write_message(&mut buf, &msg).await.expect("write");
+            let mut cursor = std::io::Cursor::new(buf);
+            let got = read_message(&mut cursor).await.expect("read");
+            assert_eq!(msg, got, "session variant must round-trip exactly");
+        }
+
+        // Explicitly assert env ordering is preserved (Vec, not a map).
+        let open = Message::SessionOpen {
+            term: "t".to_string(),
+            cols: 1,
+            rows: 1,
+            env: vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ],
+        };
+        let frame = encode(&open).expect("encode");
+        if let Message::SessionOpen { env, .. } = decode(&frame[4..]).expect("decode") {
+            assert_eq!(
+                env,
+                vec![
+                    ("A".to_string(), "1".to_string()),
+                    ("B".to_string(), "2".to_string())
+                ]
+            );
+        } else {
+            panic!("expected SessionOpen");
+        }
+    }
+
+    #[tokio::test]
     async fn async_write_then_read_round_trip() {
         let msg = Message::SessionClose {
             exit_code: 7,
