@@ -1,58 +1,21 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-29T10:49:31.300Z",
+  "timestamp": "2026-05-29T10:55:48.626Z",
   "source": "auto-postool",
-  "partial": false,
+  "partial": true,
   "phase": null,
-  "phase_name": "02 (ssh-key-mutual-auth) — VERIFIED (passed)",
+  "phase_name": null,
   "phase_dir": null,
-  "plan": "4",
+  "plan": null,
   "task": null,
   "total_tasks": null,
   "status": "auto-checkpoint",
   "completed_tasks": [],
   "remaining_tasks": [],
-  "blockers": [
-    {
-      "description": "Phase 2: `ssh-agent-client-rs` 1.1.2 RSA SHA-2 flag exposure is unconfirmed — inspect source at implementation time; may need to limit to Ed25519 initially",
-      "type": "technical",
-      "workaround": ""
-    },
-    {
-      "description": "Phase 2: `verify_tls13_signature` delegation pattern is non-trivial — plan a focused spike on the signing round-trip before declaring Phase 2 done",
-      "type": "technical",
-      "workaround": ""
-    }
-  ],
+  "blockers": [],
   "human_actions_pending": [],
-  "decisions": [
-    {
-      "decision": "Init: Cert-pinning path for M1 (not RFC 7250 RPK) — rustls issue #2257 resolution unconfirmed in 0.23.40",
-      "rationale": "",
-      "phase": null
-    },
-    {
-      "decision": "Init: Ed25519-first for auth; RSA must be tested before Phase 2 closes",
-      "rationale": "",
-      "phase": null
-    },
-    {
-      "decision": "Init: `spawn_blocking` bridge for PTY I/O in Phase 3 spike (not AsyncFd)",
-      "rationale": "",
-      "phase": null
-    },
-    {
-      "decision": "Init: Session keyed on SSH identity fingerprint (not QUIC connection ID) — M3 reattach seam",
-      "rationale": "",
-      "phase": null
-    }
-  ],
-  "uncommitted_files": [
-    {
-      "status": "M",
-      "path": ".planning/HANDOFF.json"
-    }
-  ],
-  "next_action": "Phase 2 complete; stopped before any milestone transition / Phase 3",
-  "context_notes": "Status: Phase 2 complete; stopped before any milestone transition / Phase 3\n\nStopped at: Phase 3 context gathered\n\nRecent commits:\nff53d29 docs(03): research + plans for PTY session core\n14a8891 docs(state): record phase 3 context session\n8944b4d docs(03): capture phase context\n83009c0 docs(02): add code review fix report\n0b55130 fix(02): release pre-auth permit on handshake completion (WR-01)"
+  "decisions": [],
+  "uncommitted_files": [],
+  "next_action": null,
+  "context_notes": ""
 }

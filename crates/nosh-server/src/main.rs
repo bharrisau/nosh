@@ -39,6 +39,11 @@ struct Args {
     /// Seconds a connection has to complete auth before being dropped (D-13).
     #[arg(long, default_value_t = 5)]
     auth_timeout_secs: u64,
+
+    /// Override the login shell spawned for sessions (default: the account's
+    /// shell from /etc/passwd, run as a login shell).
+    #[arg(long)]
+    shell: Option<String>,
 }
 
 fn default_host_key() -> anyhow::Result<PathBuf> {
@@ -82,5 +87,5 @@ async fn main() -> anyhow::Result<()> {
         auth_timeout: Duration::from_secs(args.auth_timeout_secs),
     };
     let endpoint = server::make_endpoint(addr, &host_key, &authorized_keys)?;
-    server::run_accept_loop(endpoint, limits).await
+    server::run_accept_loop(endpoint, limits, args.shell).await
 }

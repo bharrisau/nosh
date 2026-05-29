@@ -1,9 +1,10 @@
-//! Server-side QUIC endpoint setup and per-connection echo handlers.
+//! Server-side QUIC endpoint setup and the per-connection PTY session pump.
 //!
-//! Exposed as library functions so the integration tests (Plan 04) can drive an
+//! Exposed as library functions so the integration tests can drive an
 //! in-process server. Phase 2 enforces SSH-key mutual auth inside the TLS
-//! handshake (client cert pinned against `authorized_keys`) and caps
-//! concurrent unauthenticated connections.
+//! handshake (client cert pinned against `authorized_keys`) and caps concurrent
+//! unauthenticated connections. Phase 3 replaces the echo loops with a real PTY
+//! login-shell session framed over a single bidi QUIC stream (D-01).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -12,7 +13,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
+use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
+use tokio::sync::mpsc;
+
+use crate::session;
 
 /// Pre-auth DoS limits for the accept loop (decision D-13 / FOOTGUN-3).
 #[derive(Clone, Copy, Debug)]
@@ -93,7 +98,11 @@ pub fn make_endpoint(
 /// handshakes and enforcing an auth-completion timeout (AUTH-05 / D-13). The
 /// per-connection permit is released as soon as the handshake resolves, so the
 /// cap bounds unauthenticated state rather than total live sessions.
-pub async fn run_accept_loop(endpoint: quinn::Endpoint, limits: AuthLimits) -> anyhow::Result<()> {
+pub async fn run_accept_loop(
+    endpoint: quinn::Endpoint,
+    limits: AuthLimits,
+    shell_override: Option<String>,
+) -> anyhow::Result<()> {
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent));
     while let Some(incoming) = endpoint.accept().await {
         // Bound concurrent pre-auth connections: if all permits are taken,
@@ -110,11 +119,12 @@ pub async fn run_accept_loop(endpoint: quinn::Endpoint, limits: AuthLimits) -> a
             }
         };
         let timeout = limits.auth_timeout;
+        let shell = shell_override.clone();
         tokio::spawn(async move {
             // The permit bounds PRE-AUTH state only (D-13): it is released the
             // moment the handshake resolves (success, failure, or timeout), so
             // long-lived authenticated sessions do not consume pre-auth capacity.
-            if let Err(e) = handle_connection(incoming, timeout, permit).await {
+            if let Err(e) = handle_connection(incoming, timeout, permit, shell).await {
                 tracing::warn!("connection handler ended: {e:#}");
             }
         });
@@ -122,12 +132,21 @@ pub async fn run_accept_loop(endpoint: quinn::Endpoint, limits: AuthLimits) -> a
     Ok(())
 }
 
-/// Handle one connection: echo bidi-stream bytes and echo datagrams,
-/// concurrently, until the peer closes or the connection times out.
+/// QUIC application close code for an orderly session end.
+const CLOSE_OK: u32 = 0;
+/// QUIC application close code for a protocol violation (bad first frame).
+const CLOSE_PROTOCOL: u32 = 1;
+/// PTY output read chunk size.
+const PTY_CHUNK: usize = 8 * 1024;
+
+/// Handle one connection: after auth, drive a real PTY login-shell session over
+/// a single bidirectional stream until the shell exits or the client
+/// disconnects.
 async fn handle_connection(
     incoming: quinn::Incoming,
     auth_timeout: Duration,
     permit: tokio::sync::OwnedSemaphorePermit,
+    shell_override: Option<String>,
 ) -> anyhow::Result<()> {
     // AUTH-05: bound the time a connection may stay half-open. The TLS handshake
     // (including client-cert verification) completes when `incoming` resolves;
@@ -153,69 +172,182 @@ async fn handle_connection(
         .unwrap_or_else(|| "<none>".to_string());
     tracing::info!(%peer, alpn = %alpn, "connection accepted");
 
-    let stream_conn = conn.clone();
-    let datagram_conn = conn.clone();
+    // The client opens exactly one bidi stream and sends SessionOpen first.
+    let (send, recv) = match conn.accept_bi().await {
+        Ok(pair) => pair,
+        Err(e) => return clean_exit(e),
+    };
 
-    let stream_task = async move { stream_echo_loop(stream_conn).await };
-    let datagram_task = async move { datagram_echo_loop(datagram_conn).await };
-
-    // Run both pumps concurrently; the connection closing ends both.
-    tokio::select! {
-        r = stream_task => r?,
-        r = datagram_task => r?,
-    }
-    Ok(())
+    run_session(conn, peer, send, recv, shell_override).await
 }
 
-/// Accept bidirectional streams and echo their bytes back (TRANS-02).
-async fn stream_echo_loop(conn: quinn::Connection) -> anyhow::Result<()> {
-    loop {
-        match conn.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                tokio::spawn(async move {
-                    match recv.read_to_end(nosh_proto::codec::MAX_FRAME_LEN).await {
-                        Ok(buf) => {
-                            if let Err(e) = send.write_all(&buf).await {
-                                tracing::warn!("stream echo write failed: {e}");
-                                return;
-                            }
-                            let _ = send.finish();
-                            tracing::debug!(bytes = buf.len(), "echoed stream");
-                        }
-                        Err(e) => tracing::warn!("stream read failed: {e}"),
-                    }
-                });
-            }
-            Err(e) => return clean_exit(e),
+/// Drive a single PTY session over the established bidi stream.
+async fn run_session(
+    conn: quinn::Connection,
+    peer: SocketAddr,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    shell_override: Option<String>,
+) -> anyhow::Result<()> {
+    // First frame must be SessionOpen.
+    let open = match nosh_proto::read_message(&mut recv).await {
+        Ok(Message::SessionOpen {
+            term,
+            cols,
+            rows,
+            env,
+        }) => (term, cols, rows, env),
+        Ok(other) => {
+            tracing::warn!(?other, "expected SessionOpen as first frame");
+            conn.close(CLOSE_PROTOCOL.into(), b"expected SessionOpen");
+            return Ok(());
         }
-    }
-}
+        Err(e) => {
+            tracing::warn!("failed to read SessionOpen: {e}");
+            conn.close(CLOSE_PROTOCOL.into(), b"bad first frame");
+            return Ok(());
+        }
+    };
+    let (term, cols, rows, client_env) = open;
 
-/// Receive datagrams and echo them straight back (TRANS-03/04).
-async fn datagram_echo_loop(conn: quinn::Connection) -> anyhow::Result<()> {
-    loop {
-        match conn.read_datagram().await {
-            Ok(bytes) => {
-                // Only echo if datagrams are enabled and the payload fits the
-                // current path limit (PITFALL 2). On loopback this always holds.
-                match conn.max_datagram_size() {
-                    Some(max) if bytes.len() <= max => {
-                        if let Err(e) = conn.send_datagram(bytes.clone()) {
-                            tracing::warn!("datagram echo failed: {e}");
-                        } else {
-                            tracing::debug!(bytes = bytes.len(), "echoed datagram");
+    let passwd = session::lookup_self(shell_override.as_deref());
+    let (mut sess, reader, writer) =
+        session::open(&passwd, &term, cols, rows, &client_env, None).context("open session")?;
+
+    let session_id = sess.session_id;
+    let username = sess.username.clone();
+    let span = tracing::info_span!("session", %session_id, %peer, username = %username);
+    let _enter = span.enter();
+    tracing::info!(%term, cols, rows, child_pid = ?sess.child_pid(), "session open");
+
+    // Take the child so its exit can be awaited concurrently (the select loop
+    // needs `&mut sess` for resize, so the child cannot live inside `sess`).
+    let child = sess
+        .take_child()
+        .context("session has no child to wait on")?;
+    // Wait for the shell exit on a dedicated task; the JoinHandle resolves once
+    // with the exit code (SESS-08). On disconnect we abort it and reap manually.
+    let mut wait_task = tokio::spawn(session::wait_child(child));
+
+    // OUTPUT pump: a blocking thread reads PTY output and forwards chunks; an
+    // async task drains them into PtyData frames on the stream.
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut reader = reader;
+    let output_reader = tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; PTY_CHUNK];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // PTY EOF: shell closed.
+                Ok(n) => {
+                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break; // receiver gone — stop reading.
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // INPUT pump: writes from the client stream go to the PTY. The blocking
+    // writer is moved into a dedicated blocking task fed by a channel.
+    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut writer = writer;
+    let input_writer = tokio::task::spawn_blocking(move || {
+        while let Some(bytes) = in_rx.blocking_recv() {
+            if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    // Pump until the shell exits (Some(code)) or the client disconnects (None).
+    let session_outcome = loop {
+        tokio::select! {
+            // Shell exited: capture the code and tell the client.
+            res = &mut wait_task => {
+                break Some(res.unwrap_or(1));
+            }
+            // PTY output ready: frame it to the client. Drain remaining output
+            // even as the shell is exiting so the last bytes are delivered.
+            chunk = out_rx.recv() => {
+                match chunk {
+                    Some(data) => {
+                        if nosh_proto::write_message(&mut send, &Message::PtyData { data })
+                            .await
+                            .is_err()
+                        {
+                            break None;
                         }
                     }
-                    Some(max) => tracing::warn!(
-                        "datagram {} exceeds max_datagram_size {max}; dropping",
-                        bytes.len()
-                    ),
-                    None => tracing::warn!("datagrams not enabled; dropping"),
+                    None => {
+                        // Output pump ended (PTY EOF). Await the exit code.
+                        break Some((&mut wait_task).await.unwrap_or(1));
+                    }
                 }
             }
-            Err(e) => return clean_exit(e),
+            // Client → server frames.
+            msg = nosh_proto::read_message(&mut recv) => {
+                match msg {
+                    Ok(Message::PtyData { data }) => {
+                        if in_tx.send(data).await.is_err() {
+                            break None;
+                        }
+                    }
+                    Ok(Message::Resize { cols, rows }) => {
+                        if let Err(e) = sess.resize(cols, rows) {
+                            tracing::warn!("resize failed: {e}");
+                        } else {
+                            tracing::debug!(cols, rows, "resize");
+                        }
+                    }
+                    Ok(Message::SessionClose { .. }) | Ok(Message::SessionOpen { .. }) => {
+                        break None; // client signalled end (or unexpected reopen)
+                    }
+                    Err(_) => break None, // stream/connection closed by the client
+                }
+            }
+        }
+    };
+
+    // Stop the input pump.
+    drop(in_tx);
+
+    match session_outcome {
+        Some(exit_code) => {
+            // Shell exited normally: drain any final PTY output, deliver the exit
+            // code, then close cleanly with a structured reason (SESS-08/09).
+            while let Ok(data) = out_rx.try_recv() {
+                let _ = nosh_proto::write_message(&mut send, &Message::PtyData { data }).await;
+            }
+            tracing::info!(exit_code, "shell exited");
+            let _ = nosh_proto::write_message(
+                &mut send,
+                &Message::SessionClose {
+                    exit_code,
+                    reason: "shell exited".to_string(),
+                },
+            )
+            .await;
+            let _ = send.finish();
+            conn.close(CLOSE_OK.into(), b"shell exited");
+        }
+        None => {
+            // Client disconnected (or protocol end): SIGHUP the shell, then let
+            // the in-flight wait task reap it so no zombie/orphan remains
+            // (SESS-10). The child was moved into `wait_task`; SIGHUP unblocks
+            // its blocking `wait()`, which reaps. Await it (bounded) for
+            // deterministic teardown.
+            tracing::info!("client disconnected; reaping shell");
+            sess.sighup();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
+            conn.close(CLOSE_OK.into(), b"client disconnected");
         }
     }
+
+    // Best-effort: ensure the blocking I/O tasks unwind.
+    output_reader.abort();
+    input_writer.abort();
+    Ok(())
 }
 
 /// Treat orderly connection teardown as a clean loop exit, not an error.
