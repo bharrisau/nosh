@@ -1,17 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: Awaiting next milestone
-stopped_at: v1.0 milestone complete
-last_updated: "2026-05-29T11:35:44.387Z"
-last_activity: 2026-05-29 — Milestone v1.0 completed and archived
+milestone: v1.1
+milestone_name: M3 Roaming + Windows Client
+status: planning
+last_updated: "2026-05-29T12:17:00.129Z"
+last_activity: 2026-05-29
 progress:
-  total_phases: 3
-  completed_phases: 3
-  total_plans: 11
-  completed_plans: 11
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -25,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-05-29)
 
 ## Current Position
 
-Phase: Milestone v1.0 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-05-29 — Milestone v1.0 completed and archived
+Status: Defining requirements
+Last activity: 2026-05-29 — Milestone v1.1 started
 
 ## Performance Metrics
 

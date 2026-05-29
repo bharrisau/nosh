@@ -37,5 +37,5 @@
   "agent_skills": {},
   "features": {},
   "mode": "yolo",
-  "granularity": "coarse"
+  "granularity": "balanced"
 }

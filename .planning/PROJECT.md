@@ -4,11 +4,24 @@
 
 `nosh` is a roaming-tolerant remote shell built on QUIC — a successor to Mosh and Eternal Terminal that reuses the user's existing SSH keys for mutual authentication and runs over a single UDP/443 port (indistinguishable from HTTP/3 on the wire). It's for developers who SSH from laptops and phones across flaky, NAT'd, or firewalled networks and want sessions that survive IP changes without re-authenticating.
 
-This milestone is an **architecture-validation spike** (M0–M2 of the full brief): prove the three foundational bets work end-to-end on Linux before investing in the harder differentiators.
+The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux). The current milestone (v1.1, M3) builds the first headline differentiator on that foundation: roaming.
 
 ## Core Value
 
 A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity. If that core path works, everything else in the brief (roaming, predictive echo, forwarding, Windows) is incremental — so this milestone de-risks the architecture above all else.
+
+## Current Milestone: v1.1 M3 Roaming + Windows Client
+
+**Goal:** A nosh session survives network changes and client suspend/resume by continuing the *same* QUIC connection (or cold-reattaching to a persisted orphaned session in 1 RTT), and a Windows client can drive a Linux server.
+
+**Target features:**
+- Connection migration — IP/path change (NAT rebind, interface switch) continues the same QUIC connection via connection IDs, zero extra round trips
+- Server-side session persistence — orphaned sessions survive client disconnect Mosh-style (live until shell exits), with a configurable idle timeout (default `0` = disabled), bound to SSH identity
+- 1-RTT cold reattach — sequence-numbered re-attach control message reconnects a disconnected client to its orphaned session; authorization bound to the authenticated SSH identity
+- Identity threading — wire `Session.identity` from the authenticated peer cert (the M3 seam left in v1.0)
+- Windows client (bounded slice) — Windows client connects to a Linux server, reading an on-disk OpenSSH private key directly for signing
+
+**Key context:** 0-RTT stays deferred (1-RTT default holds). Native Windows *server* (ConPTY) stays at M6 — only the client comes forward. Windows key-file signing is a temporary Windows-only exception to the "never handle the private key directly" invariant; the Linux ssh-agent path is untouched. Roaming validated headless via a forced path change, with a real Wi-Fi→cellular run as a human-verified live check. A per-identity cap bounds persisted-session memory since the idle timeout defaults off.
 
 ## Requirements
 
@@ -29,19 +42,24 @@ A single QUIC connection on UDP/443 can carry a live interactive shell, authenti
 
 ### Active
 
-<!-- v1.0 (M0–M2 spike) shipped and validated. Next milestone (M3 roaming) requirements
-     to be defined via /gsd:new-milestone. -->
+<!-- v1.1 (M3 roaming + Windows client). Building toward these; REQ-IDs in REQUIREMENTS.md. -->
 
-(Next milestone not yet scoped — start with `/gsd:new-milestone`)
+- [ ] Connection migration: IP/path change continues the same QUIC connection (zero extra round trips)
+- [ ] Server-side session persistence: orphaned sessions survive client disconnect (configurable idle timeout, default disabled), bound to SSH identity
+- [ ] 1-RTT cold reattach: sequence-numbered re-attach reconnects a client to its orphaned session
+- [ ] `Session.identity` threaded from the authenticated peer cert (M3 reattach-authorization seam)
+- [ ] Per-identity cap bounds persisted-session memory
+- [ ] Windows client connects to a Linux server (on-disk key-file signing, agent integration deferred)
 
 ### Out of Scope
 
 <!-- Deferred to future milestones (M3–M7) or excluded outright. Each has a reason. -->
 
-- Roaming / QUIC connection migration / sequence-numbered cold reattach — M3; the spike proves the connection works before proving it survives network change
 - Predictive local echo (datagram state sync) — M4; hardest UX problem, only worth building once the transport+session foundation is proven
 - Native scrollback sync, channel multiplexing, port forwarding, agent forwarding, OSC 52, file transfer — M5
-- Native Windows client/server (ConPTY) — M6; this milestone is Linux-only
+- Native Windows *server* (ConPTY) — M6; v1.1 brings only the Windows *client* (→ Linux server)
+- Windows ssh-agent / Pageant integration — deferred; the v1.1 Windows client signs from an on-disk key file as a bounded, temporary exception
+- 0-RTT cold reattach — still deferred; v1.1 cold reattach is 1-RTT (see Key Decisions)
 - WebTransport-over-HTTP/3 reverse-proxy mode and NAT hole-punch/relay topologies — M7
 - macOS support — deferred; Linux-only this milestone to tighten scope
 - 0-RTT — deliberately not pursued; 1-RTT is the default (see Key Decisions). Revisit only if profiling shows reconnect latency matters
@@ -94,4 +112,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-29 after v1.0 milestone*
+*Last updated: 2026-05-29 after v1.1 milestone start*
