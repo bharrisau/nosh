@@ -114,9 +114,10 @@ pub fn build_child_env(
 /// kept in an `Option` so it can be `take()`n for the blocking wait/reap path.
 pub struct Session {
     pub session_id: Uuid,
-    /// The authenticated SSH identity (Phase 2). `None` for this spike: the
-    /// connection handler does not yet surface the peer cert key (noted M3 seam).
-    pub identity: Option<NoshPublicKey>,
+    /// The authenticated peer's SSH identity, proven during the TLS mutual
+    /// handshake. Always present — a `Session` cannot be constructed without
+    /// a verified identity (D-01).
+    pub identity: NoshPublicKey,
     /// The login account the shell runs as.
     pub username: String,
     master: Box<dyn MasterPty + Send>,
@@ -203,7 +204,7 @@ pub fn open(
     cols: u16,
     rows: u16,
     client_env: &[(String, String)],
-    identity: Option<NoshPublicKey>,
+    identity: NoshPublicKey,
 ) -> anyhow::Result<(Session, PtyReader, PtyWriter)> {
     let pty = native_pty_system();
     let pair = pty
