@@ -83,6 +83,17 @@ pub async fn spawn_server(
     authorized: &[&NoshPublicKey],
     limits: AuthLimits,
 ) -> TestServer {
+    spawn_server_with_shell(host_key, authorized, limits, None).await
+}
+
+/// Like [`spawn_server`] but lets the session tests force a specific login shell
+/// (e.g. `/bin/sh`) for portability via the server `--shell`-equivalent param.
+pub async fn spawn_server_with_shell(
+    host_key: &TestKey,
+    authorized: &[&NoshPublicKey],
+    limits: AuthLimits,
+    shell_override: Option<String>,
+) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let host_key_path = dir.path().join("host_ed25519");
     let auth_path = dir.path().join("authorized_keys");
@@ -104,7 +115,7 @@ pub async fn spawn_server(
         server::make_endpoint(bind, &host_key_path, &auth_path).expect("server endpoint");
     let addr = endpoint.local_addr().expect("server local_addr");
     let handle = tokio::spawn(async move {
-        let _ = server::run_accept_loop(endpoint, limits).await;
+        let _ = server::run_accept_loop(endpoint, limits, shell_override).await;
     });
     TestServer {
         addr,
@@ -124,4 +135,27 @@ pub fn client_endpoint(
 /// A temp known_hosts path (empty → TOFU on first contact).
 pub fn empty_known_hosts(dir: &Path) -> PathBuf {
     dir.join("known_hosts")
+}
+
+/// True if `/bin/sh` is available (session-usability checks need a shell).
+pub fn have_sh() -> bool {
+    std::path::Path::new("/bin/sh").exists()
+}
+
+/// Prove an authenticated connection yields a USABLE session: open a PTY
+/// session, echo a unique marker via the remote shell, and confirm it comes
+/// back. Replaces the Phase 2 stream-echo usability probe now that the server
+/// runs a real PTY session instead of echo loops. Requires the server to have
+/// been started with `--shell /bin/sh` (see `spawn_server_with_shell`).
+pub async fn session_marker_usable(conn: &quinn::Connection, marker: &str) -> bool {
+    let script = format!("printf '%s\\n' {marker}; exit 0\n");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client::run_session_collect(conn, "xterm", 80, 24, Vec::new(), script.as_bytes()),
+    )
+    .await
+    {
+        Ok(Ok((out, _code))) => String::from_utf8_lossy(&out).contains(marker),
+        _ => false,
+    }
 }

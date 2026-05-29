@@ -290,7 +290,9 @@ mod tests {
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
 
         // Baseline + whitelisted present.
-        for present in ["HOME", "USER", "LOGNAME", "SHELL", "PATH", "TERM", "LC_ALL", "TZ"] {
+        for present in [
+            "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TERM", "LC_ALL", "TZ",
+        ] {
             assert!(keys.contains(&present), "{present} must be present");
         }
         // Dangerous client vars absent (security assertion, SESS-07).

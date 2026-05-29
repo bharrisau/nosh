@@ -12,6 +12,7 @@ use bytes::Bytes;
 use nosh_auth::{
     AgentSigner, AgentSigningKey, HostKeyVerifier, NoshClientCertResolver, RawEd25519Signer,
 };
+use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig};
 
 /// Generous read limit for echoed streams in this skeleton.
@@ -201,4 +202,117 @@ pub async fn concurrent_roundtrip(conn: &quinn::Connection) -> anyhow::Result<()
         "concurrent datagram echo mismatch"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: interactive PTY session over a single bidi stream (D-01).
+// ---------------------------------------------------------------------------
+
+/// RAII guard that puts the local terminal in raw mode and restores it on
+/// `Drop` (SESS-03). Drop fires on normal return, on panic (unwind runs Drop),
+/// and on the error path after abrupt network loss (the guard is held in the
+/// run scope). It does NOT fire on `SIGKILL` — that is the documented
+/// human-verification case.
+pub struct RawModeGuard;
+
+impl RawModeGuard {
+    /// Enter raw mode. The returned guard restores cooked mode when dropped.
+    pub fn enable() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Collect the client's whitelisted, SendEnv-style environment (D-05): `TERM`,
+/// `LANG`, `TZ`, and every `LC_*`. NEVER includes `SSH_AUTH_SOCK` or `LD_*`
+/// (the server also re-filters deny-by-default, but the client does not even
+/// offer them). Returned as ordered pairs for deterministic encoding.
+pub fn collect_client_env() -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for (k, v) in std::env::vars() {
+        if k == "TERM" || k == "LANG" || k == "TZ" || k.starts_with("LC_") {
+            env.push((k, v));
+        }
+    }
+    env
+}
+
+/// Open the session bidi stream and send the `SessionOpen` frame.
+pub async fn open_session(
+    conn: &quinn::Connection,
+    term: String,
+    cols: u16,
+    rows: u16,
+    env: Vec<(String, String)>,
+) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
+    let (mut send, recv) = conn.open_bi().await.context("open session stream")?;
+    nosh_proto::write_message(
+        &mut send,
+        &Message::SessionOpen {
+            term,
+            cols,
+            rows,
+            env,
+        },
+    )
+    .await
+    .context("send SessionOpen")?;
+    Ok((send, recv))
+}
+
+/// Send keystrokes (or any input bytes) as a `PtyData` frame.
+pub async fn send_input(send: &mut quinn::SendStream, bytes: &[u8]) -> anyhow::Result<()> {
+    nosh_proto::write_message(send, &Message::PtyData { data: bytes.to_vec() })
+        .await
+        .context("send PtyData")
+}
+
+/// Send a window resize (SESS-05).
+pub async fn send_resize(
+    send: &mut quinn::SendStream,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<()> {
+    nosh_proto::write_message(send, &Message::Resize { cols, rows })
+        .await
+        .context("send Resize")
+}
+
+/// Headless session driver for tests: open a session, write `input_script` as a
+/// single `PtyData` frame, then read frames collecting all PTY output until a
+/// `SessionClose` arrives (or the stream closes). Returns the collected output
+/// bytes and the exit code. No terminal/raw-mode involvement, so it runs in CI.
+pub async fn run_session_collect(
+    conn: &quinn::Connection,
+    term: &str,
+    cols: u16,
+    rows: u16,
+    env: Vec<(String, String)>,
+    input_script: &[u8],
+) -> anyhow::Result<(Vec<u8>, i32)> {
+    let (mut send, mut recv) = open_session(conn, term.to_string(), cols, rows, env).await?;
+    send_input(&mut send, input_script).await?;
+    collect_until_close(&mut recv).await
+}
+
+/// Read frames from `recv`, appending `PtyData` payloads to a buffer, until a
+/// `SessionClose` (returning its exit code) or the stream closes (exit code 0).
+pub async fn collect_until_close(
+    recv: &mut quinn::RecvStream,
+) -> anyhow::Result<(Vec<u8>, i32)> {
+    let mut output = Vec::new();
+    loop {
+        match nosh_proto::read_message(recv).await {
+            Ok(Message::PtyData { data }) => output.extend_from_slice(&data),
+            Ok(Message::SessionClose { exit_code, .. }) => return Ok((output, exit_code)),
+            Ok(_) => {} // ignore unexpected control frames in the headless driver
+            Err(_) => return Ok((output, 0)), // stream closed without an explicit close
+        }
+    }
 }

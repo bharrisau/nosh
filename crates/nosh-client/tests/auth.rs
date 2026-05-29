@@ -17,12 +17,22 @@ mod common;
 use common::{TestKey, HOST};
 
 /// AUTH-03/AUTH-04 (in-process happy path): a known client key completes mutual
-/// auth and the stream echo round-trips.
+/// auth and a real PTY session runs over the authenticated link.
 #[tokio::test]
 async fn mutual_auth_inprocess_happy_path() {
+    if !common::have_sh() {
+        eprintln!("skipping: /bin/sh unavailable");
+        return;
+    }
     let host_key = TestKey::generate();
     let client_key = TestKey::generate();
-    let server = common::spawn_server(&host_key, &[&client_key.public], AuthLimits::default()).await;
+    let server = common::spawn_server_with_shell(
+        &host_key,
+        &[&client_key.public],
+        AuthLimits::default(),
+        Some("/bin/sh".to_string()),
+    )
+    .await;
 
     let dir = tempfile::tempdir().unwrap();
     let kh = dir.path().join("known_hosts");
@@ -31,10 +41,10 @@ async fn mutual_auth_inprocess_happy_path() {
         .await
         .expect("mutual auth handshake should succeed");
 
-    let echoed = client::stream_echo_roundtrip(&conn, b"authed-payload")
-        .await
-        .expect("stream echo over authed link");
-    assert_eq!(echoed, b"authed-payload");
+    assert!(
+        common::session_marker_usable(&conn, "authed-marker").await,
+        "a session must run over the authenticated link"
+    );
 }
 
 /// AUTH-01: a client key absent from authorized_keys is rejected at the
@@ -59,15 +69,14 @@ async fn unknown_client_key_rejected() {
     );
 }
 
-/// Returns true iff a full authenticated session is usable: connect AND a
-/// stream echo round-trip both succeed. Any failure (handshake rejected, server
-/// closed the connection after rejecting the client cert) returns false.
+/// Returns true iff a full authenticated session is usable: connect AND a real
+/// PTY session both succeed. Any failure (handshake rejected, server closed the
+/// connection after rejecting the client cert, or the session cannot open)
+/// returns false. Used by the negative auth tests, where the connection is
+/// rejected and this must return false.
 async fn auth_usable(endpoint: &quinn::Endpoint, addr: std::net::SocketAddr) -> bool {
     match client::connect(endpoint, addr, HOST).await {
-        Ok(conn) => client::stream_echo_roundtrip(&conn, b"probe")
-            .await
-            .map(|e| e == b"probe")
-            .unwrap_or(false),
+        Ok(conn) => common::session_marker_usable(&conn, "auth-probe-marker").await,
         Err(_) => false,
     }
 }
@@ -200,7 +209,13 @@ async fn agent_ed25519_handshake_live() {
         NoshPublicKey::from_ssh_public(&agent.public_key()).expect("agent key is Ed25519");
 
     let host_key = TestKey::generate();
-    let server = common::spawn_server(&host_key, &[&client_pub], AuthLimits::default()).await;
+    let server = common::spawn_server_with_shell(
+        &host_key,
+        &[&client_pub],
+        AuthLimits::default(),
+        Some("/bin/sh".to_string()),
+    )
+    .await;
 
     // The client signs via the live ssh-agent (private key never read).
     let signer = AgentSigner::new(agent.socket_path(), agent.public_key()).unwrap();
@@ -213,10 +228,10 @@ async fn agent_ed25519_handshake_live() {
         .await
         .expect("live ssh-agent mutual auth handshake should succeed");
 
-    let echoed = client::stream_echo_roundtrip(&conn, b"agent-signed")
-        .await
-        .expect("echo over agent-authed link");
-    assert_eq!(echoed, b"agent-signed");
+    assert!(
+        common::session_marker_usable(&conn, "agent-signed-marker").await,
+        "a session must run over the agent-authenticated link"
+    );
 }
 
 /// AUTH-05: flooding the accept loop with connections that never complete auth
@@ -231,7 +246,13 @@ async fn preauth_flood_bounded() {
         max_concurrent: 4,
         auth_timeout: Duration::from_secs(1),
     };
-    let server = common::spawn_server(&host_key, &[&client_key.public], limits).await;
+    let server = common::spawn_server_with_shell(
+        &host_key,
+        &[&client_key.public],
+        limits,
+        Some("/bin/sh".to_string()),
+    )
+    .await;
 
     // Flood: open raw UDP sockets that send junk to the server's port (half-open
     // pressure) without ever completing a handshake.
@@ -259,10 +280,10 @@ async fn preauth_flood_bounded() {
     .expect("server stayed responsive under flood")
     .expect("legitimate client connects after flood");
 
-    let echoed = client::stream_echo_roundtrip(&conn, b"post-flood")
-        .await
-        .expect("echo after flood");
-    assert_eq!(echoed, b"post-flood");
+    assert!(
+        common::session_marker_usable(&conn, "post-flood-marker").await,
+        "a session must run after the flood"
+    );
 
     drop(floods);
 }

@@ -113,7 +113,10 @@ mod tests {
             Message::PtyData {
                 data: vec![0x03, b'l', b's', b'\n'],
             },
-            Message::Resize { cols: 100, rows: 50 },
+            Message::Resize {
+                cols: 100,
+                rows: 50,
+            },
         ];
         for msg in msgs {
             let mut buf: Vec<u8> = Vec::new();

@@ -72,8 +72,8 @@ pub fn build_server_config(
         )));
     rustls_cfg.alpn_protocols = vec![nosh_proto::ALPN.to_vec()];
 
-    let quic_crypto = QuicServerConfig::try_from(rustls_cfg)
-        .context("convert rustls server config to QUIC")?;
+    let quic_crypto =
+        QuicServerConfig::try_from(rustls_cfg).context("convert rustls server config to QUIC")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     server_config.transport_config(Arc::new(nosh_proto::transport_config(false)));
 
@@ -314,10 +314,20 @@ async fn run_session(
 
     match session_outcome {
         Some(exit_code) => {
-            // Shell exited normally: drain any final PTY output, deliver the exit
-            // code, then close cleanly with a structured reason (SESS-08/09).
-            while let Ok(data) = out_rx.try_recv() {
-                let _ = nosh_proto::write_message(&mut send, &Message::PtyData { data }).await;
+            // Shell exited normally: drain ALL remaining PTY output (the output
+            // reader thread closes `out_rx` on PTY EOF, so recv() eventually
+            // yields None), then deliver the exit code and close cleanly with a
+            // structured reason (SESS-08/09). Draining to channel close avoids a
+            // race where the shell's final bytes are still in flight.
+            loop {
+                match tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await {
+                    Ok(Some(data)) => {
+                        let _ =
+                            nosh_proto::write_message(&mut send, &Message::PtyData { data }).await;
+                    }
+                    Ok(None) => break, // output channel closed: all output sent
+                    Err(_) => break,   // no more output within the window
+                }
             }
             tracing::info!(exit_code, "shell exited");
             let _ = nosh_proto::write_message(
@@ -329,6 +339,12 @@ async fn run_session(
             )
             .await;
             let _ = send.finish();
+            // Wait until the client has acknowledged reading the finished stream
+            // (so the SessionClose frame is delivered, not truncated), then the
+            // server closes the connection with a structured application code
+            // (SESS-09). `stopped()` resolves once the peer has consumed/acked
+            // the stream; a short bounded fallback covers a client that lingers.
+            let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
             conn.close(CLOSE_OK.into(), b"shell exited");
         }
         None => {
