@@ -153,6 +153,70 @@ pub fn client_endpoint(
     client::make_endpoint(&identity, known_hosts, HOST)
 }
 
+/// Build a client endpoint that writes a qlog trace to `qlog_path` (D-05).
+///
+/// Identical to `client_endpoint` except the client `TransportConfig` carries a
+/// `QlogStream` writing to `qlog_path` (created/truncated). If qlog stream
+/// construction fails (e.g. file creation fails or `into_stream()` returns None),
+/// the endpoint is built WITHOUT qlog and a warning is printed — qlog setup
+/// failure must not fail the connection; Plan 02's qlog artifact assertion will
+/// surface the missing file.
+pub fn client_endpoint_with_qlog(
+    identity: ClientIdentity,
+    known_hosts: PathBuf,
+    qlog_path: &Path,
+) -> anyhow::Result<quinn::Endpoint> {
+    // Build a transport config starting from the standard client settings
+    // (keep-alive enabled on the client side — TRANS-05).
+    let mut transport = nosh_proto::transport_config(true);
+
+    // Attach the qlog stream. Open/create (truncate) the target file.
+    match std::fs::File::create(qlog_path) {
+        Ok(file) => {
+            let boxed: Box<dyn std::io::Write + Send + Sync> = Box::new(file);
+            let mut qlog_cfg = quinn::QlogConfig::default();
+            qlog_cfg.writer(boxed);
+            qlog_cfg.title(Some("nosh-migration-test".into()));
+            match qlog_cfg.into_stream() {
+                Some(stream) => {
+                    transport.qlog_stream(Some(stream));
+                }
+                None => {
+                    eprintln!(
+                        "[qlog] QlogConfig::into_stream() returned None; endpoint will run \
+                         without qlog (qlog file will not be created)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[qlog] failed to create qlog file at {}: {e}; endpoint will run without qlog",
+                qlog_path.display()
+            );
+        }
+    }
+
+    client::make_endpoint_with_transport(&identity, known_hosts, HOST, transport)
+}
+
+/// Bind a fresh `127.0.0.1:0` UDP socket. Used by `rebind_client` to allocate
+/// the new local address before handing the socket to quinn.
+pub fn fresh_loopback_socket() -> std::io::Result<std::net::UdpSocket> {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+}
+
+/// Force a QUIC path change by rebinding the client endpoint onto a fresh
+/// loopback UDP socket (D-02). Returns the new local address. This triggers
+/// QUIC path validation (PATH_CHALLENGE / PATH_RESPONSE) on the existing
+/// connection — the same connection continues with no new TLS handshake.
+pub fn rebind_client(endpoint: &quinn::Endpoint) -> std::io::Result<std::net::SocketAddr> {
+    let socket = fresh_loopback_socket()?;
+    let new_addr = socket.local_addr()?;
+    endpoint.rebind(socket)?;
+    Ok(new_addr)
+}
+
 /// A temp known_hosts path (empty → TOFU on first contact).
 pub fn empty_known_hosts(dir: &Path) -> PathBuf {
     dir.join("known_hosts")

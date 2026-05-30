@@ -115,6 +115,46 @@ pub fn make_endpoint(
     Ok(endpoint)
 }
 
+/// Build a client `Endpoint` with a CALLER-SUPPLIED transport config, used by the
+/// test harness to inject a qlog stream (D-05) without altering the production
+/// path. The transport config replaces the one that `build_client_config` would
+/// normally produce; all other aspects (mutual auth, ALPN) are unchanged.
+///
+/// Use `nosh_proto::transport_config(true)` as the base and layer additional
+/// options (e.g. `.qlog_stream(Some(stream))`) before passing in.
+pub fn make_endpoint_with_transport(
+    identity: &ClientIdentity,
+    known_hosts: PathBuf,
+    host: impl Into<String>,
+    transport: quinn::TransportConfig,
+) -> anyhow::Result<quinn::Endpoint> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .context("no default CryptoProvider installed")?
+        .clone();
+
+    let cert = nosh_auth::mint_self_signed_cert(&identity.signer)?;
+    let signing_key = Arc::new(AgentSigningKey::new(identity.signer.clone()));
+    let resolver = Arc::new(NoshClientCertResolver::new(cert, signing_key));
+    let verifier = Arc::new(HostKeyVerifier::new(known_hosts, host, provider));
+
+    let mut rustls_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(resolver);
+    rustls_cfg.alpn_protocols = vec![nosh_proto::ALPN.to_vec()];
+
+    let quic_crypto =
+        QuicClientConfig::try_from(rustls_cfg).context("convert rustls client config to QUIC")?;
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    client_config.transport_config(Arc::new(transport));
+
+    let mut endpoint =
+        quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).context("create client endpoint")?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
 /// Connect to `server_addr` and assert the negotiated ALPN is `nosh/0`
 /// (TRANS-01). Returns the established connection.
 pub async fn connect(
