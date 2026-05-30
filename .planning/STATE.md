@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: M3 Roaming + Windows Client
-status: executed
-stopped_at: Phase 9 done + Windows-host validation PASSED; milestone lifecycle (audit→complete→cleanup) ready to run
-last_updated: "2026-05-30T06:45:00.000Z"
-last_activity: 2026-05-30 -- Phase 09 (Windows Client Polish & Hardening) executed, reviewed, opus-verified
+status: Awaiting next milestone
+stopped_at: Phase 4 context gathered
+last_updated: "2026-05-30T10:21:11.281Z"
+last_activity: 2026-05-30 — Milestone v1.1 completed and archived
 progress:
   total_phases: 6
-  completed_phases: 6
-  total_plans: 18
-  completed_plans: 18
-  percent: 100
+  completed_phases: 4
+  total_plans: 14
+  completed_plans: 12
+  percent: 67
 ---
 
 # Project State
@@ -21,18 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-29)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** v1.1 phases 4–9 all executed + verified. Milestone lifecycle (audit → complete → cleanup) paused pending Windows-host re-validation of Phase 9 fixes.
+**Current focus:** v1.1 (M3 Roaming + Windows Client) shipped + archived 2026-05-30. Awaiting next milestone (v1.2 / M4) — run `/gsd:new-milestone`.
 
 ## Current Position
 
-Phase: 9 (done + Windows-host validated)
-Plan: All complete (4–9)
-Status: Windows validation PASSED — milestone lifecycle ready; run `/gsd:autonomous` to trigger audit→complete→cleanup
-Last activity: 2026-05-30 -- Phase 09 Windows-host validation passed (vim/arrows/~./roaming confirmed)
-
-```
-Progress: [██████████] 100% (6/6 phases executed)
-```
+Phase: Milestone v1.1 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-05-30 — Milestone v1.1 completed and archived
 
 ## Performance Metrics
 
@@ -87,7 +83,6 @@ Recent decisions affecting current work:
 
 > **RESOLVED in Phase 9 + VALIDATED on Windows host (2026-05-30).** Plan commits `eb2659b` VT-console+`~.`, `2bf6c9d` migration log, `5af3757` authorized_keys skip, `43ba8ac` connect timeout+PathBuf gate, `2d4db1e`/`edb77b8`/`83c6186` review fixes. Plus three Windows-validation follow-up fixes: `1c6afde` (HANDLE type, windows-sys 0.59 build break), `f83093e` (poll terminal::size() instead of EventStream — the real fix for vim REPLACE mode / dead arrows: EventStream was draining the console input queue), `263a60b` (restore terminal before process::exit). **Windows-host validation PASSED** (operator sign-off in docs/windows-client-test.md): vim NORMAL mode + arrows/PageUp-Down, less controllable, `~.` quits, Ctrl-C→remote, clean exit restores prompt, network roaming survives real path change. Phase 8 D-02 and Phase 9 Windows `human_needed` items are now CONFIRMED. **Still OPEN:** only the `WSAEMSGSIZE` investigation below (deliberately deferred; connection works) and a process item — wire a git remote so `windows-cross.yml` CI compiles the `#[cfg(windows)]` path automatically (would have caught `1c6afde`).
 
-
 - `authorized_keys` must IGNORE unsupported/unparseable entries (warn + skip, like sshd) — currently `load_authorized_keys` (`crates/nosh-auth/src/keys.rs:118`) propagates the first parse error via `?`, so a single RSA/ECDSA/malformed line rejects the entire file. Real-world `authorized_keys` files routinely contain non-Ed25519 keys.
 - Client needs a **connection timeout** when no server responds — `connect(...).await` (`crates/nosh-client/src/client.rs:188-190`) has no timeout and hangs; wrap in `tokio::time::timeout` with a clear error.
 - Unused `PathBuf` import warning on Windows builds — `crates/nosh-auth/src/signer.rs:15` is only used by the `#[cfg(unix)]` `AgentSigner`; gate the import.
@@ -125,4 +120,4 @@ Resume file: .planning/phases/04-identity-threading/04-CONTEXT.md
 
 ## Operator Next Steps
 
-- Start Phase 4: `/gsd:plan-phase 4`
+- Start the next milestone with /gsd-new-milestone

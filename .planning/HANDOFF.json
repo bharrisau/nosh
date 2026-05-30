@@ -1,28 +1,21 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-30T00:00:00.000Z",
-  "source": "manual-pause",
-  "partial": false,
-  "phase": 6,
-  "phase_name": "Cold Reattach Protocol",
-  "phase_dir": ".planning/phases/06-cold-reattach-protocol",
+  "timestamp": "2026-05-30T10:24:09.027Z",
+  "source": "auto-postool",
+  "partial": true,
+  "phase": null,
+  "phase_name": null,
+  "phase_dir": null,
   "plan": null,
   "task": null,
   "total_tasks": null,
-  "status": "phase-6-complete-paused",
+  "status": "auto-checkpoint",
   "completed_tasks": [],
   "remaining_tasks": [],
   "blockers": [],
-  "human_actions_pending": [
-    "Phase 7: Wi-Fi->cellular live check (non-blocking)",
-    "Phase 8: Windows interactive session (non-blocking)"
-  ],
-  "decisions": [
-    "model_overrides pins gsd-verifier + gsd-integration-checker to opus",
-    "Verify runs as a separate opus pass, never inline; make it adversarial",
-    "Phases 4-6 done & opus-verified; Phases 7 & 8 PLANNED, need execute only"
-  ],
+  "human_actions_pending": [],
+  "decisions": [],
   "uncommitted_files": [],
-  "next_action": "Run /gsd:resume-work, then execute Phase 7 (plans exist), opus-re-verify, then Phase 8, then milestone audit->complete->cleanup. Serialize 7 then 8 (both touch nosh-client). See .planning/.continue-here.md for full detail incl. 2 carry-forward items (reader-zombie race; W1 token-lifecycle).",
-  "context_notes": "v1.1 M3. 63 tests green, clippy clean. All phases discussed. Background agents can't spawn subagents -> run verify as its own opus agent. CARRY-FORWARD: (1) pre-existing reader-zombie race (spawn_blocking+abort doesn't interrupt blocked read) - latent, investigate; (2) Phase 6 W1 token-lifecycle wants verify confirmation."
+  "next_action": null,
+  "context_notes": ""
 }

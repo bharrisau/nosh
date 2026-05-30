@@ -10,18 +10,15 @@ The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundat
 
 A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity. If that core path works, everything else in the brief (roaming, predictive echo, forwarding, Windows) is incremental — so this milestone de-risks the architecture above all else.
 
-## Current Milestone: v1.1 M3 Roaming + Windows Client
+## Current State
 
-**Goal:** A nosh session survives network changes and client suspend/resume by continuing the *same* QUIC connection (or cold-reattaching to a persisted orphaned session in 1 RTT), and a Windows client can drive a Linux server.
+**Shipped:** v1.1 (M3 Roaming + Windows Client) — 2026-05-30. Phases 4-9. Audit 11/11 requirements, 4/4 cross-phase integration invariants, no blockers; validated end-to-end on a live native-Windows client → Linux server (auth, interactive shell, locale, resize, vim/arrows, `~.` quit, Ctrl-C→remote, and real network roaming all confirmed).
 
-**Target features:**
-- Connection migration — IP/path change (NAT rebind, interface switch) continues the same QUIC connection via connection IDs, zero extra round trips
-- Server-side session persistence — orphaned sessions survive client disconnect Mosh-style (live until shell exits), with a configurable idle timeout (default `0` = disabled), bound to SSH identity
-- 1-RTT cold reattach — sequence-numbered re-attach control message reconnects a disconnected client to its orphaned session; authorization bound to the authenticated SSH identity
-- Identity threading — wire `Session.identity` from the authenticated peer cert (the M3 seam left in v1.0)
-- Windows client (bounded slice) — Windows client connects to a Linux server, reading an on-disk OpenSSH private key directly for signing
+Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+PTY architecture on Linux; v1.1 added the differentiators that justify nosh over plain SSH — roaming-tolerant session persistence (migration + 1-RTT cold reattach) and a native Windows client.
 
-**Key context:** 0-RTT stays deferred (1-RTT default holds). Native Windows *server* (ConPTY) stays at M6 — only the client comes forward. Windows key-file signing is a temporary Windows-only exception to the "never handle the private key directly" invariant; the Linux ssh-agent path is untouched. Roaming validated headless via a forced path change, with a real Wi-Fi→cellular run as a human-verified live check. A per-identity cap bounds persisted-session memory since the idle timeout defaults off.
+**Carried tech debt (weigh at M4 start):** PTY reader-zombie race (Phase 6, latent — `spawn_blocking`+`abort()` can't interrupt a blocked `read()`; worth a `/gsd:debug` pass before relying on reattach under load); Windows cross-compile CI gate exists but has never run (no git remote configured — wire one); `WSAEMSGSIZE` quinn_udp warning on Windows (deferred; connection works).
+
+**Next milestone:** v1.2 (M4) not yet scoped — `/gsd:new-milestone`. The brief's next differentiator is **predictive local echo** (datagram state sync); see INIT.md §10.
 
 ## Requirements
 
@@ -40,16 +37,19 @@ A single QUIC connection on UDP/443 can carry a live interactive shell, authenti
 - ✓ Client-supplied environment is sanitized on shell open (deny-by-default: strips `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PYTHONPATH`, `NODE_OPTIONS`; whitelists `TERM`, `LC_*`/locale, `TZ`); `SSH_AUTH_SOCK` is never forwarded via the environment — v1.0 (SESS-07)
 - ✓ Pre-auth DoS hardening (concurrent half-open cap + auth-completion timeout), explicit `SessionClose{exit_code}` exit-code propagation, clean QUIC close, and a structured server-side `Session` struct (M3 reattach seam) — v1.0 (AUTH-05, SESS-08/09/10/11)
 
+<!-- v1.1 (M3 roaming + Windows client) — all shipped 2026-05-30. -->
+
+- ✓ Identity threading: `Session.identity` is a non-optional verified SSH key, the spine for persistence/cap/reattach — v1.1 (IDENT-01)
+- ✓ Server-side session persistence: orphaned sessions survive disconnect (MasterPty held, no SIGHUP; idle timeout default 0; per-identity cap before first store; zombie reaper) — v1.1 (PERSIST-01..03)
+- ✓ 1-RTT cold reattach: sequence-numbered resume, two-factor (TLS re-run + identity-scoped token selector, no oracle), byte-exact replay — v1.1 (IDENT-02, ROAM-02)
+- ✓ Connection migration: IP/path change continues the same QUIC connection (no re-handshake), validated headless + real network-change live check from the Windows client — v1.1 (ROAM-01)
+- ✓ Native Windows client → Linux server: cross-compiles (no WSL), on-disk Ed25519 signing, raw VT I/O + resize, TERM/locale; P9 hardening (VT console-input, `~.` escape, authorized_keys warn+skip, connect timeout, migration logging) — v1.1 (WIN-01..04)
+
 ### Active
 
-<!-- v1.1 (M3 roaming + Windows client). Building toward these; REQ-IDs in REQUIREMENTS.md. -->
+<!-- v1.2 (M4) not yet scoped. Run /gsd:new-milestone to define requirements. -->
 
-- [ ] Connection migration: IP/path change continues the same QUIC connection (zero extra round trips)
-- [ ] Server-side session persistence: orphaned sessions survive client disconnect (configurable idle timeout, default disabled), bound to SSH identity
-- [ ] 1-RTT cold reattach: sequence-numbered re-attach reconnects a client to its orphaned session
-- [ ] `Session.identity` threaded from the authenticated peer cert (M3 reattach-authorization seam)
-- [ ] Per-identity cap bounds persisted-session memory
-- [ ] Windows client connects to a Linux server (on-disk key-file signing, agent integration deferred)
+- (to be defined at M4 — likely predictive local echo / datagram state sync per INIT.md §10)
 
 ### Out of Scope
 
@@ -112,4 +112,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-30 after Phase 4 (Identity Threading) complete — Session.identity is non-optional NoshPublicKey, IDENT-01 satisfied*
+*Last updated: 2026-05-30 after v1.1 (M3 Roaming + Windows Client) shipped — roaming + persistence + native Windows client validated end-to-end*
