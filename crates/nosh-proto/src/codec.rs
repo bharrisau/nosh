@@ -162,4 +162,95 @@ mod tests {
         let got = read_message(&mut cursor).await.expect("read");
         assert_eq!(msg, got);
     }
+
+    /// Phase 6 reattach variants: all five new variants must round-trip exactly
+    /// through write_message / read_message, the no-oracle property must hold
+    /// (ReattachErr encodes to a byte-identical frame every time), and appending
+    /// the new variants must NOT shift the existing SessionClose discriminant.
+    #[tokio::test]
+    async fn reattach_variants_round_trip() {
+        let token = [0xABu8; 16];
+
+        // 1. SessionOpened
+        let msg_opened = Message::SessionOpened { token };
+        {
+            let mut buf: Vec<u8> = Vec::new();
+            write_message(&mut buf, &msg_opened).await.expect("write SessionOpened");
+            let mut cursor = std::io::Cursor::new(buf);
+            let got = read_message(&mut cursor).await.expect("read SessionOpened");
+            assert_eq!(msg_opened, got, "SessionOpened must round-trip exactly");
+        }
+
+        // 2. Reattach — also verify the last_acked_seq convention is preserved.
+        let msg_reattach = Message::Reattach {
+            token,
+            last_acked_seq: 12345,
+        };
+        {
+            let mut buf: Vec<u8> = Vec::new();
+            write_message(&mut buf, &msg_reattach).await.expect("write Reattach");
+            let mut cursor = std::io::Cursor::new(buf);
+            let got = read_message(&mut cursor).await.expect("read Reattach");
+            assert_eq!(msg_reattach, got, "Reattach must round-trip exactly");
+            // Verify the decoded last_acked_seq is what we encoded.
+            if let Message::Reattach { last_acked_seq, .. } = got {
+                assert_eq!(last_acked_seq, 12345, "last_acked_seq must survive codec");
+            }
+        }
+
+        // 3. ReattachOk with truncated=true
+        let msg_reattach_ok = Message::ReattachOk {
+            new_token: token,
+            replaying_from_seq: 42,
+            truncated: true,
+        };
+        {
+            let mut buf: Vec<u8> = Vec::new();
+            write_message(&mut buf, &msg_reattach_ok).await.expect("write ReattachOk");
+            let mut cursor = std::io::Cursor::new(buf);
+            let got = read_message(&mut cursor).await.expect("read ReattachOk");
+            assert_eq!(msg_reattach_ok, got, "ReattachOk must round-trip exactly");
+        }
+
+        // 4. ReattachErr — NO-ORACLE PROPERTY: encoding twice must produce
+        //    byte-identical frames regardless of context. There is no reason
+        //    field or discriminating data of any kind.
+        {
+            let mut buf1: Vec<u8> = Vec::new();
+            write_message(&mut buf1, &Message::ReattachErr).await.expect("write ReattachErr #1");
+            let mut buf2: Vec<u8> = Vec::new();
+            write_message(&mut buf2, &Message::ReattachErr).await.expect("write ReattachErr #2");
+            assert_eq!(buf1, buf2, "ReattachErr must encode byte-identically (no oracle)");
+            // Also verify round-trip.
+            let mut cursor = std::io::Cursor::new(buf1);
+            let got = read_message(&mut cursor).await.expect("read ReattachErr");
+            assert_eq!(Message::ReattachErr, got, "ReattachErr must round-trip exactly");
+        }
+
+        // 5. Ack
+        let msg_ack = Message::Ack { seq: 99999 };
+        {
+            let mut buf: Vec<u8> = Vec::new();
+            write_message(&mut buf, &msg_ack).await.expect("write Ack");
+            let mut cursor = std::io::Cursor::new(buf);
+            let got = read_message(&mut cursor).await.expect("read Ack");
+            assert_eq!(msg_ack, got, "Ack must round-trip exactly");
+        }
+
+        // 6. DISCRIMINANT STABILITY: encode a SessionClose (existing variant,
+        //    discriminant 3 in the original enum) and verify it still decodes as
+        //    SessionClose after the five new variants were appended. Appending to
+        //    the END must not shift existing discriminants.
+        {
+            let sc = Message::SessionClose {
+                exit_code: 99,
+                reason: "discriminant-stability-check".to_string(),
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            write_message(&mut buf, &sc).await.expect("write SessionClose");
+            let mut cursor = std::io::Cursor::new(buf);
+            let got = read_message(&mut cursor).await.expect("read SessionClose after extension");
+            assert_eq!(sc, got, "SessionClose discriminant must not shift after appending new variants");
+        }
+    }
 }

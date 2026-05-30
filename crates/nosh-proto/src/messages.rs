@@ -52,4 +52,87 @@ pub enum Message {
     /// Session terminated; carries the shell exit code and a reason string.
     /// The client then exits its own process with `exit_code` (SESS-08).
     SessionClose { exit_code: i32, reason: String },
+
+    // ── Phase 6: Cold Reattach Protocol ──────────────────────────────────────
+    //
+    // These five variants are appended AFTER `SessionClose` to preserve the
+    // postcard discriminant order of all existing variants. Inserting or
+    // reordering is NOT backward-compatible. The token fields carry CSPRNG
+    // bytes and MUST NOT be logged; callers log only the identity fingerprint.
+
+    /// Server → client, sent immediately after a successful fresh `SessionOpen`.
+    /// Delivers the initial reattach token the client must hold in memory
+    /// (D-01 / D-05) for the next cold reattach attempt.
+    ///
+    /// WARNING: the `token` bytes MUST NOT be logged. Log only the identity
+    /// fingerprint (D-07).
+    SessionOpened {
+        /// CSPRNG reattach token (122-bit, uuid v4 bytes). Single-use: rotated
+        /// on every successful reattach.
+        token: [u8; 16],
+    },
+
+    /// Client → server, the FIRST frame on a reconnected QUIC connection, in
+    /// place of `SessionOpen` (D-03 / D-04).
+    ///
+    /// `last_acked_seq` convention (LOCK THIS — see §6 of 06-RESEARCH):
+    /// it is the **highest output sequence number the client has APPLIED**
+    /// (i.e. written to the terminal). The server replays all buffered chunks
+    /// with `seq > last_acked_seq`. A value of 0 when the client applied no
+    /// output means replay starts from the first retained chunk (seq 1+), or
+    /// from `lowest_retained_seq` if the buffer was truncated.
+    ///
+    /// WARNING: the `token` bytes MUST NOT be logged. Log only the identity
+    /// fingerprint (D-07).
+    Reattach {
+        /// The reattach token last received from the server (initial
+        /// `SessionOpened.token` or the most recent `ReattachOk.new_token`).
+        token: [u8; 16],
+        /// Highest output sequence number the client has successfully applied.
+        /// Server replays all chunks with seq STRICTLY GREATER THAN this value.
+        last_acked_seq: u64,
+    },
+
+    /// Server → client on a successful reattach (D-03 / D-05 / D-09).
+    /// The server sends this as the very first frame on the new stream, then
+    /// replays `PtyData` frames for each chunk with seq > `last_acked_seq`
+    /// (or >= `replaying_from_seq` if truncation occurred).
+    ///
+    /// WARNING: `new_token` MUST NOT be logged. Log only the identity
+    /// fingerprint (D-07).
+    ReattachOk {
+        /// Rotated single-use reattach token. The client MUST replace its
+        /// stored token with this value immediately.
+        new_token: [u8; 16],
+        /// The first sequence number in the replay stream. Normally
+        /// `last_acked_seq + 1`; equals `lowest_retained_seq` when
+        /// `truncated == true`.
+        replaying_from_seq: u64,
+        /// `true` when the requested resume point (`last_acked_seq + 1`)
+        /// predates the buffer's `lowest_retained_seq` (the 64 KiB cap dropped
+        /// those bytes). The client should display a truncation notice (D-09).
+        truncated: bool,
+    },
+
+    /// Server → client on ANY reattach failure. FIELDLESS and UNIFORM — there
+    /// is deliberately no reason code or distinguishing field (D-07). Unknown
+    /// token, expired token, wrong SSH identity, active/reconnecting session:
+    /// ALL map to this identical variant. This is the no-oracle invariant:
+    /// an attacker cannot distinguish "session exists but wrong key" from
+    /// "session does not exist".
+    ///
+    /// INVARIANT: this variant MUST remain fieldless forever. Adding a
+    /// reason field would create a session-existence oracle.
+    ReattachErr,
+
+    /// Client → server, periodic; carries the highest output sequence number
+    /// the client has received and applied (D-08 continuous acking).
+    ///
+    /// The server calls `SequencedOutputBuffer::trim_acked(seq)` to drop
+    /// bytes the client has already consumed, keeping the ring lean. Cadence
+    /// is coarse (time-interval or byte-threshold), not per-chunk.
+    Ack {
+        /// Highest output sequence number the client has applied.
+        seq: u64,
+    },
 }

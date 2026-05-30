@@ -396,6 +396,19 @@ async fn run_session(
                         // D-01: explicit SessionClose → teardown, NOT orphan.
                         break SessionEnd::ClientClosed;
                     }
+                    // Phase 6 reattach control frames — not expected in a live session pump.
+                    // Ack is handled in Phase 6 (plan 06-03); ignore silently for now.
+                    Ok(Message::Ack { .. }) => {
+                        slot.touch();
+                        // trim_acked will be wired in Plan 06-03
+                    }
+                    Ok(Message::SessionOpened { .. })
+                    | Ok(Message::Reattach { .. })
+                    | Ok(Message::ReattachOk { .. })
+                    | Ok(Message::ReattachErr) => {
+                        // Unexpected reattach control frames in a live session: treat as protocol error.
+                        break SessionEnd::ClientClosed;
+                    }
                     Err(_) => {
                         // Stream/connection closed without a SessionClose → transport loss.
                         // D-02: this is NOT a clean close; orphan the session (Pitfall #7).
