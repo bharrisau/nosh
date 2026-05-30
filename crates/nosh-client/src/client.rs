@@ -267,18 +267,125 @@ pub async fn concurrent_roundtrip(conn: &quinn::Connection) -> anyhow::Result<()
 /// and on the error path after abrupt network loss (the guard is held in the
 /// run scope). It does NOT fire on `SIGKILL` — that is the documented
 /// human-verification case.
-pub struct RawModeGuard;
+///
+/// On Windows, crossterm's `enable_raw_mode` clears ENABLE_LINE_INPUT,
+/// ENABLE_ECHO_INPUT, and ENABLE_PROCESSED_INPUT but does NOT set
+/// ENABLE_VIRTUAL_TERMINAL_INPUT — so arrow keys, PageUp/Down, and other
+/// special keys are NOT delivered as ANSI escape sequences, and Ctrl-C is
+/// consumed as a console signal (exit 130) rather than forwarded to the
+/// remote as 0x03. This guard adds a `#[cfg(windows)]` extension that:
+///   - sets ENABLE_VIRTUAL_TERMINAL_INPUT on stdin so special keys encode ANSI
+///   - ensures ENABLE_PROCESSED_INPUT is cleared so Ctrl-C arrives as 0x03
+///   - sets ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout so server ANSI renders
+///   - saves both original modes and restores them in Drop before disable_raw_mode
+/// (STATE.md 2026-05-30 finding: Phase 8 D-02 partial gap — VT input not enabled)
+pub struct RawModeGuard {
+    /// Original stdin console mode (Windows only; saves original for restore in Drop).
+    #[cfg(windows)]
+    orig_stdin_mode: u32,
+    /// Original stdout console mode (Windows only; saves original for restore in Drop).
+    #[cfg(windows)]
+    orig_stdout_mode: u32,
+}
 
 impl RawModeGuard {
     /// Enter raw mode. The returned guard restores cooked mode when dropped.
     pub fn enable() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        Ok(Self)
+
+        // ── Windows console VT-input extension ──────────────────────────────────
+        // crossterm's enable_raw_mode on Windows clears line/echo/processed-input
+        // but does NOT set ENABLE_VIRTUAL_TERMINAL_INPUT on the stdin handle.
+        // Without it, special keys (arrows, PageUp/Down) are not encoded as ANSI
+        // escape sequences, and Ctrl-C terminates the process (exit 130) instead
+        // of being delivered to the read loop as byte 0x03.
+        //
+        // ENABLE_VIRTUAL_TERMINAL_INPUT  0x0200 — stdin handle flag
+        // ENABLE_PROCESSED_INPUT         0x0001 — must be CLEARED for raw Ctrl-C
+        // ENABLE_LINE_INPUT              0x0002 — cleared by crossterm already
+        // ENABLE_ECHO_INPUT              0x0004 — cleared by crossterm already
+        // ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004 — stdout handle flag (different handle)
+        #[cfg(windows)]
+        {
+            use std::io;
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::System::Console::{
+                GetConsoleMode, GetStdHandle, SetConsoleMode,
+                ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+                ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+
+            // -- stdin --
+            // SAFETY: GetStdHandle returns a borrowed handle; we do not close it.
+            let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            if stdin_handle == INVALID_HANDLE_VALUE {
+                // Undo crossterm's raw mode before returning.
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(io::Error::last_os_error());
+            }
+            let mut orig_stdin_mode: u32 = 0;
+            // SAFETY: valid handle; valid pointer; GetConsoleMode is safe to call.
+            if unsafe { GetConsoleMode(stdin_handle, &mut orig_stdin_mode) } == 0 {
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(io::Error::last_os_error());
+            }
+            let new_stdin_mode = (orig_stdin_mode | ENABLE_VIRTUAL_TERMINAL_INPUT)
+                & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            // SAFETY: valid handle; SetConsoleMode is safe to call.
+            if unsafe { SetConsoleMode(stdin_handle, new_stdin_mode) } == 0 {
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(io::Error::last_os_error());
+            }
+
+            // -- stdout --
+            // SAFETY: GetStdHandle returns a borrowed handle; we do not close it.
+            let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            if stdout_handle == INVALID_HANDLE_VALUE {
+                // Restore stdin, then undo crossterm.
+                let _ = unsafe { SetConsoleMode(stdin_handle, orig_stdin_mode) };
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(io::Error::last_os_error());
+            }
+            let mut orig_stdout_mode: u32 = 0;
+            // SAFETY: valid handle and pointer.
+            if unsafe { GetConsoleMode(stdout_handle, &mut orig_stdout_mode) } == 0 {
+                let _ = unsafe { SetConsoleMode(stdin_handle, orig_stdin_mode) };
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(io::Error::last_os_error());
+            }
+            let new_stdout_mode = orig_stdout_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            // SAFETY: valid handle.
+            if unsafe { SetConsoleMode(stdout_handle, new_stdout_mode) } == 0 {
+                let _ = unsafe { SetConsoleMode(stdin_handle, orig_stdin_mode) };
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(io::Error::last_os_error());
+            }
+
+            return Ok(Self { orig_stdin_mode, orig_stdout_mode });
+        }
+
+        #[cfg(not(windows))]
+        Ok(Self {})
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        // Restore Windows console modes BEFORE disable_raw_mode so the console
+        // is in a sane state even if disable_raw_mode is called during panic unwind.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{
+                GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+            // SAFETY: borrowed handles; we only call SetConsoleMode on them.
+            let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            // Ignore errors — best effort in Drop (T-09-02 mitigation).
+            let _ = unsafe { SetConsoleMode(stdin_handle, self.orig_stdin_mode) };
+            let _ = unsafe { SetConsoleMode(stdout_handle, self.orig_stdout_mode) };
+        }
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }

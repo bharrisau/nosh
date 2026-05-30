@@ -38,6 +38,13 @@ dirs = "5"
 # #[cfg(unix)]-gated to match.
 ssh-agent-client-rs = "1.1"
 
+[target.'cfg(windows)'.dependencies]
+# windows-sys provides the Win32 console APIs needed to set ENABLE_VIRTUAL_TERMINAL_INPUT
+# on stdin and ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout (RawModeGuard extension).
+# crossterm's enable_raw_mode on Windows does NOT set these flags, so we add them
+# manually for correct TUI/special-key support.
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 nosh-server = { path = "../nosh-server" }
 nosh-auth = { path = "../nosh-auth", features = ["test-support"] }

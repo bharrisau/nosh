@@ -48,9 +48,200 @@ const ACK_INTERVAL: Duration = Duration::from_millis(750);
 const BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
+// ── SSH-style escape state machine ────────────────────────────────────────────
+//
+// This implements the OpenSSH client escape mechanism. It sits BETWEEN the
+// local stdin read and `client::send_input`, so it is fed ONLY local keystrokes.
+// Server-sourced `PtyData` bytes go directly to stdout and NEVER pass through
+// here (T-09-01 threat model: a malicious server cannot inject `~.` to force
+// a local disconnect).
+//
+// State machine:
+//   - LineStart: at the beginning of the stream, or just after forwarding a '\n'.
+//     A '~' at LineStart does NOT get forwarded immediately; transitions to SeenTilde.
+//   - SeenTilde: a preceding '~' at line-start is pending.
+//     '.' → quit (no bytes forwarded)
+//     '~' → forward one literal '~', return to MidLine (not LineStart — a literal
+//            tilde is not a newline)
+//     other → forward the pending '~' + this byte; update state based on the byte
+//   - MidLine: any byte forwarded literally; transitions to LineStart after '\n'.
+//
+// Escape sequences (recognized only at line start):
+//   ~.   Disconnect the local client (PumpOutcome::UserQuit).
+//   ~~   Send a literal tilde (~) to the remote.
+
+/// The result of processing a chunk of stdin bytes through the escape machine.
+#[derive(Debug)]
+struct EscapeResult {
+    /// Bytes to forward to the server (may be empty if the input was consumed
+    /// by the escape logic or produced no output).
+    bytes_to_forward: Vec<u8>,
+    /// Whether a `~.` escape was detected, signalling local quit.
+    quit: bool,
+}
+
+/// State of the `~`-escape state machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EscapeState {
+    /// At line-start: a '~' byte will begin an escape sequence.
+    LineStart,
+    /// A '~' at line-start was just seen; pending the next byte.
+    SeenTilde,
+    /// Mid-line: '~' has no escape meaning; transitions to LineStart on '\n'.
+    MidLine,
+}
+
+impl EscapeState {
+    fn new() -> Self {
+        // Session start counts as line-start (like OpenSSH).
+        EscapeState::LineStart
+    }
+
+    /// Process `input` bytes through the escape machine. Returns bytes to forward
+    /// and whether `~.` was encountered (local quit). Must be fed ONLY local stdin
+    /// bytes — NEVER server output.
+    fn process(&mut self, input: &[u8]) -> EscapeResult {
+        let mut out = Vec::with_capacity(input.len());
+        let mut quit = false;
+
+        for &byte in input {
+            match *self {
+                EscapeState::LineStart => {
+                    if byte == b'~' {
+                        // Pending tilde: do NOT forward yet, wait for next byte.
+                        *self = EscapeState::SeenTilde;
+                    } else {
+                        out.push(byte);
+                        *self = if byte == b'\n' {
+                            EscapeState::LineStart
+                        } else {
+                            EscapeState::MidLine
+                        };
+                    }
+                }
+                EscapeState::SeenTilde => {
+                    if byte == b'.' {
+                        // ~. → local quit; forward nothing.
+                        quit = true;
+                        // Consume remaining input on quit; the caller will
+                        // discard out and return UserQuit.
+                        break;
+                    } else if byte == b'~' {
+                        // ~~ → forward one literal tilde, return to MidLine.
+                        // (A literal tilde is not a newline; mid-line is correct.)
+                        out.push(b'~');
+                        *self = EscapeState::MidLine;
+                    } else {
+                        // ~<other>: forward both the pending '~' and this byte.
+                        out.push(b'~');
+                        out.push(byte);
+                        *self = if byte == b'\n' {
+                            EscapeState::LineStart
+                        } else {
+                            EscapeState::MidLine
+                        };
+                    }
+                }
+                EscapeState::MidLine => {
+                    out.push(byte);
+                    if byte == b'\n' {
+                        *self = EscapeState::LineStart;
+                    }
+                }
+            }
+        }
+
+        EscapeResult { bytes_to_forward: out, quit }
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::{EscapeState};
+
+    /// Helper: run the escape machine over the given bytes and return
+    /// (bytes_forwarded, quit_flag).
+    fn run(state: &mut EscapeState, input: &[u8]) -> (Vec<u8>, bool) {
+        let r = state.process(input);
+        (r.bytes_to_forward, r.quit)
+    }
+
+    #[test]
+    fn line_start_tilde_dot_quits_no_bytes() {
+        let mut s = EscapeState::new(); // starts at LineStart
+        let (fwd, quit) = run(&mut s, b"~.");
+        assert!(quit, "~. at line-start must signal quit");
+        assert!(fwd.is_empty(), "~. must not forward any bytes");
+    }
+
+    #[test]
+    fn tilde_tilde_forwards_one_literal_tilde() {
+        let mut s = EscapeState::new(); // LineStart
+        let (fwd, quit) = run(&mut s, b"~~");
+        assert!(!quit);
+        assert_eq!(fwd, b"~", "~~ must forward exactly one ~");
+    }
+
+    #[test]
+    fn mid_line_tilde_is_literal() {
+        // 'a' takes us to MidLine; subsequent '~' has no escape semantics.
+        let mut s = EscapeState::new();
+        let (fwd, quit) = run(&mut s, b"a~b");
+        assert!(!quit);
+        assert_eq!(fwd, b"a~b", "mid-line ~ must be forwarded literally");
+    }
+
+    #[test]
+    fn newline_resets_to_line_start_enabling_escape() {
+        // '\n' at mid-line → LineStart; then '~.' should quit.
+        let mut s = EscapeState::new();
+        // First put us at mid-line with 'x'.
+        let (_, _) = run(&mut s, b"x");
+        // '\n' moves to LineStart; '~.' quits.
+        let (fwd_n, quit_n) = run(&mut s, b"\n~.");
+        // '\n' is forwarded, then '~.' quits.
+        assert!(quit_n, "~. after newline must quit");
+        assert_eq!(fwd_n, b"\n", "newline before ~. must be forwarded");
+    }
+
+    #[test]
+    fn mid_line_tilde_dot_is_literal() {
+        // 'x' puts us at MidLine; '~.' must NOT quit.
+        let mut s = EscapeState::new();
+        let (fwd, quit) = run(&mut s, b"x~.");
+        assert!(!quit, "~. not at line-start must NOT quit");
+        assert_eq!(fwd, b"x~.", "all three bytes forwarded literally");
+    }
+
+    #[test]
+    fn session_start_counts_as_line_start() {
+        // EscapeState::new() starts at LineStart — confirm '~.' quits immediately.
+        let mut s = EscapeState::new();
+        let r = s.process(b"~.");
+        assert!(r.quit);
+        assert!(r.bytes_to_forward.is_empty());
+    }
+
+    #[test]
+    fn tilde_other_byte_forwarded_both() {
+        // '~' at line start + 'q' → forward "~q" (no quit).
+        let mut s = EscapeState::new();
+        let (fwd, quit) = run(&mut s, b"~q");
+        assert!(!quit);
+        assert_eq!(fwd, b"~q");
+    }
+}
+
 /// nosh client (Phase 3 — interactive PTY session over authenticated QUIC).
 #[derive(Parser, Debug)]
-#[command(name = "nosh-client", about, version)]
+#[command(
+    name = "nosh-client",
+    about = "nosh — roaming-tolerant remote shell over QUIC",
+    long_about = "nosh — roaming-tolerant remote shell over QUIC\n\n\
+        Escape sequences (recognized at line start, i.e. after a newline or at session start):\n  \
+          ~.   Disconnect and quit the local client.\n  \
+          ~~   Send a literal tilde (~) to the remote."
+)]
 struct Args {
     /// Server address.
     #[arg(long, default_value = "127.0.0.1")]
@@ -377,6 +568,10 @@ async fn run_pump(
     ack_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Track the last seq for which we sent an Ack to avoid redundant sends.
     let mut last_acked = *highest_applied;
+    // Escape state machine: persisted across reads so line-start state is
+    // maintained correctly. Fed ONLY local stdin bytes — server PtyData output
+    // goes directly to stdout and NEVER enters this machine (T-09-01).
+    let mut escape = EscapeState::new();
     let exit_code;
 
     loop {
@@ -392,6 +587,8 @@ async fn run_pump(
             msg = nosh_proto::read_message(recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
+                        // Server output goes directly to stdout — it does NOT pass
+                        // through the EscapeState machine (T-09-01 security property).
                         stdout.write_all(&data).await?;
                         stdout.flush().await?;
                         // Count each PtyData chunk as one applied sequence unit.
@@ -411,13 +608,22 @@ async fn run_pump(
                     }
                 }
             }
-            // Keystrokes (incl. Ctrl-C as 0x03 — passed through, SESS-06).
+            // Keystrokes: run through the escape machine before forwarding.
+            // ~. at line-start → quit; ~~ → literal ~; other ~ → pass through.
+            // The escape machine is fed ONLY these local stdin bytes (T-09-01).
             n = stdin.read(&mut stdin_buf) => {
                 match n {
                     Ok(0) => return Ok(PumpOutcome::UserQuit),
                     Ok(n) => {
-                        if client::send_input(send, &stdin_buf[..n]).await.is_err() {
-                            return Ok(PumpOutcome::TransportDrop);
+                        let result = escape.process(&stdin_buf[..n]);
+                        if result.quit {
+                            // ~. escape: quit locally without forwarding.
+                            return Ok(PumpOutcome::UserQuit);
+                        }
+                        if !result.bytes_to_forward.is_empty() {
+                            if client::send_input(send, &result.bytes_to_forward).await.is_err() {
+                                return Ok(PumpOutcome::TransportDrop);
+                            }
                         }
                     }
                     Err(_) => return Ok(PumpOutcome::UserQuit),
