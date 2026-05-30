@@ -409,8 +409,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Raw mode entered ONCE for the lifetime of the reconnect supervisor.
-    // Restored via Drop on any exit path — NEVER re-entered per reconnect (D-11).
-    let _guard = client::RawModeGuard::enable().context("enter raw mode")?;
+    // Restored explicitly before std::process::exit below (which skips Drop),
+    // and via Drop on any `?` early-return path — NEVER re-entered per reconnect (D-11).
+    let raw_guard = client::RawModeGuard::enable().context("enter raw mode")?;
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
@@ -521,7 +522,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Terminal is restored by the _guard Drop here.
+    // std::process::exit() does NOT run destructors, so the RawModeGuard's Drop
+    // would never fire on this path — restore the terminal explicitly first.
+    drop(raw_guard);
     std::process::exit(exit_code);
 }
 
