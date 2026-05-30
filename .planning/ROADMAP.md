@@ -100,3 +100,24 @@ Plans:
 | 6. Cold Reattach Protocol | v1.1 | 4/4 | Complete | 2026-05-30 |
 | 7. Connection Migration Validation | v1.1 | 2/2 | Complete   | 2026-05-30 |
 | 8. Windows Client | v1.1 | 2/2 | Complete   | 2026-05-30 |
+
+### Phase 9: Windows Client Polish & Hardening
+
+**Goal:** The nosh client is usable day-to-day from a native Windows console (real-key TUI input works) and degrades gracefully, with better server observability — closing the gaps found during live Windows→Linux validation on 2026-05-30 (auth, line shell, $TERM/$LANG/UTF-8, resize, and network roaming were all confirmed working in that session).
+**Requirements**: WIN-02 (Windows interactive usability), ROBUST-01 (client/auth robustness), OBS-01 (migration observability) — derived from live-validation findings; see `.planning/STATE.md` 2026-05-30 findings for full per-item root cause, file:line, and exact Win32 flags.
+**Depends on:** Phase 8 (Windows client platform split), Phase 7 (migration validation)
+
+**Success Criteria (observable truths):**
+1. Windows console set to virtual-terminal INPUT mode: `ENABLE_VIRTUAL_TERMINAL_INPUT` on, `ENABLE_PROCESSED_INPUT` cleared (Ctrl-C forwards to the remote as `0x03`, not killing nosh-client.exe / exit 130), stdout `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on, original modes saved + restored on exit — so vim/less/arrows/PageUp-Down work. (Windows-host confirm → human_needed)
+2. ssh-style `~.` escape in the client stdin pump: line-start `~` begins escape; `~.` quits the client locally; `~~` sends a literal `~`; any other char passes through with the `~`. Documented in usage. The local-quit mechanism on all platforms. (logic testable on Linux; full Windows confirm → human_needed)
+3. `authorized_keys` load skips unsupported/unparseable entries with a `warn` instead of failing the whole file (sshd behavior); a file with one Ed25519 key + an RSA line + a malformed line loads exactly the Ed25519 key. (Linux-testable)
+4. Client `connect()` has a timeout (~10s default, optional `--connect-timeout`) returning a clear error when no server responds; happy path and reattach/reconnect unaffected. (Linux-testable)
+5. Server logs an INFO event when a session's peer/remote address changes (connection migration): session_id + old→new addr. (Linux-testable)
+6. The Windows-only unused `PathBuf` import warning in `nosh-auth/src/signer.rs` is removed (gated `#[cfg(unix)]`); no warning on either platform. (Windows-host confirm → human_needed)
+
+**Constraints:** All Windows-specific code stays behind `#[cfg(windows)]` in nosh-client; nosh-proto unchanged; nosh-auth changes limited to the authorized_keys parser + import gate; nosh-server change limited to the migration log. Do NOT change quinn transport config for the Windows `WSAEMSGSIZE` warning (separate noted investigation; connection succeeds, likely benign GSO fallback).
+
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 9 to break down)
