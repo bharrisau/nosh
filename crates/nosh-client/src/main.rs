@@ -57,14 +57,17 @@ const BACKOFF_MAX: Duration = Duration::from_secs(10);
 // a local disconnect).
 //
 // State machine:
-//   - LineStart: at the beginning of the stream, or just after forwarding a '\n'.
+//   - LineStart: at the beginning of the stream, or just after forwarding a '\n'
+//     or '\r'. In raw mode (ICRNL disabled), the Enter key delivers '\r' (CR,
+//     0x0D), not '\n' (LF, 0x0A). Both are treated as line-start triggers,
+//     matching OpenSSH's `last_was_cr` logic (clientloop.c).
 //     A '~' at LineStart does NOT get forwarded immediately; transitions to SeenTilde.
 //   - SeenTilde: a preceding '~' at line-start is pending.
 //     '.' → quit (no bytes forwarded)
 //     '~' → forward one literal '~', return to MidLine (not LineStart — a literal
 //            tilde is not a newline)
 //     other → forward the pending '~' + this byte; update state based on the byte
-//   - MidLine: any byte forwarded literally; transitions to LineStart after '\n'.
+//   - MidLine: any byte forwarded literally; transitions to LineStart after '\n' or '\r'.
 //
 // Escape sequences (recognized only at line start):
 //   ~.   Disconnect the local client (PumpOutcome::UserQuit).
@@ -112,7 +115,9 @@ impl EscapeState {
                         *self = EscapeState::SeenTilde;
                     } else {
                         out.push(byte);
-                        *self = if byte == b'\n' {
+                        // '\r' (CR) and '\n' (LF) both count as line-start.
+                        // In raw mode, Enter delivers '\r'; ICRNL is disabled.
+                        *self = if matches!(byte, b'\n' | b'\r') {
                             EscapeState::LineStart
                         } else {
                             EscapeState::MidLine
@@ -135,7 +140,8 @@ impl EscapeState {
                         // ~<other>: forward both the pending '~' and this byte.
                         out.push(b'~');
                         out.push(byte);
-                        *self = if byte == b'\n' {
+                        // '\r' or '\n' after an unrecognised escape also resets.
+                        *self = if matches!(byte, b'\n' | b'\r') {
                             EscapeState::LineStart
                         } else {
                             EscapeState::MidLine
@@ -144,7 +150,8 @@ impl EscapeState {
                 }
                 EscapeState::MidLine => {
                     out.push(byte);
-                    if byte == b'\n' {
+                    // '\r' (CR) and '\n' (LF) both transition to LineStart.
+                    if matches!(byte, b'\n' | b'\r') {
                         *self = EscapeState::LineStart;
                     }
                 }
@@ -230,6 +237,34 @@ mod escape_tests {
         assert!(!quit);
         assert_eq!(fwd, b"~q");
     }
+
+    #[test]
+    fn carriage_return_resets_to_line_start_enabling_escape() {
+        // In raw mode, Enter delivers '\r' (CR, 0x0D), NOT '\n' (LF, 0x0A) —
+        // ICRNL is disabled. This test guards the CR-01 fix: the escape machine
+        // must accept '~.' after a CR exactly as it does after a LF.
+        let mut s = EscapeState::new();
+        let (_, _) = run(&mut s, b"x"); // 'x' → MidLine
+        let (fwd, quit) = run(&mut s, b"\r~.");
+        assert!(quit, "~. after \\r must quit (CR-01: raw-mode Enter is \\r not \\n)");
+        assert_eq!(fwd, b"\r", "\\r before ~. must be forwarded");
+    }
+
+    #[test]
+    fn carriage_return_mid_line_tilde_dot_is_literal() {
+        // A '~.' that is NOT preceded by a line-start must never quit,
+        // even when the line-start was established by '\r'. After the \r~
+        // sequence, the machine is at SeenTilde; then a subsequent non-dot
+        // byte (here '\r' itself to form a new mid-line) ensures we test
+        // the mid-line path.
+        let mut s = EscapeState::new();
+        // Put us mid-line by consuming 'x'.
+        run(&mut s, b"x");
+        // '\r' at MidLine → LineStart; 'y' → MidLine; '~.' must NOT quit.
+        let (fwd, quit) = run(&mut s, b"\ry~.");
+        assert!(!quit, "~. after mid-line 'y' (reached via \\r) must NOT quit");
+        assert_eq!(fwd, b"\ry~.", "all four bytes must be forwarded literally");
+    }
 }
 
 /// nosh client (Phase 3 — interactive PTY session over authenticated QUIC).
@@ -238,7 +273,7 @@ mod escape_tests {
     name = "nosh-client",
     about = "nosh — roaming-tolerant remote shell over QUIC",
     long_about = "nosh — roaming-tolerant remote shell over QUIC\n\n\
-        Escape sequences (recognized at line start, i.e. after a newline or at session start):\n  \
+        Escape sequences (recognized at line start, i.e. after CR/LF (Enter) or at session start):\n  \
           ~.   Disconnect and quit the local client.\n  \
           ~~   Send a literal tilde (~) to the remote."
 )]
