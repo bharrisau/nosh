@@ -117,7 +117,9 @@ Plans:
 
 **Constraints:** All Windows-specific code stays behind `#[cfg(windows)]` in nosh-client; nosh-proto unchanged; nosh-auth changes limited to the authorized_keys parser + import gate; nosh-server change limited to the migration log. Do NOT change quinn transport config for the Windows `WSAEMSGSIZE` warning (separate noted investigation; connection succeeds, likely benign GSO fallback).
 
-**Plans:** 0 plans
+**Plans:** 3 plans
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 9 to break down)
+- [ ] 09-01-PLAN.md — Windows VT console-input mode + ssh-style `~.` local-quit escape (WIN-02) (Wave 1)
+- [ ] 09-02-PLAN.md — authorized_keys warn+skip, client connect timeout, signer.rs PathBuf import gate (ROBUST-01, WIN-02) (Wave 2)
+- [ ] 09-03-PLAN.md — server logs connection migration (remote_address change) at INFO (OBS-01) (Wave 1)
