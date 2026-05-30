@@ -397,6 +397,15 @@ async fn run_session(
 
     // Pump until the shell exits, the client closes cleanly, or the transport
     // is lost (D-02). The outcome drives the post-loop teardown/orphan split.
+
+    // OBS-01: poll conn.remote_address() to detect connection migration.
+    // quinn 0.11 provides no direct migration callback; polling is the only
+    // detection mechanism. 500 ms cadence bounds log frequency while remaining
+    // responsive to human-visible roaming events.
+    let mut last_seen_addr: SocketAddr = conn.remote_address();
+    let mut migration_poll = tokio::time::interval(Duration::from_millis(500));
+    migration_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let session_end: SessionEnd = loop {
         tokio::select! {
             // Shell exited: capture the code and tell the client.
@@ -423,6 +432,21 @@ async fn run_session(
                         // Output pump ended (PTY EOF). Await the exit code.
                         break SessionEnd::ShellExited((&mut wait_task).await.unwrap_or(1));
                     }
+                }
+            }
+            // OBS-01: migration detection — fires at most every 500 ms.
+            // Logs an INFO event if the peer address changed (QUIC connection
+            // migration). Does NOT break the loop; purely observational.
+            _ = migration_poll.tick() => {
+                let cur = conn.remote_address();
+                if cur != last_seen_addr {
+                    tracing::info!(
+                        session_id = %session_id,
+                        old = %last_seen_addr,
+                        new = %cur,
+                        "connection migrated"
+                    );
+                    last_seen_addr = cur;
                 }
             }
             // Client → server frames.
