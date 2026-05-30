@@ -208,6 +208,14 @@ gsd-sdk query resolve-model gsd-planner   # → {"model": "opus", "profile": "ba
 - The profile maps **per-agent**, not globally. On `balanced` (this project): `gsd-planner` → **opus**; executor / verifier / researcher / plan-checker / roadmapper / synthesizer / code-reviewer → **sonnet**. Don't generalize one role's tier to the others or blanket-default to opus or sonnet.
 - When wrapping a GSD skill (e.g. `gsd:plan-phase`) in an `Agent`, let the skill resolve its own subagents' models — do **not** inject a blanket model override into the wrapper prompt (it can downgrade the planner off opus).
 - Profile is changed via `/gsd:set-profile` / `/gsd:settings`; never silently override it.
+
+### GSD verification: separate pass, on opus
+
+Verification runs as an **independent pass on opus**, never collapsed inline into the (sonnet) executor — a peer grading a peer rubber-stamps subtle bugs (happened in three consecutive M3 phases; opus re-verify caught a real bug each time).
+
+- Pinned in `.planning/config.json` via per-agent override (GSD #3227): `"model_overrides": { "gsd-verifier": "opus", "gsd-integration-checker": "opus" }` (use `model_overrides.<agent-id>`, the per-agent knob — not `model_profile_overrides`).
+- Don't wrap `execute-phase` in a background agent and let it self-verify: background agents can't spawn subagents (one-level nesting), so the separate `gsd-verifier` collapses inline. Run a dedicated verifier agent after execute.
+- Make the verifier **adversarial** — write a probe test that reproduces the suspected failure (fails before fix, passes after); trust the code over the executor's summary.
 <!-- GSD:conventions-end -->
 
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->
