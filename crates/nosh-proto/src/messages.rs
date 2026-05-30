@@ -75,12 +75,19 @@ pub enum Message {
     /// Client → server, the FIRST frame on a reconnected QUIC connection, in
     /// place of `SessionOpen` (D-03 / D-04).
     ///
-    /// `last_acked_seq` convention (LOCK THIS — see §6 of 06-RESEARCH):
-    /// it is the **highest output sequence number the client has APPLIED**
-    /// (i.e. written to the terminal). The server replays all buffered chunks
-    /// with `seq > last_acked_seq`. A value of 0 when the client applied no
-    /// output means replay starts from the first retained chunk (seq 1+), or
-    /// from `lowest_retained_seq` if the buffer was truncated.
+    /// `last_acked_seq` convention (LOCKED — **next-expected-seq**):
+    /// it is the **count of output chunks the client has applied**, which —
+    /// because the server numbers chunks 0-based — equals the **sequence number
+    /// of the next chunk the client expects** (the lowest seq it has NOT yet
+    /// applied). After applying 0-based seqs `0..=K` (i.e. `K+1` chunks) the
+    /// client reports `K+1`.
+    ///
+    /// The server replays every buffered chunk with `seq >= last_acked_seq`
+    /// (inclusive — see `SequencedOutputBuffer::replay_from`). A value of `0`
+    /// means "applied nothing": replay everything from the first retained chunk
+    /// (seq 0), or from `lowest_retained_seq` if the buffer was truncated. No
+    /// sentinel is needed because seq is 0-based: "next expected = 0" is the
+    /// natural empty state.
     ///
     /// WARNING: the `token` bytes MUST NOT be logged. Log only the identity
     /// fingerprint (D-07).
@@ -88,15 +95,18 @@ pub enum Message {
         /// The reattach token last received from the server (initial
         /// `SessionOpened.token` or the most recent `ReattachOk.new_token`).
         token: [u8; 16],
-        /// Highest output sequence number the client has successfully applied.
-        /// Server replays all chunks with seq STRICTLY GREATER THAN this value.
+        /// Count of output chunks the client has applied == the seq of the
+        /// next chunk it expects (next-expected-seq convention). The server
+        /// replays all chunks with seq GREATER THAN OR EQUAL TO this value.
         last_acked_seq: u64,
     },
 
     /// Server → client on a successful reattach (D-03 / D-05 / D-09).
     /// The server sends this as the very first frame on the new stream, then
-    /// replays `PtyData` frames for each chunk with seq > `last_acked_seq`
-    /// (or >= `replaying_from_seq` if truncation occurred).
+    /// replays one `PtyData` frame for each chunk with seq `>= last_acked_seq`
+    /// (next-expected-seq convention; see `Message::Reattach`). When the buffer
+    /// was truncated below the requested resume point, replay instead starts at
+    /// `lowest_retained_seq == replaying_from_seq`.
     ///
     /// WARNING: `new_token` MUST NOT be logged. Log only the identity
     /// fingerprint (D-07).
@@ -104,13 +114,15 @@ pub enum Message {
         /// Rotated single-use reattach token. The client MUST replace its
         /// stored token with this value immediately.
         new_token: [u8; 16],
-        /// The first sequence number in the replay stream. Normally
-        /// `last_acked_seq + 1`; equals `lowest_retained_seq` when
-        /// `truncated == true`.
+        /// The seq of the FIRST replayed chunk. Normally equals the client's
+        /// reported `last_acked_seq` (next-expected-seq); equals
+        /// `lowest_retained_seq` when `truncated == true`. The client rebases
+        /// its applied-count to this value so the first replayed chunk lands at
+        /// the right offset with no off-by-one.
         replaying_from_seq: u64,
-        /// `true` when the requested resume point (`last_acked_seq + 1`)
-        /// predates the buffer's `lowest_retained_seq` (the 64 KiB cap dropped
-        /// those bytes). The client should display a truncation notice (D-09).
+        /// `true` when the requested resume point (`last_acked_seq`) predates
+        /// the buffer's `lowest_retained_seq` (the 64 KiB cap dropped those
+        /// bytes). The client should display a truncation notice (D-09).
         truncated: bool,
     },
 
@@ -125,14 +137,17 @@ pub enum Message {
     /// reason field would create a session-existence oracle.
     ReattachErr,
 
-    /// Client → server, periodic; carries the highest output sequence number
-    /// the client has received and applied (D-08 continuous acking).
+    /// Client → server, periodic; carries the **next-expected-seq** == the
+    /// count of output chunks the client has applied (D-08 continuous acking),
+    /// using the SAME convention as `Message::Reattach::last_acked_seq`.
     ///
-    /// The server calls `SequencedOutputBuffer::trim_acked(seq)` to drop
-    /// bytes the client has already consumed, keeping the ring lean. Cadence
-    /// is coarse (time-interval or byte-threshold), not per-chunk.
+    /// The server calls `SequencedOutputBuffer::trim_acked(seq)`, which drops
+    /// every chunk with seq STRICTLY LESS THAN `seq` (the chunks the client has
+    /// already applied: seqs `0..seq`). It MUST NOT drop seq `>= seq` (chunks
+    /// the client has not yet applied). Cadence is coarse (time-interval or
+    /// byte-threshold), not per-chunk.
     Ack {
-        /// Highest output sequence number the client has applied.
+        /// Next-expected-seq == count of output chunks the client has applied.
         seq: u64,
     },
 }

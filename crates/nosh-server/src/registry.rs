@@ -114,23 +114,27 @@ impl SequencedOutputBuffer {
 
     // ── Phase 6: replay and continuous ack trim ──────────────────────────────
 
-    /// Return all buffered chunks with seq strictly greater than `last_acked_seq`,
-    /// for replaying to a reconnecting client (D-09 / ROAM-02).
+    /// Return all buffered chunks with seq GREATER THAN OR EQUAL TO
+    /// `last_acked_seq`, for replaying to a reconnecting client (D-09 / ROAM-02).
     ///
-    /// `last_acked_seq` is the highest output sequence number the client has
-    /// APPLIED (as documented on `Message::Reattach`). Replay starts at
-    /// `last_acked_seq + 1`, or at `lowest_retained_seq` if the ring was
-    /// truncated and the requested resume point predates it.
+    /// CONVENTION (next-expected-seq, LOCKED — see `Message::Reattach`):
+    /// `last_acked_seq` is the COUNT of chunks the client has applied, which —
+    /// since seq is 0-based — equals the seq of the next chunk it expects (the
+    /// lowest seq it has NOT yet applied). Replay is therefore INCLUSIVE: every
+    /// chunk with `seq >= last_acked_seq` is replayed. A value of `0` ("applied
+    /// nothing") replays everything from seq 0 (or from `lowest_retained_seq`
+    /// if the ring was truncated and the requested resume point predates it).
     ///
     /// Returns `(chunks, replaying_from_seq, truncated_below_request)` where:
     /// - `chunks`: owned `(seq, Bytes)` in ascending seq order, no dup/gap
     ///   within the retained range.
     /// - `replaying_from_seq`: the sequence number of the first replayed chunk
-    ///   (or `last_acked_seq + 1` if the ring is empty / nothing to replay).
+    ///   (or `last_acked_seq` if the ring is empty / nothing to replay).
     /// - `truncated_below_request`: `true` when the client's requested resume
     ///   point fell below the buffer's lowest retained seq (cap dropped it).
     pub fn replay_from(&self, last_acked_seq: u64) -> (Vec<(u64, Bytes)>, u64, bool) {
-        let want_from = last_acked_seq.saturating_add(1);
+        // Next-expected-seq: the client wants chunks starting AT last_acked_seq.
+        let want_from = last_acked_seq;
 
         let (ring_front_seq, truncated_below_request) = if let Some(&(front_seq, _)) = self.ring.front() {
             let truncated = front_seq > want_from;
@@ -146,28 +150,37 @@ impl SequencedOutputBuffer {
             want_from
         };
 
-        // Collect all chunks with seq > last_acked_seq (ascending, no dup/gap
-        // within the retained range — Pitfall #9).
+        // Collect all chunks with seq >= last_acked_seq (ascending, no dup/gap
+        // within the retained range — Pitfall #9). Inclusive boundary is what
+        // makes the next-expected-seq convention exactly-once.
         let chunks: Vec<(u64, Bytes)> = self
             .ring
             .iter()
-            .filter(|(seq, _)| *seq > last_acked_seq)
+            .filter(|(seq, _)| *seq >= want_from)
             .map(|(seq, b)| (*seq, b.clone()))
             .collect();
 
         (chunks, replaying_from_seq, truncated_below_request)
     }
 
-    /// Drop ring entries that the client has already applied (seq <= acked_seq),
-    /// freeing buffer space (D-08 continuous acking). This is NOT a data-loss
-    /// truncation — the client already has those bytes — so it MUST NOT set
-    /// `self.truncated` and must NOT advance `lowest_retained_seq` in a way that
-    /// would signal data loss to a future `replay_from` call.
+    /// Drop ring entries the client has already applied, freeing buffer space
+    /// (D-08 continuous acking).
     ///
-    /// Only the cap-eviction path in `push()` sets `truncated`.
+    /// CONVENTION (next-expected-seq, LOCKED — see `Message::Ack`): `acked_seq`
+    /// is the COUNT of chunks the client has applied == the seq of the next
+    /// chunk it expects. The chunks it has ALREADY applied are seqs
+    /// `0..acked_seq`, so we drop every entry with `seq < acked_seq`. We MUST
+    /// NEVER drop `seq >= acked_seq` — those are chunks the client has not yet
+    /// applied and may still need on replay (the inflated-Ack silent-loss bug).
+    ///
+    /// This is NOT a data-loss truncation — the client already has the dropped
+    /// bytes — so it MUST NOT set `self.truncated` and must NOT advance
+    /// `lowest_retained_seq` in a way that would signal data loss to a future
+    /// `replay_from` call. Only the cap-eviction path in `push()` sets
+    /// `truncated`.
     pub fn trim_acked(&mut self, acked_seq: u64) {
         while let Some(&(seq, _)) = self.ring.front() {
-            if seq <= acked_seq {
+            if seq < acked_seq {
                 if let Some((_, chunk)) = self.ring.pop_front() {
                     self.total_bytes -= chunk.len();
                 }
@@ -1232,12 +1245,24 @@ mod tests {
         for i in 0u8..5 {
             buf.push(&[i; 10]);
         }
-        // replay_from(2) should return seqs 3 and 4 only, in order.
-        let (chunks, replaying_from_seq, truncated) = buf.replay_from(2);
+        // Next-expected-seq convention: replay_from(3) means "client applied 3
+        // chunks (seqs 0,1,2), next expected is seq 3" → replay seqs 3 and 4.
+        let (chunks, replaying_from_seq, truncated) = buf.replay_from(3);
         let seqs: Vec<u64> = chunks.iter().map(|(s, _)| *s).collect();
-        assert_eq!(seqs, vec![3, 4], "should replay only seqs > 2");
-        assert_eq!(replaying_from_seq, 3, "replaying_from_seq should be last_acked+1");
+        assert_eq!(seqs, vec![3, 4], "should replay seqs >= 3 (inclusive)");
+        assert_eq!(replaying_from_seq, 3, "replaying_from_seq should equal next-expected");
         assert!(!truncated, "no truncation in a non-overflowed buffer");
+
+        // replay_from(0) ("applied nothing") replays EVERYTHING from seq 0.
+        let (all, from0, _) = buf.replay_from(0);
+        let all_seqs: Vec<u64> = all.iter().map(|(s, _)| *s).collect();
+        assert_eq!(all_seqs, vec![0, 1, 2, 3, 4], "replay_from(0) replays all");
+        assert_eq!(from0, 0, "replaying_from_seq for applied-nothing is 0");
+
+        // replay_from(5) (applied all 5) replays nothing — next expected past end.
+        let (none, from5, _) = buf.replay_from(5);
+        assert!(none.is_empty(), "applied-all replays nothing");
+        assert_eq!(from5, 5);
     }
 
     #[test]
@@ -1280,18 +1305,21 @@ mod tests {
         let bytes_before = buf.len_bytes();
         assert_eq!(bytes_before, 6 * 20, "should have 6*20 bytes before trim");
 
-        // Trim seqs 0..2 (acked_seq = 2).
-        buf.trim_acked(2);
+        // Next-expected-seq convention: trim_acked(3) means "client applied 3
+        // chunks (seqs 0,1,2), next expected is seq 3" → drop seqs < 3.
+        buf.trim_acked(3);
 
         // Should have dropped 3 chunks (seqs 0, 1, 2) = 60 bytes.
-        assert_eq!(buf.len_bytes(), 3 * 20, "should have 3 chunks left after trim_acked(2)");
+        assert_eq!(buf.len_bytes(), 3 * 20, "should have 3 chunks left after trim_acked(3)");
         // truncated must remain false (trim_acked is NOT a data-loss event).
         assert!(!buf.truncated(), "trim_acked must NOT set truncated flag");
 
-        // replay_from(2) should still return seqs 3, 4, 5 (seq > 2, those still in ring).
-        let (chunks, _, trunc) = buf.replay_from(2);
+        // CRITICAL (silent-loss guard): trim_acked must NEVER drop a chunk the
+        // client has not applied. The next-expected chunk (seq 3) must survive.
+        let (chunks, replaying_from, trunc) = buf.replay_from(3);
         let seqs: Vec<u64> = chunks.iter().map(|(s, _)| *s).collect();
-        assert_eq!(seqs, vec![3, 4, 5], "replay after trim must return remaining seqs");
+        assert_eq!(seqs, vec![3, 4, 5], "replay after trim must return remaining seqs (no drop)");
+        assert_eq!(replaying_from, 3, "next-expected chunk must still be replayable, not trimmed");
         assert!(!trunc, "no truncation after trim (trim is not overflow)");
     }
 

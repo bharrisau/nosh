@@ -282,9 +282,11 @@ pub async fn open_session_with_token(
 
 /// Send a `Reattach` frame as the FIRST frame on a new connection's bidi stream.
 ///
-/// `last_acked_seq` is the highest output sequence number the client has applied
-/// (as documented on `Message::Reattach`). Use the value tracked by the client;
-/// 0 if the client applied nothing since the last fresh open.
+/// `last_acked_seq` is the next-expected-seq == the COUNT of output chunks the
+/// client has applied (as documented on `Message::Reattach`). Use the value
+/// tracked by the client (`highest_applied`); 0 if the client applied nothing
+/// since the last fresh open. The server replays all chunks with
+/// `seq >= last_acked_seq`.
 pub async fn send_reattach(
     send: &mut quinn::SendStream,
     token: [u8; 16],
@@ -296,7 +298,8 @@ pub async fn send_reattach(
 }
 
 /// Send a periodic `Ack { seq }` frame (D-08 continuous acking). `seq` is the
-/// highest output sequence number the client has applied.
+/// next-expected-seq == count of output chunks the client has applied (same
+/// convention as `Message::Reattach::last_acked_seq`).
 pub async fn send_ack(send: &mut quinn::SendStream, seq: u64) -> anyhow::Result<()> {
     nosh_proto::write_message(send, &Message::Ack { seq })
         .await

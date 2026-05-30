@@ -50,22 +50,61 @@ fn client_endpoint_for(key: &TestKey) -> (quinn::Endpoint, tempfile::TempDir) {
     (ep, dir)
 }
 
-// ── SC#1: replay continuity ───────────────────────────────────────────────────
+// ── SC#1: replay continuity (byte-exact, multi-cycle) ─────────────────────────
 
-/// SC#1 / ROAM-02: a reconnecting client receives exactly the buffered output
-/// it missed (no duplicated or dropped bytes relative to the server's buffered
-/// output). The test keeps the shell running with a long sleep so the session
-/// can be orphaned, then reconnected with reattach.
+/// Mirror of the production `run_pump` applied-seq accounting in
+/// `nosh-client/src/main.rs`, so this test exercises the REAL client counter
+/// contract rather than a hardcoded `last_acked_seq`.
 ///
-/// Test flow:
-/// 1. Fresh session; run a script that prints LINE1..LINE10 then sleeps for 60s
-///    (to keep the shell alive while we drop and reattach).
-/// 2. Wait for the shell to print READY, then abruptly drop the connection.
-/// 3. Poll for orphan.
-/// 4. Reconnect with the SAME key and send a Reattach (using the bidi stream
-///    directly, NOT reattach_collect which would wait for SessionClose).
-/// 5. Assert ReattachOk and that the replay/live output contains LINE markers.
-/// 6. Send SessionClose to clean up.
+/// Invariant (next-expected-seq convention, see `Message::Reattach`):
+/// - fresh session: counter starts at 0.
+/// - each applied `PtyData` chunk: counter += 1 (so the counter equals the
+///   count of chunks applied == the seq of the next chunk expected).
+/// - on reattach: the client rebases the counter to the server's
+///   `replaying_from_seq` (NOT `replaying_from_seq - 1`) so the first replayed
+///   chunk lands at the right offset.
+///
+/// The value sent in `Reattach.last_acked_seq` / `Ack.seq` is exactly this
+/// counter. If the counter logic or the server's replay/trim boundary is off
+/// by one, this test drops or duplicates a chunk and fails.
+struct ClientCounter {
+    highest_applied: u64,
+}
+
+impl ClientCounter {
+    fn fresh() -> Self {
+        Self { highest_applied: 0 }
+    }
+    /// Apply one received chunk exactly as `run_pump` does.
+    fn apply_chunk(&mut self) {
+        self.highest_applied = self.highest_applied.saturating_add(1);
+    }
+    /// Rebase on reattach exactly as `reattach_session` does.
+    fn rebase_on_reattach(&mut self, replaying_from_seq: u64) {
+        self.highest_applied = replaying_from_seq;
+    }
+    /// The value the client reports to the server.
+    fn last_acked_seq(&self) -> u64 {
+        self.highest_applied
+    }
+}
+
+/// SC#1 / ROAM-02 (byte-exact, MULTI-CYCLE): drive the ACTUAL client counter
+/// through several disconnect→reattach cycles and assert the client observes
+/// EVERY emitted output marker EXACTLY ONCE, in order — no duplicate, no drop.
+///
+/// This is the crux test for the fence-post BLOCKER: the previous version
+/// hardcoded `last_acked_seq = 0` and only did a fuzzy "≥3 markers" substring
+/// check, so it could not detect the drop-one-chunk-per-reconnect bug. This
+/// version:
+///  - has the server emit N distinct, totally-ordered markers (`MARK000000`…),
+///  - reads them through the real client counter,
+///  - disconnects mid-stream on EACH cycle (without ever Acking, so the server
+///    must replay the un-applied tail),
+///  - reattaches using the counter value (next-expected-seq) and rebases,
+///  - repeats for several cycles to surface the COMPOUNDING off-by-one,
+///  - finally asserts the concatenated applied output contains every marker
+///    exactly once and in strictly increasing order.
 #[tokio::test]
 async fn reattach_replays_unacked_output_byte_exact() {
     if !have_sh() {
@@ -73,131 +112,188 @@ async fn reattach_replays_unacked_output_byte_exact() {
         return;
     }
 
+    const TOTAL_MARKERS: u32 = 40;
+    const CYCLES: u32 = 4;
+
     let registry = SessionRegistry::new(5, Duration::ZERO);
     let client_key = TestKey::generate();
     let server = server_with_key(registry.clone(), &client_key).await;
 
-    let (ep1, _dir1) = client_endpoint_for(&client_key);
-    let conn1 = client::connect(&ep1, server.addr, HOST).await.expect("connect");
-
-    // Open session and capture token.
-    let (mut send1, mut recv1, token) =
-        client::open_session_with_token(&conn1, "xterm".to_string(), 80, 24, vec![])
+    // ── Fresh session ────────────────────────────────────────────────────────
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST).await.expect("connect");
+    let (mut send, mut recv, mut token) =
+        client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open_session_with_token");
 
-    // Script: print LINE1..LINE10 then print READY then sleep (keep shell alive).
-    let script = "for i in $(seq 1 10); do echo LINE$i; done; echo READY; sleep 60\n";
-    client::send_input(&mut send1, script.as_bytes())
+    // Emit ALL TOTAL_MARKERS distinct, ordered markers up front (one tight
+    // loop, no per-marker sleep), THEN keep the shell alive with a long sleep.
+    // `printf` with a zero-padded counter gives strictly-ordered, unique,
+    // easily-greppable tokens (MARK000000, MARK000001, …).
+    //
+    // Producing all output BEFORE the first disconnect — and sleeping (no new
+    // PTY output) across every orphan→reattach gap — isolates the sequence /
+    // replay / trim contract (FIX 1's scope) from the orthogonal PTY-reader
+    // handoff timing. Every byte the client misses is buffered server-side and
+    // must be replayed via `seq >= last_acked_seq`, so a single off-by-one at
+    // the replay/trim boundary drops or duplicates a marker and fails the test.
+    // After emitting the markers, the shell blocks on `read` (waiting for
+    // stdin). This keeps it alive across the orphan→reattach cycles WITHOUT a
+    // fixed-duration `sleep` that would stall teardown: sending any line at the
+    // end unblocks `read` and the shell exits immediately.
+    let script = format!(
+        "i=0; while [ $i -lt {TOTAL_MARKERS} ]; do printf 'MARK%06d\\n' $i; i=$((i+1)); done; echo DONEMARKER; read _x\n"
+    );
+    client::send_input(&mut send, script.as_bytes())
         .await
         .expect("send script");
+    // Let the shell finish producing every marker before we disconnect.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    // Collect until we see READY (all LINE output was produced).
-    let mut pre_output = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    'outer: loop {
-        match tokio::time::timeout(Duration::from_millis(500), nosh_proto::read_message(&mut recv1)).await {
-            Ok(Ok(nosh_proto::Message::PtyData { data })) => {
-                pre_output.extend_from_slice(&data);
-                if String::from_utf8_lossy(&pre_output).contains("READY") {
-                    break 'outer;
+    // Accumulate everything the client APPLIES across all cycles.
+    let mut applied = Vec::<u8>::new();
+    let mut counter = ClientCounter::fresh();
+
+    // Helper: drain `recv` into `applied`, advancing the counter per chunk,
+    // until we've seen `stop_after_chunks` newly-applied chunks, OR output goes
+    // idle (no PtyData for ~1.2s, meaning everything buffered has arrived), OR
+    // the stream errors. Returns true if the stream is still alive.
+    //
+    // The idle cutoff matters: there are far fewer PtyData frames than markers
+    // (the PTY batches many lines per read), so a fixed chunk target would
+    // block until a deadline. Stopping on idle keeps the test fast while still
+    // applying every byte the server sends in this window.
+    async fn drain_n(
+        recv: &mut quinn::RecvStream,
+        applied: &mut Vec<u8>,
+        counter: &mut ClientCounter,
+        stop_after_chunks: u32,
+    ) -> bool {
+        let mut got = 0u32;
+        let mut idle_strikes = 0u32;
+        while got < stop_after_chunks {
+            match tokio::time::timeout(Duration::from_millis(400), nosh_proto::read_message(recv)).await {
+                Ok(Ok(nosh_proto::Message::PtyData { data })) => {
+                    applied.extend_from_slice(&data);
+                    counter.apply_chunk();
+                    got += 1;
+                    idle_strikes = 0;
+                }
+                Ok(Ok(_)) => { /* ignore non-PtyData control frames */ }
+                Ok(Err(_)) => return false, // stream closed
+                Err(_) => {
+                    // No data this window. After 3 idle windows (~1.2s) assume
+                    // the buffered output has all arrived and return.
+                    idle_strikes += 1;
+                    if idle_strikes >= 3 {
+                        return true;
+                    }
                 }
             }
-            Ok(Ok(_)) | Err(_) => {}
-            Ok(Err(_)) => break 'outer,
         }
-        if std::time::Instant::now() > deadline {
-            // If we didn't get READY but have at least some LINE output, proceed.
-            let s = String::from_utf8_lossy(&pre_output);
-            if s.contains("LINE1") {
-                eprintln!("  WARN: did not see READY but have LINE1; proceeding");
-                break 'outer;
+        true
+    }
+
+    // Apply a handful of chunks on the fresh session before the first drop.
+    drain_n(&mut recv, &mut applied, &mut counter, 3).await;
+
+    // ── Disconnect → reattach cycles ───────────────────────────────────────────
+    let mut cur_conn = conn;
+    let mut cur_ep = ep;
+    let mut _cur_dir = _dir;
+
+    for cycle in 0..CYCLES {
+        // Abrupt drop (no SessionClose, NO Ack) → orphan with un-applied tail.
+        cur_conn.close(1u32.into(), b"test transport loss");
+        drop(send);
+        drop(recv);
+        drop(cur_conn);
+        cur_ep.close(0u32.into(), b"done");
+        drop(cur_ep);
+
+        // Wait for the server to orphan the session.
+        let orphan_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if registry.total_orphans() >= 1 {
+                break;
             }
-            panic!(
-                "shell did not print any LINE output within 10s; got: {:?}",
-                &s[..s.len().min(200)]
+            if std::time::Instant::now() > orphan_deadline {
+                panic!("server did not orphan within 5s (cycle {cycle})");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Reconnect with the SAME key; reattach using the REAL counter value.
+        let (ep2, dir2) = client_endpoint_for(&client_key);
+        let conn2 = client::connect(&ep2, server.addr, HOST)
+            .await
+            .expect("reconnect");
+        let (mut send2, mut recv2) = conn2.open_bi().await.expect("open bi");
+        client::send_reattach(&mut send2, token, counter.last_acked_seq())
+            .await
+            .expect("send reattach");
+
+        let outcome = client::await_reattach_reply(&mut recv2)
+            .await
+            .expect("await_reattach_reply");
+        let replaying_from_seq = match outcome {
+            ReattachOutcome::Ok { new_token, replaying_from_seq, truncated } => {
+                assert!(!truncated, "64 KiB buffer must not truncate {TOTAL_MARKERS} tiny markers (cycle {cycle})");
+                token = new_token;
+                replaying_from_seq
+            }
+            ReattachOutcome::Err => panic!("reattach must succeed (cycle {cycle})"),
+        };
+        // Rebase exactly as the production client does.
+        counter.rebase_on_reattach(replaying_from_seq);
+
+        // Apply a couple more chunks this cycle (drain everything on the final
+        // cycle via the large target + idle cutoff).
+        let take = if cycle == CYCLES - 1 { u32::MAX } else { 2 };
+        drain_n(&mut recv2, &mut applied, &mut counter, take).await;
+
+        send = send2;
+        recv = recv2;
+        cur_conn = conn2;
+        cur_ep = ep2;
+        _cur_dir = dir2;
+    }
+
+    // Final top-up: the last cycle already drained to idle, but make sure the
+    // terminal marker landed (bounded by idle cutoff inside drain_n).
+    drain_n(&mut recv, &mut applied, &mut counter, u32::MAX).await;
+
+    // Clean up: unblock the shell's `read` so it exits immediately.
+    let _ = client::send_input(&mut send, b"\n").await;
+    drop(send);
+    drop(recv);
+    cur_conn.close(0u32.into(), b"done");
+    cur_ep.close(0u32.into(), b"done");
+
+    // ── BYTE-EXACT ASSERTION: every marker exactly once, in order ──────────────
+    let text = String::from_utf8_lossy(&applied).into_owned();
+    let mut last_idx: Option<usize> = None;
+    for i in 0..TOTAL_MARKERS {
+        let marker = format!("MARK{i:06}");
+        let occurrences = text.matches(&marker).count();
+        assert_eq!(
+            occurrences, 1,
+            "marker {marker} must appear EXACTLY once (no drop, no dup); appeared {occurrences} times.\n\
+             Counter ended at {}.\nApplied transcript:\n{}",
+            counter.last_acked_seq(),
+            &text[..text.len().min(2000)]
+        );
+        // Strictly-increasing order: each marker appears after the previous one.
+        let idx = text.find(&marker).unwrap();
+        if let Some(prev) = last_idx {
+            assert!(
+                idx > prev,
+                "marker {marker} must appear AFTER the previous marker (ordering); got idx {idx} <= {prev}"
             );
         }
+        last_idx = Some(idx);
     }
-
-    // Abruptly drop (no SessionClose) → orphan.
-    conn1.close(1u32.into(), b"test transport loss");
-    drop(send1); drop(recv1); drop(conn1);
-    ep1.close(0u32.into(), b"done");
-    drop(ep1);
-
-    // Wait for orphan.
-    let orphan_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if registry.total_orphans() >= 1 { break; }
-        if std::time::Instant::now() > orphan_deadline {
-            panic!("server did not show an orphan within 5s");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Reconnect with the SAME key (last_acked_seq = 0 → replay from beginning).
-    let (ep2, _dir2) = client_endpoint_for(&client_key);
-    let conn2 = client::connect(&ep2, server.addr, HOST).await.expect("reconnect");
-    let (mut send2, mut recv2) = conn2.open_bi().await.expect("open bi");
-    client::send_reattach(&mut send2, token, 0).await.expect("send reattach");
-
-    // Read the ReattachOk reply.
-    let reattach_outcome = client::await_reattach_reply(&mut recv2)
-        .await
-        .expect("await_reattach_reply");
-    assert!(
-        matches!(reattach_outcome, ReattachOutcome::Ok { .. }),
-        "reattach must succeed, got {reattach_outcome:?}"
-    );
-
-    // Drain output from the replay stream until we see LINE markers or timeout.
-    let mut replay_output = Vec::new();
-    let replay_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match tokio::time::timeout(Duration::from_secs(3), nosh_proto::read_message(&mut recv2)).await {
-            Ok(Ok(nosh_proto::Message::PtyData { data })) => {
-                replay_output.extend_from_slice(&data);
-                // Stop once we have enough output.
-                let s = String::from_utf8_lossy(&replay_output);
-                if s.contains("LINE1") && s.contains("LINE5") {
-                    break;
-                }
-            }
-            Ok(Ok(_)) | Err(_) => {
-                // Timeout or non-PtyData: check if we have enough.
-                let s = String::from_utf8_lossy(&replay_output);
-                if s.contains("LINE1") { break; }
-            }
-            Ok(Err(_)) => break,
-        }
-        if std::time::Instant::now() > replay_deadline { break; }
-    }
-
-    // Send SessionClose to clean up the long-running shell.
-    let _ = client::send_input(&mut send2, b"exit 0\n").await;
-    drop(send2); drop(recv2);
-    conn2.close(0u32.into(), b"done");
-    ep2.close(0u32.into(), b"done");
-
-    // Assert: replay contains LINE markers from the pre-drop output.
-    let replay_str = String::from_utf8_lossy(&replay_output);
-    assert!(
-        replay_str.contains("LINE1"),
-        "replay must contain LINE1 (buffered before drop); replay: {:?}",
-        &replay_str[..replay_str.len().min(500)]
-    );
-    let mut found_lines = std::collections::BTreeSet::new();
-    for i in 1..=10u32 {
-        if replay_str.contains(&format!("LINE{i}")) {
-            found_lines.insert(i);
-        }
-    }
-    assert!(
-        found_lines.len() >= 3,
-        "replay must contain at least 3 LINE markers (no-gap / no-drop SC#1); found: {found_lines:?}; replay: {:?}",
-        &replay_str[..replay_str.len().min(500)]
-    );
 }
 
 // ── SC#2/#3: two-factor auth / no-oracle ─────────────────────────────────────

@@ -281,9 +281,18 @@ async fn reattach_session(
             if truncated {
                 eprintln!("\r\nnosh: output truncated\r");
             }
-            // Replay: continue from replaying_from_seq. The replayed PtyData
-            // frames will advance highest_applied via run_pump.
-            *highest_applied = replaying_from_seq.saturating_sub(1);
+            // Rebase the applied-count to the server's first replayed seq
+            // (next-expected-seq convention). `replaying_from_seq` is the seq
+            // of the FIRST chunk the server is about to replay; after run_pump
+            // applies that chunk it will increment highest_applied to
+            // `replaying_from_seq + 1`, which is the correct next-expected.
+            //
+            // This MUST be `= replaying_from_seq`, NOT `replaying_from_seq - 1`:
+            // the prior `- 1` was the compounding off-by-one that dropped one
+            // chunk per reconnect cycle (ROAM-02 BLOCKER). On truncation,
+            // `replaying_from_seq == lowest_retained_seq` so this resyncs the
+            // baseline to exactly what the server is sending.
+            *highest_applied = replaying_from_seq;
             run_pump(&mut send, &mut recv, highest_applied, winch, *highest_applied).await
         }
     }
