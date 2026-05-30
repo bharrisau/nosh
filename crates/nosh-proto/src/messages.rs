@@ -151,3 +151,57 @@ pub enum Message {
         seq: u64,
     },
 }
+
+impl Message {
+    /// The variant's static name, with NO payload. Use this for logging instead
+    /// of `Debug` (`{:?}`): several variants (`SessionOpened`, `Reattach`,
+    /// `ReattachOk`) carry CSPRNG token bytes, and the D-07 invariant forbids
+    /// ever logging a token. Logging the variant name is always safe.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Message::SessionOpen { .. } => "SessionOpen",
+            Message::PtyData { .. } => "PtyData",
+            Message::Resize { .. } => "Resize",
+            Message::SessionClose { .. } => "SessionClose",
+            Message::SessionOpened { .. } => "SessionOpened",
+            Message::Reattach { .. } => "Reattach",
+            Message::ReattachOk { .. } => "ReattachOk",
+            Message::ReattachErr => "ReattachErr",
+            Message::Ack { .. } => "Ack",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W3 / D-07: `variant_name` must render ONLY the variant name for
+    /// token-bearing variants — never the token bytes. This is the safe
+    /// logging path that replaces `Debug` at every dispatch/error site.
+    #[test]
+    fn variant_name_never_leaks_token_bytes() {
+        let secret = [0xABu8; 16];
+        for (msg, expected) in [
+            (Message::SessionOpened { token: secret }, "SessionOpened"),
+            (
+                Message::Reattach { token: secret, last_acked_seq: 7 },
+                "Reattach",
+            ),
+            (
+                Message::ReattachOk { new_token: secret, replaying_from_seq: 3, truncated: false },
+                "ReattachOk",
+            ),
+            (Message::ReattachErr, "ReattachErr"),
+            (Message::Ack { seq: 1 }, "Ack"),
+        ] {
+            let name = msg.variant_name();
+            assert_eq!(name, expected);
+            // The hex of the secret token must NOT appear anywhere in the name.
+            assert!(
+                !name.to_lowercase().contains("ab"),
+                "variant_name must not contain token bytes: {name}"
+            );
+        }
+    }
+}

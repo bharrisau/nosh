@@ -275,7 +275,8 @@ pub async fn open_session_with_token(
     // registering the slot (before any PTY output — guaranteed by the server).
     match nosh_proto::read_message(&mut recv).await {
         Ok(Message::SessionOpened { token }) => Ok((send, recv, token)),
-        Ok(other) => anyhow::bail!("expected SessionOpened, got {:?}", other),
+        // W3 / D-07: never Debug a frame (could carry a token) — use the variant name.
+        Ok(other) => anyhow::bail!("expected SessionOpened, got {}", other.variant_name()),
         Err(e) => anyhow::bail!("failed to read SessionOpened: {e}"),
     }
 }
@@ -320,7 +321,8 @@ pub async fn await_reattach_reply(recv: &mut quinn::RecvStream) -> anyhow::Resul
             truncated,
         }),
         Ok(Message::ReattachErr) => Ok(ReattachOutcome::Err),
-        Ok(other) => anyhow::bail!("unexpected reply to Reattach: {:?}", other),
+        // W3 / D-07: never Debug a frame (could carry a token) — use the variant name.
+        Ok(other) => anyhow::bail!("unexpected reply to Reattach: {}", other.variant_name()),
         Err(e) => anyhow::bail!("failed to read reattach reply: {e}"),
     }
 }

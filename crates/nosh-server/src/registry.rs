@@ -1512,7 +1512,6 @@ mod tests {
         use crate::session;
         use std::io::{Read as _, Write as _};
 
-        let key = test_key(0x77);
         let registry = SessionRegistry::new(5, Duration::ZERO);
 
         // Open a real /bin/sh and KEEP the writer (the server stores it in the

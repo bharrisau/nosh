@@ -241,7 +241,9 @@ async fn handle_connection(
             run_reattach_session(conn, peer, peer_identity, send, recv, (token, last_acked_seq), registry).await
         }
         Ok(other) => {
-            tracing::warn!(%peer, ?other, "expected SessionOpen or Reattach as first frame");
+            // W3 / D-07: NEVER Debug-log the message — SessionOpened / ReattachOk
+            // would print a token. Log only the variant name (no payload).
+            tracing::warn!(%peer, frame = other.variant_name(), "expected SessionOpen or Reattach as first frame");
             conn.close(CLOSE_PROTOCOL.into(), b"expected SessionOpen or Reattach");
             Ok(())
         }
