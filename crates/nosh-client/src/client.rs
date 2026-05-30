@@ -179,15 +179,30 @@ pub fn make_endpoint_with_transport(
 
 /// Connect to `server_addr` and assert the negotiated ALPN is `nosh/0`
 /// (TRANS-01). Returns the established connection.
+///
+/// `connect_timeout` bounds the QUIC handshake establishment wait. If no
+/// server responds within the timeout, an error naming the address and timeout
+/// is returned (T-09-05 DoS hardening — a dead/black-hole server no longer
+/// hangs the client indefinitely).
 pub async fn connect(
     endpoint: &quinn::Endpoint,
     server_addr: SocketAddr,
     host: &str,
+    connect_timeout: std::time::Duration,
 ) -> anyhow::Result<quinn::Connection> {
-    let conn = endpoint
+    let connecting = endpoint
         .connect(server_addr, host)
-        .context("start connect")?
+        .context("start connect")?;
+    let conn = tokio::time::timeout(connect_timeout, connecting)
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "connection to {}:{} timed out after {}s (no response from server)",
+                server_addr.ip(),
+                server_addr.port(),
+                connect_timeout.as_secs_f64().round() as u64,
+            )
+        })?
         .context("await connection")?;
 
     let alpn = conn

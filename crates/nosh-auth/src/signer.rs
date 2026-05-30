@@ -12,6 +12,10 @@
 //!   passes the fully-constructed CertificateVerify input (RFC 8446 §4.4.3) as
 //!   `message`; we sign it raw — we MUST NOT reconstruct it (PITFALL 8).
 
+// PathBuf is only used by the #[cfg(unix)] AgentSigner (socket_path field and
+// new() constructor). Gate the import to silence the unused-import warning on
+// Windows builds (STATE.md 2026-05-30 finding: signer.rs:15 unused on Windows).
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 

@@ -70,7 +70,7 @@ async fn run_migration_test() {
     )
     .expect("client endpoint with qlog");
 
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("mutual auth handshake");
 

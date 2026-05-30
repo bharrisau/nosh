@@ -37,7 +37,7 @@ async fn mutual_auth_inprocess_happy_path() {
     let dir = tempfile::tempdir().unwrap();
     let kh = dir.path().join("known_hosts");
     let endpoint = common::client_endpoint(client_key.client_identity(), kh).unwrap();
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("mutual auth handshake should succeed");
 
@@ -76,7 +76,7 @@ async fn unknown_client_key_rejected() {
 /// returns false. Used by the negative auth tests, where the connection is
 /// rejected and this must return false.
 async fn auth_usable(endpoint: &quinn::Endpoint, addr: std::net::SocketAddr) -> bool {
-    match client::connect(endpoint, addr, HOST).await {
+    match client::connect(endpoint, addr, HOST, Duration::from_secs(30)).await {
         Ok(conn) => common::session_marker_usable(&conn, "auth-probe-marker").await,
         Err(_) => false,
     }
@@ -106,7 +106,7 @@ async fn host_key_mismatch_aborts() {
     .unwrap();
 
     let endpoint = common::client_endpoint(client_key.client_identity(), kh).unwrap();
-    let result = client::connect(&endpoint, server.addr, HOST).await;
+    let result = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30)).await;
     assert!(
         result.is_err(),
         "host key mismatch must abort the client connection (no overwrite)"
@@ -127,7 +127,7 @@ async fn tofu_first_contact_records() {
     assert!(!kh.exists());
 
     let endpoint = common::client_endpoint(client_key.client_identity(), kh.clone()).unwrap();
-    let _conn = client::connect(&endpoint, server.addr, HOST)
+    let _conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("TOFU first contact should proceed");
 
@@ -232,7 +232,7 @@ async fn agent_ed25519_handshake_live() {
     let dir = tempfile::tempdir().unwrap();
     let kh = dir.path().join("known_hosts");
     let endpoint = common::client_endpoint(identity, kh).unwrap();
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("live ssh-agent mutual auth handshake should succeed");
 
@@ -282,7 +282,7 @@ async fn preauth_flood_bounded() {
     let endpoint = common::client_endpoint(client_key.client_identity(), kh).unwrap();
     let conn = tokio::time::timeout(
         Duration::from_secs(10),
-        client::connect(&endpoint, server.addr, HOST),
+        client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30)),
     )
     .await
     .expect("server stayed responsive under flood")

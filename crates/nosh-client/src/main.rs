@@ -270,6 +270,13 @@ struct Args {
     /// Default `~/.ssh/known_hosts`.
     #[arg(long)]
     known_hosts: Option<PathBuf>,
+
+    /// Timeout in seconds for the initial QUIC connection handshake.
+    /// If the server does not respond within this window, the client
+    /// reports a clear error and enters the reconnect backoff loop.
+    /// Default 10 seconds.
+    #[arg(long, default_value_t = 10)]
+    connect_timeout: u64,
 }
 
 fn default_known_hosts() -> anyhow::Result<PathBuf> {
@@ -373,6 +380,9 @@ async fn main() -> anyhow::Result<()> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
+    // Build the connect timeout once from the CLI argument.
+    let connect_timeout = Duration::from_secs(args.connect_timeout);
+
     // Per-session reconnect state held across reconnects (D-01 in-memory only).
     let mut token: Option<[u8; 16]> = None; // None = no session yet
     let mut highest_applied: u64 = 0;       // highest seq applied to terminal
@@ -403,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let conn = match client::connect(&endpoint, server_addr, &args.host).await {
+        let conn = match client::connect(&endpoint, server_addr, &args.host, connect_timeout).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("connect failed: {e}");

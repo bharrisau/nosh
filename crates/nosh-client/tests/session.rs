@@ -40,7 +40,7 @@ async fn connect_session_server() -> Option<(quinn::Endpoint, quinn::Connection,
     let dir = tempfile::tempdir().unwrap();
     let kh = dir.path().join("known_hosts");
     let endpoint = common::client_endpoint(client_key.client_identity(), kh).unwrap();
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("mutual auth handshake");
     Some((endpoint, conn, server))

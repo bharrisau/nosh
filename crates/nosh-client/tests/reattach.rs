@@ -121,7 +121,7 @@ async fn reattach_replays_unacked_output_byte_exact() {
 
     // ── Fresh session ────────────────────────────────────────────────────────
     let (ep, _dir) = client_endpoint_for(&client_key);
-    let conn = client::connect(&ep, server.addr, HOST).await.expect("connect");
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30)).await.expect("connect");
     let (mut send, mut recv, mut token) =
         client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
             .await
@@ -226,7 +226,7 @@ async fn reattach_replays_unacked_output_byte_exact() {
 
         // Reconnect with the SAME key; reattach using the REAL counter value.
         let (ep2, dir2) = client_endpoint_for(&client_key);
-        let conn2 = client::connect(&ep2, server.addr, HOST)
+        let conn2 = client::connect(&ep2, server.addr, HOST, Duration::from_secs(30))
             .await
             .expect("reconnect");
         let (mut send2, mut recv2) = conn2.open_bi().await.expect("open bi");
@@ -325,7 +325,7 @@ async fn reattach_wrong_key_rejected_like_bad_token() {
 
     // Connect with key A, open session, capture token, then drop → orphan.
     let (ep_a1, _dir_a1) = client_endpoint_for(&key_a);
-    let conn_a1 = client::connect(&ep_a1, server.addr, HOST).await.expect("connect A");
+    let conn_a1 = client::connect(&ep_a1, server.addr, HOST, Duration::from_secs(30)).await.expect("connect A");
     let (_send, _recv, token_a) =
         client::open_session_with_token(&conn_a1, "xterm".to_string(), 80, 24, vec![])
             .await
@@ -348,7 +348,7 @@ async fn reattach_wrong_key_rejected_like_bad_token() {
 
     // Case 1: valid token_a, but reconnect with key B (wrong identity) → Err.
     let (ep_b, _dir_b) = client_endpoint_for(&key_b);
-    let conn_b = client::connect(&ep_b, server.addr, HOST).await.expect("connect B");
+    let conn_b = client::connect(&ep_b, server.addr, HOST, Duration::from_secs(30)).await.expect("connect B");
     let (outcome_b, _, _) = client::reattach_collect(&conn_b, token_a, 0)
         .await
         .expect("reattach with wrong key");
@@ -364,7 +364,7 @@ async fn reattach_wrong_key_rejected_like_bad_token() {
     // Case 2: bogus token, right identity A → Err.
     let bogus_token = [0xDEu8; 16];
     let (ep_a2, _dir_a2) = client_endpoint_for(&key_a);
-    let conn_a2 = client::connect(&ep_a2, server.addr, HOST).await.expect("connect A2");
+    let conn_a2 = client::connect(&ep_a2, server.addr, HOST, Duration::from_secs(30)).await.expect("connect A2");
     let (outcome_a2, _, _) = client::reattach_collect(&conn_a2, bogus_token, 0)
         .await
         .expect("reattach with bogus token");
@@ -402,7 +402,7 @@ async fn reattach_rejected_while_session_active() {
 
     // Connect with key A and KEEP the connection active (do NOT drop).
     let (ep1, _dir1) = client_endpoint_for(&client_key);
-    let conn1 = client::connect(&ep1, server.addr, HOST).await.expect("connect 1");
+    let conn1 = client::connect(&ep1, server.addr, HOST, Duration::from_secs(30)).await.expect("connect 1");
     let (_send1, _recv1, token) =
         client::open_session_with_token(&conn1, "xterm".to_string(), 80, 24, vec![])
             .await
@@ -413,7 +413,7 @@ async fn reattach_rejected_while_session_active() {
 
     // From a second endpoint with the SAME key, attempt to reattach the Active session.
     let (ep2, _dir2) = client_endpoint_for(&client_key);
-    let conn2 = client::connect(&ep2, server.addr, HOST).await.expect("connect 2");
+    let conn2 = client::connect(&ep2, server.addr, HOST, Duration::from_secs(30)).await.expect("connect 2");
     let (outcome2, _, _) = client::reattach_collect(&conn2, token, 0)
         .await
         .expect("reattach_collect for active slot");

@@ -63,7 +63,7 @@ async fn shell_exit_does_not_orphan() {
     let registry = SessionRegistry::new(5, Duration::ZERO);
     let (endpoint, server) = server_with_registry(registry.clone()).await;
 
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
 
@@ -100,7 +100,7 @@ async fn clean_session_close_does_not_orphan() {
     let registry = SessionRegistry::new(5, Duration::ZERO);
     let (endpoint, server) = server_with_registry(registry.clone()).await;
 
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
 
@@ -142,7 +142,7 @@ async fn transport_loss_orphans_without_sighup() {
     let registry = SessionRegistry::new(5, Duration::ZERO);
     let (endpoint, server) = server_with_registry(registry.clone()).await;
 
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
 

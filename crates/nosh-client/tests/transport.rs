@@ -45,7 +45,7 @@ async fn connect(h: &Harness) -> (quinn::Endpoint, quinn::Connection) {
     let kh = h.dir.path().join("known_hosts");
     let endpoint =
         common::client_endpoint(h.client_key.client_identity(), kh).expect("client endpoint");
-    let conn = client::connect(&endpoint, h.server.addr, HOST)
+    let conn = client::connect(&endpoint, h.server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
     (endpoint, conn)

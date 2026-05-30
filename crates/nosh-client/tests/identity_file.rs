@@ -51,7 +51,7 @@ async fn identity_file_mutual_auth_happy_path() {
     let endpoint = common::client_endpoint(identity, kh).unwrap();
 
     // Connect with mutual auth using the file-backed identity.
-    let conn = client::connect(&endpoint, server.addr, HOST)
+    let conn = client::connect(&endpoint, server.addr, HOST, std::time::Duration::from_secs(30))
         .await
         .expect("file-key mutual auth should succeed");
 
