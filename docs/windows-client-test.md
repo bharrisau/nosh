@@ -107,19 +107,36 @@ Record PASSED or FAILED for each item:
 ## Operator Sign-off
 
 ```
-Test date:    _______________
-Windows host: Windows _____ (version)
-Terminal:     _______________
-Server IP:    _______________
-Key type:     Ed25519 (unencrypted)
+Test date:    2026-05-30
+Windows host: Windows (native, no WSL)
+Terminal:     Windows Terminal / PowerShell
+Server IP:    10.209.1.5:4433
+Key type:     Ed25519 (unencrypted, C:\Users\bharris\.ssh\id_ed25519)
 
-Overall result: [ ] PASSED  [ ] FAILED (see notes below)
+Overall result: [x] PASSED  [ ] FAILED (see notes below)
 
 Notes / failures:
-_______________________________________________
-_______________________________________________
+PASSED after Phase 9 fixes. Confirmed on the live Windows host: SSH-key auth,
+interactive shell, TERM/LANG/UTF-8 rendering, window resize, and NETWORK ROAMING
+(QUIC migration survived a real path change with no re-auth). Full-screen TUI
+input works: vim opens in NORMAL mode, arrow/up-down keys navigate, less is
+controllable. ssh-style `~.` quits the client locally; Ctrl-C interrupts the
+REMOTE command (forwarded as 0x03), not the client. Clean `exit` returns to a
+normal PowerShell prompt (terminal restored).
 
-Operator: _______________
+Required follow-up fixes (committed during validation):
+  1c6afde  HANDLE is *mut c_void in windows-sys 0.59 (Windows build was broken)
+  f83093e  poll terminal::size() for resize instead of EventStream (EventStream
+           was draining the console input queue, splitting VT sequences →
+           vim REPLACE mode + dead arrow keys)
+  263a60b  restore terminal before std::process::exit (Drop was being skipped)
+
+Known non-issues (expected): Windows ACL permission warning (std::fs cannot read
+ACLs — documented limitation); quinn_udp WSAEMSGSIZE warning (connection succeeds;
+deferred GSO investigation); exit code 130 after Ctrl-C'd command then `exit`
+(faithful propagation of the remote shell's exit status, same as ssh).
+
+Operator: bharris
 ```
 
 ---

@@ -95,3 +95,17 @@ Three items carry **non-blocking** Windows-host runtime confirmation (consistent
 
 _Verified: 2026-05-30_
 _Verifier: Claude (gsd-verifier, opus, adversarial pass)_
+
+---
+
+## Post-Verification Addendum — Windows-host validation PASSED (2026-05-30)
+
+The `human_needed` Windows-runtime items (success criteria 1, 2, 6 + the Windows runtime of item 2) were validated on a live native-Windows host against the Linux server and **PASSED**, after three follow-up fixes found during validation (the Windows `#[cfg(windows)]` path had never been compiled before — the deferred CI gate never ran):
+
+- `1c6afde` — Windows build fix: `HANDLE` is `*mut c_void` in windows-sys 0.59 (the Drop-path null check used `!= 0`, which only compiles against the old 0.52 `isize` type). The opus verification had inspected against 0.52 — wrong version.
+- `f83093e` — **the real VT-input fix**: resize was watched via `crossterm::EventStream`, which calls `ReadConsoleInput` and drained the console input queue concurrently with `tokio::io::stdin`. Two readers split multi-byte VT sequences (cursor-position reply `ESC[…R` → bare `R` → vim REPLACE mode; arrow escapes broken). Fixed by polling `terminal::size()` so stdin is the sole console reader. The VT-console-mode change alone (item 1) was necessary but insufficient until this landed.
+- `263a60b` — `std::process::exit` skips destructors, so `RawModeGuard::drop` never ran → terminal not restored on exit. Now drops the guard explicitly first.
+
+**Confirmed by operator (docs/windows-client-test.md sign-off):** vim opens in NORMAL mode, arrows/PageUp-Down navigate, `less` controllable, `~.` quits the client, Ctrl-C interrupts the remote command, clean `exit` restores the PowerShell prompt, and network roaming survives a real path change. Exit code 130 after a Ctrl-C'd command + `exit` is faithful remote-shell exit-status propagation (matches ssh), not a defect.
+
+**Status upgrade:** all 6 success criteria now confirmed (Linux + Windows host). Remaining loose end is process, not code: wire a git remote so `windows-cross.yml` CI compiles the `#[cfg(windows)]` path on every push (would have caught `1c6afde`).
