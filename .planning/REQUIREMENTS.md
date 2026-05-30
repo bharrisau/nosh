@@ -29,10 +29,10 @@ Threading the authenticated SSH identity into the server-side session is the arc
 
 A bounded Windows *client* slice talking to a Linux server. Native Windows *server* (ConPTY) remains deferred (PLAT-01, M6).
 
-- [ ] **WIN-01**: A native Windows client (no WSL) connects to and authenticates against a Linux nosh server; the client crate cross-compiles cleanly for the Windows target
-- [ ] **WIN-02**: The Windows client signs the auth handshake from an on-disk OpenSSH Ed25519 private key (selected via an identity-file flag), without ssh-agent — a temporary, Windows-only, documented exception to the "never handle the private key directly" invariant, with the key held in the narrowest possible scope
-- [ ] **WIN-03**: The Windows client provides raw VT input/output mode and propagates terminal-resize events to the server PTY (using Windows console resize events, not SIGWINCH)
-- [ ] **WIN-04**: The Windows client propagates `TERM` (defaulting to `xterm-256color`) and locale so the remote shell renders correctly
+- [x] **WIN-01**: A native Windows client (no WSL) connects to and authenticates against a Linux nosh server; the client crate cross-compiles cleanly for the Windows target
+- [x] **WIN-02**: The Windows client signs the auth handshake from an on-disk OpenSSH Ed25519 private key (selected via an identity-file flag), without ssh-agent — a temporary, Windows-only, documented exception to the "never handle the private key directly" invariant, with the key held in the narrowest possible scope
+- [x] **WIN-03**: The Windows client provides raw VT input/output mode and propagates terminal-resize events to the server PTY (using Windows console resize events, not SIGWINCH)
+- [x] **WIN-04**: The Windows client propagates `TERM` (defaulting to `xterm-256color`) and locale so the remote shell renders correctly
 
 ## v2 Requirements
 
@@ -93,10 +93,10 @@ Which phases cover which requirements. Phase numbering continues from v1.0 (ende
 | PERSIST-01 | Phase 5 | Pending |
 | PERSIST-02 | Phase 5 | Pending |
 | PERSIST-03 | Phase 5 | Pending |
-| WIN-01 | Phase 8 | Pending |
-| WIN-02 | Phase 8 | Pending |
-| WIN-03 | Phase 8 | Pending |
-| WIN-04 | Phase 8 | Pending |
+| WIN-01 | Phase 8 | Complete |
+| WIN-02 | Phase 8 | Complete |
+| WIN-03 | Phase 8 | Complete |
+| WIN-04 | Phase 8 | Complete |
 
 **Coverage:**
 - v1.1 requirements: 11 total
