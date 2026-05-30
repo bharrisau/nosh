@@ -17,7 +17,6 @@ nosh-proto = { path = "../nosh-proto" }
 nosh-auth = { path = "../nosh-auth" }
 quinn = { workspace = true }
 rustls = { workspace = true }
-rcgen = { workspace = true }
 tokio = { workspace = true, features = ["signal", "io-std"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
