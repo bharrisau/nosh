@@ -1,40 +1,28 @@
 {
   "version": "1.0",
   "timestamp": "2026-05-30T00:00:00.000Z",
-  "source": "gsd:execute-phase",
+  "source": "manual-pause",
   "partial": false,
   "phase": 6,
   "phase_name": "Cold Reattach Protocol",
   "phase_dir": ".planning/phases/06-cold-reattach-protocol",
   "plan": null,
   "task": null,
-  "total_tasks": 15,
-  "status": "phase-complete",
-  "completed_tasks": [
-    "06-01: Add five reattach Message variants",
-    "06-01: Round-trip test the new variants",
-    "06-02: Add Reconnecting state and audit all SlotState uses",
-    "06-02: Add a single-use token to SessionSlot",
-    "06-02: Add SequencedOutputBuffer::replay_from and trim_acked",
-    "06-02: Add SessionSlot replay/trim delegates",
-    "06-02: Implement SessionRegistry::reattach (two-factor, atomic, opaque)",
-    "06-02: Unit tests for reattach, replay, trim, rotation, mutual exclusion",
-    "06-03: Dispatch the first frame in handle_connection",
-    "06-03: Implement run_reattach_session: authorize, rebind, replay, ack",
-    "06-03: Server-side reattach integration smoke",
-    "06-04: Add reattach-aware client helpers",
-    "06-04: Wire the reconnect supervisor into the client binary",
-    "06-04: SC#1 happy-path replay integration test",
-    "06-04: SC#2/3 no-oracle negative test and SC#4 mutual-exclusion test"
-  ],
+  "total_tasks": null,
+  "status": "phase-6-complete-paused",
+  "completed_tasks": [],
   "remaining_tasks": [],
   "blockers": [],
-  "human_actions_pending": [],
-  "decisions": [],
-  "uncommitted_files": [
-    ".planning/phases/06-cold-reattach-protocol/06-VERIFICATION.md",
-    ".planning/HANDOFF.json"
+  "human_actions_pending": [
+    "Phase 7: Wi-Fi->cellular live check (non-blocking)",
+    "Phase 8: Windows interactive session (non-blocking)"
   ],
-  "next_action": "Phase 7: Connection Migration (--no-transition was set, no auto-advance)",
-  "context_notes": "Phase 6 complete. All 15 tasks done across 4 waves. cargo test --workspace green (61 tests). cargo clippy clean. All 4 roadmap success criteria covered by tests. last_acked_seq convention locked: highest-applied, server replays seq > last_acked_seq."
+  "decisions": [
+    "model_overrides pins gsd-verifier + gsd-integration-checker to opus",
+    "Verify runs as a separate opus pass, never inline; make it adversarial",
+    "Phases 4-6 done & opus-verified; Phases 7 & 8 PLANNED, need execute only"
+  ],
+  "uncommitted_files": [],
+  "next_action": "Run /gsd:resume-work, then execute Phase 7 (plans exist), opus-re-verify, then Phase 8, then milestone audit->complete->cleanup. Serialize 7 then 8 (both touch nosh-client). See .planning/.continue-here.md for full detail incl. 2 carry-forward items (reader-zombie race; W1 token-lifecycle).",
+  "context_notes": "v1.1 M3. 63 tests green, clippy clean. All phases discussed. Background agents can't spawn subagents -> run verify as its own opus agent. CARRY-FORWARD: (1) pre-existing reader-zombie race (spawn_blocking+abort doesn't interrupt blocked read) - latent, investigate; (2) Phase 6 W1 token-lifecycle wants verify confirmation."
 }
