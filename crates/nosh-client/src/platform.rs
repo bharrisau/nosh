@@ -7,11 +7,18 @@
 //! ## Resize triggers
 //!
 //! - **Unix:** `SIGWINCH` via `tokio::signal::unix::{signal, SignalKind}`.
-//! - **Windows:** `crossterm::event::EventStream` watching for
-//!   `crossterm::event::Event::Resize(_,_)` (Windows console resize events,
-//!   not SIGWINCH which does not exist on Windows). The EventStream may also
-//!   deliver key events — those are ignored here; keystroke input stays on
-//!   `tokio::io::stdin()` in the main pump loop.
+//! - **Windows:** polls `crossterm::terminal::size()` on a ~300 ms interval and
+//!   reports a resize when the dimensions change. We deliberately do NOT use
+//!   `crossterm::event::EventStream` here: EventStream calls `ReadConsoleInput`,
+//!   which DRAINS console input records — and the keystroke path
+//!   (`tokio::io::stdin()` in the main pump loop) reads the SAME console input
+//!   handle. Two concurrent readers split the input queue and corrupt multi-byte
+//!   VT sequences: a cursor-position-report reply (`ESC [ row ; col R`) gets
+//!   torn so the trailing `R` reaches the remote shell as a bare keystroke (vim
+//!   → REPLACE mode), and arrow/function-key escapes (`ESC [ A` …) break.
+//!   `terminal::size()` queries `GetConsoleScreenBufferInfo` and never touches
+//!   the input queue, so `tokio::io::stdin()` stays the SOLE console reader and
+//!   receives intact VT byte sequences.
 //!
 //! After `next_resize()` returns the CALLER re-reads the authoritative terminal
 //! dimensions via `crossterm::terminal::size()`. **Do NOT trust the
@@ -38,21 +45,20 @@ pub struct ResizeWatcher {
     #[cfg(unix)]
     signal: tokio::signal::unix::Signal,
 
+    /// Interval timer that paces `terminal::size()` polling (Windows).
     #[cfg(windows)]
-    stream: crossterm::event::EventStream,
-    /// Set to `true` once `EventStream` is permanently exhausted (e.g. the
-    /// console handle was closed). When `true`, `next_resize()` parks forever
-    /// via `std::future::pending()` instead of returning immediately, which
-    /// would cause a resize-message flood in the `tokio::select!` pump loop.
+    poll: tokio::time::Interval,
+    /// Last observed `(cols, rows)`; a resize is reported only when this changes.
     #[cfg(windows)]
-    stream_done: bool,
+    last_size: (u16, u16),
 }
 
 impl ResizeWatcher {
     /// Create a new `ResizeWatcher`.
     ///
     /// On Unix: installs a SIGWINCH signal handler via `tokio::signal::unix`.
-    /// On Windows: creates a `crossterm::event::EventStream`.
+    /// On Windows: starts a ~300 ms `terminal::size()` poll (NOT EventStream —
+    /// see the module docs for why a second console-input reader is unsafe).
     pub fn new() -> anyhow::Result<Self> {
         #[cfg(unix)]
         {
@@ -65,10 +71,13 @@ impl ResizeWatcher {
 
         #[cfg(windows)]
         {
-            Ok(Self {
-                stream: crossterm::event::EventStream::new(),
-                stream_done: false,
-            })
+            let last_size = crossterm::terminal::size().unwrap_or((80, 24));
+            let mut poll =
+                tokio::time::interval(std::time::Duration::from_millis(300));
+            // Skip (don't burst) if we fall behind; first tick fires immediately
+            // but next_resize() only reports an ACTUAL change vs last_size.
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            Ok(Self { poll, last_size })
         }
 
         // Compile-time check: if neither unix nor windows, this block is empty.
@@ -95,25 +104,17 @@ impl ResizeWatcher {
 
         #[cfg(windows)]
         {
-            // If the stream was previously exhausted, park forever. Returning
-            // immediately would cause a resize-message flood in the pump loop's
-            // tokio::select! (the arm fires on every iteration once exhausted).
-            if self.stream_done {
-                std::future::pending::<()>().await;
-                return;
-            }
-            use futures::StreamExt;
-            // Loop until we see a Resize event; ignore all other events
-            // (key events etc. are handled via tokio::io::stdin in run_pump).
-            while let Some(ev) = self.stream.next().await {
-                if matches!(ev, Ok(crossterm::event::Event::Resize(_, _))) {
+            // Poll terminal::size() (GetConsoleScreenBufferInfo) — never the
+            // console INPUT queue — so we don't compete with tokio::io::stdin
+            // for keystroke bytes. Report only on an actual dimension change.
+            loop {
+                self.poll.tick().await;
+                let cur = crossterm::terminal::size().unwrap_or(self.last_size);
+                if cur != self.last_size {
+                    self.last_size = cur;
                     return;
                 }
             }
-            // Stream permanently exhausted (console handle closed or unrecoverable
-            // error). Mark done and park so the pump loop does not spin.
-            self.stream_done = true;
-            std::future::pending::<()>().await;
         }
     }
 }

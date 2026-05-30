@@ -24,12 +24,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
-# crossterm 0.29: events + event-stream for Windows console resize (Event::Resize).
-# DO NOT enable use-dev-tty: it is Unix-only and breaks Windows event-stream build
-# (crossterm #935 / Plan constraint).
-crossterm = { version = "0.29", features = ["events", "event-stream"] }
-# futures provides StreamExt for EventStream (crossterm event-stream async bound).
-futures = "0.3"
+# crossterm 0.29: terminal raw-mode + size() (resize is detected by polling
+# terminal::size(), NOT EventStream — see platform.rs: a second console-input
+# reader corrupts VT byte sequences on Windows). 'events' is a default feature;
+# we drop 'event-stream' (and its futures dep) since we no longer read events.
+# DO NOT enable use-dev-tty: Unix-only, breaks the Windows build (crossterm #935).
+crossterm = { version = "0.29", features = ["events"] }
 dirs = "5"
 
 [target.'cfg(unix)'.dependencies]

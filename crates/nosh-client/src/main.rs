@@ -18,7 +18,7 @@
 //!
 //! Resize handling is `#[cfg]`-split via [`platform::ResizeWatcher`]:
 //! - Unix: SIGWINCH → debounce → `Message::Resize`
-//! - Windows: `crossterm::event::EventStream` `Event::Resize` → debounce → `Message::Resize`
+//! - Windows: poll `crossterm::terminal::size()` (~300ms) → debounce → `Message::Resize`
 //! Both paths preserve the ~40 ms coalescing and the authoritative `terminal::size()` re-read.
 //!
 //! The reconnect-window quit uses the cross-platform `platform::quit_signal()`
@@ -37,7 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// SIGWINCH / console-resize debounce window (~40 ms) — coalesces a window-drag
 /// burst into one `Resize` (SESS-05, avoids resize storms). Preserved on both
-/// Unix (SIGWINCH) and Windows (EventStream Event::Resize).
+/// Unix (SIGWINCH) and Windows (terminal::size() polling).
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(40);
 
 /// Ack cadence: send an Ack frame roughly every 750ms when output has been
@@ -425,7 +425,7 @@ async fn main() -> anyhow::Result<()> {
     let mut backoff = BACKOFF_INITIAL;
     let mut exit_code: i32 = 0;
 
-    // Platform-abstracted resize watcher. Unix: SIGWINCH; Windows: EventStream Event::Resize.
+    // Platform-abstracted resize watcher. Unix: SIGWINCH; Windows: terminal::size() polling.
     let mut resize = platform::ResizeWatcher::new().context("install resize handler")?;
 
     // Outer reconnect supervisor loop (D-10).
@@ -674,7 +674,7 @@ async fn run_pump(
                     Err(_) => return Ok(PumpOutcome::UserQuit),
                 }
             }
-            // Terminal resize: SIGWINCH (Unix) or EventStream Event::Resize (Windows).
+            // Terminal resize: SIGWINCH (Unix) or terminal::size() poll (Windows).
             // Platform abstraction via ResizeWatcher::next_resize().
             // The AUTHORITATIVE size is re-read via crossterm::terminal::size() in
             // the resize_sleep arm (Pitfall 14 — do not trust event fields directly).
