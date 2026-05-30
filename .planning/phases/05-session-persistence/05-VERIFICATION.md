@@ -2,15 +2,33 @@
 phase: 05-session-persistence
 verified: 2026-05-30T00:00:00Z
 verifier: Claude Opus 4.8 (1M) — independent re-verification (EXTRA SCRUTINY)
-status: gaps_found
-score: 4/5 success criteria verified
+status: passed
+score: 5/5 success criteria verified (SC#5 remediated)
+remediation:
+  applied: 2026-05-30 (opus, direct fix)
+  commit: 40a8c90
+  approach: >
+    Event-driven removal. On TransportLost the orphan watcher awaits the
+    existing wait_task (shell exit; NOT aborted, so the shell keeps running —
+    SC#1 preserved) then calls SessionRegistry::remove_slot, which is
+    instance-keyed via Arc::ptr_eq and idempotent (safe against LRU eviction
+    and the future Phase 6 reattach generation swap). reap_once's try_wait
+    branch documented as a backstop for child-owning paths; idle-timeout
+    sweeping unchanged.
+  tests: >
+    New exited_orphan_removed_via_real_taken_child_path exercises the real
+    take_child→orphan→watcher path (confirmed failing before the fix, passing
+    after); reaper_removes_exited_orphan renamed to
+    reaper_backstop_removes_exited_orphan_with_owned_child; transport-loss
+    integration test strengthened to probe /proc/<pid> liveness after
+    disconnect. cargo test --workspace green; clippy -D warnings clean.
 re_verification:
   previous_verifier: sonnet (inline)
   previous_status: passed
   previous_score: 5/5
   regressions: []
   newly_found:
-    - "SC#5 reaper exit-detection is non-functional in the production path (child taken before orphaning → slot.try_wait() always None → exited orphans never removed → slot/MasterPty leak)"
+    - "SC#5 reaper exit-detection is non-functional in the production path (child taken before orphaning → slot.try_wait() always None → exited orphans never removed → slot/MasterPty leak) — REMEDIATED in 40a8c90"
 gaps:
   - truth: "A background zombie-reaper task calls child.try_wait() on all orphaned sessions; exited orphans are removed (no zombies, no leaked slots)"
     status: partial
