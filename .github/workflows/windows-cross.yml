@@ -1,0 +1,49 @@
+name: Windows Cross-Compile Check (D-01)
+
+# Automated gate for WIN-01: cargo check nosh-client for x86_64-pc-windows-gnu
+# from a Linux host (no Windows toolchain / no WSL required on the dev machine).
+#
+# Ring requires gcc-mingw-w64-x86-64 even for `cargo check` because its build.rs
+# compiles C source files unconditionally. This step installs it.
+#
+# cargo check does NOT link, so no MSVC runtime, no .exe output — this is purely
+# a Rust type-check and Windows-API-availability gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  windows-cross-check:
+    name: cargo check --target x86_64-pc-windows-gnu
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install MinGW cross-compiler
+        # ring's build.rs compiles C code and requires x86_64-w64-mingw32-gcc
+        # even for `cargo check` (no linking, but C compilation is unconditional
+        # in ring's build script).
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo check nosh-client for Windows (D-01 gate)
+        # Only check nosh-client: nosh-server, nosh-auth, and nosh-proto have no
+        # Windows-specific code and are not gated (#[cfg] only in nosh-client).
+        run: cargo check -p nosh-client --target x86_64-pc-windows-gnu

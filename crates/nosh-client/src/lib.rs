@@ -2,6 +2,7 @@
 //! exposed so integration tests can drive a client in-process.
 
 pub mod client;
+pub mod platform;
 
 pub use client::{
     build_client_config, concurrent_roundtrip, connect, datagram_roundtrip, make_endpoint,

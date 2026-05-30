@@ -283,16 +283,36 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Collect the client's whitelisted, SendEnv-style environment (D-05): `TERM`,
-/// `LANG`, `TZ`, and every `LC_*`. NEVER includes `SSH_AUTH_SOCK` or `LD_*`
-/// (the server also re-filters deny-by-default, but the client does not even
-/// offer them). Returned as ordered pairs for deterministic encoding.
+/// Collect the client's whitelisted, SendEnv-style environment (D-05 / D-09):
+/// `TERM`, `LANG`, `TZ`, and every `LC_*`. NEVER includes `SSH_AUTH_SOCK` or
+/// `LD_*` (the server also re-filters deny-by-default, but the client does not
+/// even offer them). Returned as ordered pairs for deterministic encoding.
+///
+/// `TERM` is defaulted to `xterm-256color` when not set locally; `LANG` is
+/// defaulted to `en_US.UTF-8` when not set. This matters most on Windows where
+/// neither is typically set, but also makes headless tests deterministic. The
+/// remote server re-filters env deny-by-default; both vars are on its whitelist.
 pub fn collect_client_env() -> Vec<(String, String)> {
     let mut env = Vec::new();
+    let mut has_term = false;
+    let mut has_lang = false;
     for (k, v) in std::env::vars() {
-        if k == "TERM" || k == "LANG" || k == "TZ" || k.starts_with("LC_") {
+        if k == "TERM" {
+            has_term = true;
+            env.push((k, v));
+        } else if k == "LANG" {
+            has_lang = true;
+            env.push((k, v));
+        } else if k == "TZ" || k.starts_with("LC_") {
             env.push((k, v));
         }
+    }
+    // Inject defaults when not present in the local environment.
+    if !has_term {
+        env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
+    if !has_lang {
+        env.push(("LANG".to_string(), "en_US.UTF-8".to_string()));
     }
     env
 }

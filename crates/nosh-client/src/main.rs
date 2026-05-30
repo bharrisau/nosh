@@ -2,8 +2,7 @@
 //! (Phase 2), then runs an interactive PTY session (Phase 3): the local
 //! terminal is put in raw mode (RAII-restored), keystrokes are forwarded to the
 //! remote PTY, shell output is rendered locally, window resizes propagate
-//! (SIGWINCH, coalesced), and the client process exits with the remote shell's
-//! exit code.
+//! (coalesced), and the client process exits with the remote shell's exit code.
 //!
 //! Phase 6: adds a reconnect supervisor that auto-reconnects with exponential
 //! backoff on transport drop (D-10). Holds the reattach token in memory; sends
@@ -11,12 +10,19 @@
 //! condition (D-11). The `RawModeGuard` is entered ONCE and dropped once on
 //! final exit regardless of how many reconnects occurred (RAII).
 //!
-//! Explicit quit during reconnect: Ctrl-C while the reconnecting notice is
-//! displayed (i.e. not in an active session) breaks the retry loop cleanly.
-//! This is achieved by listening for SIGINT during the backoff wait.
-//! During active session use, Ctrl-C is forwarded as 0x03 to the shell (normal
-//! shell behavior). The two behaviors don't conflict: SIGINT is only used to
-//! break the RECONNECT LOOP, not the active session (SESS-06).
+//! Phase 8: adds `--identity-file` for on-disk Ed25519 key auth (WIN-02).
+//! Auth-path selection:
+//! - If `--identity-file` is given → `ClientIdentity::from_identity_file` (all platforms).
+//! - Else on Unix → ssh-agent via `SSH_AUTH_SOCK` (existing default).
+//! - Else on Windows → default to `%USERPROFILE%\.ssh\id_ed25519`; error if absent.
+//!
+//! Resize handling is `#[cfg]`-split via [`platform::ResizeWatcher`]:
+//! - Unix: SIGWINCH → debounce → `Message::Resize`
+//! - Windows: `crossterm::event::EventStream` `Event::Resize` → debounce → `Message::Resize`
+//! Both paths preserve the ~40 ms coalescing and the authoritative `terminal::size()` re-read.
+//!
+//! The reconnect-window quit uses the cross-platform `platform::quit_signal()`
+//! (backed by `tokio::signal::ctrl_c`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -25,12 +31,13 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use nosh_client::client::{self, ClientIdentity, ReattachOutcome};
+use nosh_client::platform;
 use nosh_proto::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::signal::unix::{signal, SignalKind};
 
-/// SIGWINCH debounce window (~40 ms) — coalesces a window-drag burst into one
-/// `Resize` (SESS-05, avoids resize storms).
+/// SIGWINCH / console-resize debounce window (~40 ms) — coalesces a window-drag
+/// burst into one `Resize` (SESS-05, avoids resize storms). Preserved on both
+/// Unix (SIGWINCH) and Windows (EventStream Event::Resize).
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(40);
 
 /// Ack cadence: send an Ack frame roughly every 750ms when output has been
@@ -58,9 +65,15 @@ struct Args {
     host: String,
 
     /// Path to the identity public key selecting which ssh-agent key to use.
-    /// If omitted, the agent's single key is used (D-04).
+    /// If omitted, the agent's single key is used (Unix only, D-04).
     #[arg(long)]
     identity: Option<PathBuf>,
+
+    /// On-disk OpenSSH Ed25519 private key for authentication.
+    /// Opt-in on Linux (ssh-agent is the default); the ONLY auth path on
+    /// Windows (default: %USERPROFILE%\.ssh\id_ed25519 when flag is omitted).
+    #[arg(long)]
+    identity_file: Option<PathBuf>,
 
     /// OpenSSH `known_hosts` file for host-key pinning/TOFU (D-05/D-08).
     /// Default `~/.ssh/known_hosts`.
@@ -73,6 +86,53 @@ fn default_known_hosts() -> anyhow::Result<PathBuf> {
     Ok(home.join(".ssh").join("known_hosts"))
 }
 
+/// Resolve the client identity based on CLI args and platform.
+///
+/// Priority:
+/// 1. `--identity-file <path>` (all platforms, opt-in)
+/// 2. Unix: ssh-agent via `SSH_AUTH_SOCK` + optional `--identity` key selector
+/// 3. Windows (no --identity-file): default to `%USERPROFILE%\.ssh\id_ed25519`
+fn resolve_identity(args: &Args) -> anyhow::Result<ClientIdentity> {
+    // Branch 1: explicit --identity-file (all platforms, no SSH_AUTH_SOCK needed).
+    if let Some(ref path) = args.identity_file {
+        return ClientIdentity::from_identity_file(path);
+    }
+
+    // Branch 2: Unix — use ssh-agent (SSH_AUTH_SOCK required).
+    #[cfg(unix)]
+    {
+        let socket = std::env::var_os("SSH_AUTH_SOCK")
+            .map(PathBuf::from)
+            .context("SSH_AUTH_SOCK not set — start an ssh-agent and add your key, or use --identity-file")?;
+        return ClientIdentity::from_agent(socket, args.identity.as_deref());
+    }
+
+    // Branch 3: Windows — no ssh-agent available; default to %USERPROFILE%\.ssh\id_ed25519.
+    #[cfg(windows)]
+    {
+        let default_key = dirs::home_dir()
+            .context("locate home directory for default identity file")?
+            .join(".ssh")
+            .join("id_ed25519");
+        if default_key.exists() {
+            return ClientIdentity::from_identity_file(&default_key);
+        }
+        anyhow::bail!(
+            "no --identity-file given and no key found at {}; \
+             Windows requires --identity-file (ssh-agent is not available in this version)",
+            default_key.display()
+        );
+    }
+
+    // Fallback for platforms that are neither unix nor windows (should not occur).
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!(
+            "unsupported platform: use --identity-file to specify an Ed25519 private key"
+        );
+    }
+}
+
 /// How the pump loop ended.
 #[derive(Debug)]
 enum PumpOutcome {
@@ -80,7 +140,7 @@ enum PumpOutcome {
     CleanExit(i32),
     /// Transport dropped without a SessionClose — reconnect.
     TransportDrop,
-    /// User explicitly quit (stdin EOF, or SIGINT while active — we treat both
+    /// User explicitly quit (stdin EOF, or Ctrl-C while active — we treat both
     /// as clean exits in the interactive case).
     UserQuit,
 }
@@ -97,10 +157,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let server_addr = SocketAddr::new(args.addr, args.port);
 
-    let socket = std::env::var_os("SSH_AUTH_SOCK")
-        .map(PathBuf::from)
-        .context("SSH_AUTH_SOCK not set — start an ssh-agent and add your key")?;
-    let identity = ClientIdentity::from_agent(socket, args.identity.as_deref())?;
+    let identity = resolve_identity(&args)?;
     let known_hosts = match args.known_hosts {
         Some(p) => p,
         None => default_known_hosts()?,
@@ -120,12 +177,8 @@ async fn main() -> anyhow::Result<()> {
     let mut backoff = BACKOFF_INITIAL;
     let mut exit_code: i32 = 0;
 
-    // SIGINT during the reconnecting wait = explicit quit (D-11 escape path).
-    // This does NOT interfere with in-session Ctrl-C (forwarded as 0x03).
-    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
-
-    // Phase 6: SIGWINCH for resize debounce.
-    let mut winch = signal(SignalKind::window_change()).context("install SIGWINCH handler")?;
+    // Platform-abstracted resize watcher. Unix: SIGWINCH; Windows: EventStream Event::Resize.
+    let mut resize = platform::ResizeWatcher::new().context("install resize handler")?;
 
     // Outer reconnect supervisor loop (D-10).
     loop {
@@ -134,11 +187,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("make_endpoint failed: {e}");
-                // Wait with backoff, honouring SIGINT.
+                // Wait with backoff, honouring quit signal.
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = sigint.recv() => {
-                        // User quit during reconnect window.
+                    _ = platform::quit_signal() => {
                         eprintln!("\r\nnosh: quit\r");
                         break;
                     }
@@ -155,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("\r\nnosh: reconnecting…\r");
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = sigint.recv() => {
+                    _ = platform::quit_signal() => {
                         eprintln!("\r\nnosh: quit\r");
                         break;
                     }
@@ -174,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
                 tok,
                 highest_applied,
                 &mut highest_applied,
-                &mut winch,
+                &mut resize,
                 &mut token,
             )
             .await;
@@ -187,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
                 cols,
                 rows,
                 &mut highest_applied,
-                &mut winch,
+                &mut resize,
                 &mut token,
             )
             .await;
@@ -210,15 +262,13 @@ async fn main() -> anyhow::Result<()> {
                 // Backoff before retry.
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = sigint.recv() => {
+                    _ = platform::quit_signal() => {
                         // Explicit quit during reconnect window (D-11 escape path).
                         eprintln!("\r\nnosh: quit\r");
                         break;
                     }
                 }
                 backoff = (backoff * 2).min(BACKOFF_MAX);
-                // If we have no token (first connection never completed), don't retry
-                // forever — treat as a fatal connect failure after max backoff reached.
             }
         }
     }
@@ -235,7 +285,7 @@ async fn fresh_session(
     cols: u16,
     rows: u16,
     highest_applied: &mut u64,
-    winch: &mut tokio::signal::unix::Signal,
+    resize: &mut platform::ResizeWatcher,
     token_out: &mut Option<[u8; 16]>,
 ) -> anyhow::Result<PumpOutcome> {
     let (mut send, mut recv, tok) =
@@ -245,7 +295,7 @@ async fn fresh_session(
     // Fresh session starts at seq 0.
     *highest_applied = 0;
 
-    run_pump(&mut send, &mut recv, highest_applied, winch, 0).await
+    run_pump(&mut send, &mut recv, highest_applied, resize, 0).await
 }
 
 /// Run a reattach session. Updates `highest_applied` and `token_out` in-place.
@@ -257,7 +307,7 @@ async fn reattach_session(
     token: [u8; 16],
     last_acked_seq: u64,
     highest_applied: &mut u64,
-    winch: &mut tokio::signal::unix::Signal,
+    resize: &mut platform::ResizeWatcher,
     token_out: &mut Option<[u8; 16]>,
 ) -> anyhow::Result<PumpOutcome> {
     let (mut send, mut recv) = conn.open_bi().await.context("open bi for reattach")?;
@@ -293,7 +343,7 @@ async fn reattach_session(
             // `replaying_from_seq == lowest_retained_seq` so this resyncs the
             // baseline to exactly what the server is sending.
             *highest_applied = replaying_from_seq;
-            run_pump(&mut send, &mut recv, highest_applied, winch, *highest_applied).await
+            run_pump(&mut send, &mut recv, highest_applied, resize, *highest_applied).await
         }
     }
 }
@@ -304,7 +354,7 @@ async fn run_pump(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
     highest_applied: &mut u64,
-    winch: &mut tokio::signal::unix::Signal,
+    resize: &mut platform::ResizeWatcher,
     _seq_baseline: u64,
 ) -> anyhow::Result<PumpOutcome> {
     let mut stdin = tokio::io::stdin();
@@ -361,11 +411,15 @@ async fn run_pump(
                     Err(_) => return Ok(PumpOutcome::UserQuit),
                 }
             }
-            // Window resize signal (re)arm debounce.
-            _ = winch.recv() => {
+            // Terminal resize: SIGWINCH (Unix) or EventStream Event::Resize (Windows).
+            // Platform abstraction via ResizeWatcher::next_resize().
+            // The AUTHORITATIVE size is re-read via crossterm::terminal::size() in
+            // the resize_sleep arm (Pitfall 14 — do not trust event fields directly).
+            _ = resize.next_resize() => {
                 resize_deadline = Some(tokio::time::Instant::now() + RESIZE_DEBOUNCE);
             }
             // Debounce elapsed: send one coalesced Resize.
+            // Re-reads terminal::size() for authoritative dims (Pitfall 14).
             _ = resize_sleep => {
                 resize_deadline = None;
                 if let Ok((c, r)) = crossterm::terminal::size() {
