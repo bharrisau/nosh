@@ -33,7 +33,14 @@ jobs:
         # ring's build.rs compiles C code and requires x86_64-w64-mingw32-gcc
         # even for `cargo check` (no linking, but C compilation is unconditional
         # in ring's build script).
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        #
+        # Use the -posix threading variant: ring requires POSIX thread semantics.
+        # The generic gcc-mingw-w64-x86-64 package installs versioned binaries
+        # (e.g. x86_64-w64-mingw32-gcc-12) but the unversioned symlink may not
+        # be configured via update-alternatives on all Ubuntu images.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64-posix
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -44,6 +51,14 @@ jobs:
           key: ${{ runner.os }}-cargo-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo check nosh-client for Windows (D-01 gate)
-        # Only check nosh-client: nosh-server, nosh-auth, and nosh-proto have no
-        # Windows-specific code and are not gated (#[cfg] only in nosh-client).
+        # Only check the client binary. nosh-auth IS checked transitively as a dep.
+        # nosh-auth has #[cfg(unix)]-gated AgentSigner and a unix-conditional dep
+        # (ssh-agent-client-rs); cargo check --target windows validates those gates.
+        # nosh-server is excluded because it has no Windows-specific code or gates.
+        #
+        # CC_x86_64_pc_windows_gnu: tell the cc crate to use the explicit -posix
+        # binary so it does not rely on update-alternatives symlink discovery,
+        # which may not be configured on all Ubuntu runner images.
         run: cargo check -p nosh-client --target x86_64-pc-windows-gnu
+        env:
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc-posix
