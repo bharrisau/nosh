@@ -40,3 +40,6 @@ tempfile = "3"
 # attach a QlogStream (D-05). Feature-unification means this propagates into
 # the test binary without affecting the production binary path.
 quinn = { workspace = true, features = ["qlog"] }
+# Used by the migration test for qlog JSON-seq record validation (D-05 artifact check).
+# serde_json is already a transitive dep of the qlog crate; adding it here is low cost.
+serde_json = "1"
