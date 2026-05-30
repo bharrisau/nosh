@@ -10,8 +10,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 use nosh_auth::{
-    AgentSigner, AgentSigningKey, HostKeyVerifier, NoshClientCertResolver, RawEd25519Signer,
+    AgentSigningKey, FileSigner, HostKeyVerifier, NoshClientCertResolver, RawEd25519Signer,
 };
+#[cfg(unix)]
+use nosh_auth::AgentSigner;
 use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig};
 
@@ -31,11 +33,30 @@ impl ClientIdentity {
         Self { signer }
     }
 
+    /// Build an identity from an on-disk OpenSSH Ed25519 private key file.
+    ///
+    /// This is platform-agnostic (opt-in on Linux; the ONLY auth path on
+    /// Windows — D-03/D-04). Key material is loaded in the narrowest scope
+    /// inside [`FileSigner`] (D-05): the seed is zeroized and the
+    /// `ssh_key::PrivateKey` is dropped at end of the constructor.
+    ///
+    /// Passphrase-encrypted keys are rejected with actionable guidance (D-06).
+    pub fn from_identity_file(path: &Path) -> anyhow::Result<Self> {
+        let signer = FileSigner::from_path(path)?;
+        Ok(Self {
+            signer: Arc::new(signer),
+        })
+    }
+
     /// Build an identity backed by ssh-agent.
+    ///
+    /// Only available on Unix (ssh-agent uses Unix domain sockets — WIN-01).
+    /// On Windows, use [`from_identity_file`][Self::from_identity_file] instead.
     ///
     /// `socket_path` is the agent socket (`SSH_AUTH_SOCK`). `identity_pub`, when
     /// `Some`, selects which agent key to use (path to a `.pub`); when `None`,
     /// the agent's single key is used (error if 0 or >1).
+    #[cfg(unix)]
     pub fn from_agent(socket_path: PathBuf, identity_pub: Option<&Path>) -> anyhow::Result<Self> {
         let public_key = match identity_pub {
             Some(p) => ssh_key::PublicKey::read_openssh_file(p)
@@ -60,6 +81,7 @@ impl ClientIdentity {
     }
 }
 
+#[cfg(unix)]
 fn ssh_agent_connect(path: &Path) -> anyhow::Result<ssh_agent_client_rs::Client> {
     ssh_agent_client_rs::Client::connect(path)
         .with_context(|| format!("connect ssh-agent at {}", path.display()))

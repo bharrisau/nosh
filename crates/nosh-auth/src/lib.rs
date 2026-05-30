@@ -12,6 +12,15 @@
 //!   `known_hosts` + TOFU) and the server-side [`AuthorizedKeysVerifier`]
 //!   (`ClientCertVerifier` pinning against `authorized_keys`). Both keep REAL
 //!   TLS signature verification — never stubbed (research PITFALL 5).
+//!
+//! ## Platform gating
+//!
+//! The ONLY platform-specific cfg in this crate is a build-availability gate
+//! for the Unix-only `ssh-agent-client-rs` dependency: [`AgentSigner`] is
+//! `#[cfg(unix)]`-gated and the dep is under `[target.'cfg(unix)'.dependencies]`.
+//! This is NOT a behavioral fork — all SPKI/cert/signing logic ([`FileSigner`],
+//! [`InProcessEd25519Signer`], [`AgentSigningKey`], cert minting) is identical
+//! on every platform.
 
 pub mod keys;
 pub mod signer;
@@ -21,8 +30,16 @@ pub mod verifier;
 pub mod test_support;
 
 pub use keys::{load_authorized_keys, load_host_key, nosh_key_from_spki, NoshPublicKey, ED25519_SPKI_LEN};
+
+// AgentSigner is only available on Unix (ssh-agent uses Unix domain sockets).
+// The dep (ssh-agent-client-rs) is under [target.'cfg(unix)'.dependencies].
+#[cfg(unix)]
+pub use signer::AgentSigner;
+
+// All other signer types — FileSigner, InProcessEd25519Signer, AgentSigningKey,
+// cert minting, resolvers, and the RawEd25519Signer trait — are platform-agnostic.
 pub use signer::{
-    mint_self_signed_cert, AgentSigner, AgentSigningKey, InProcessEd25519Signer,
+    mint_self_signed_cert, AgentSigningKey, FileSigner, InProcessEd25519Signer,
     NoshClientCertResolver, NoshServerCertResolver, RawEd25519Signer,
 };
 pub use verifier::{AuthorizedKeysVerifier, HostKeyVerifier};

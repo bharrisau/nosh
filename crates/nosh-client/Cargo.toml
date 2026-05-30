@@ -24,9 +24,14 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
-ssh-agent-client-rs = "1.1"
 crossterm = "0.28"
 dirs = "5"
+
+[target.'cfg(unix)'.dependencies]
+# ssh-agent-client-rs uses Unix domain sockets — not available on Windows.
+# The agent code path in client.rs (from_agent, ssh_agent_connect) is
+# #[cfg(unix)]-gated to match.
+ssh-agent-client-rs = "1.1"
 
 [dev-dependencies]
 nosh-server = { path = "../nosh-server" }

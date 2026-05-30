@@ -32,6 +32,10 @@ pub trait RawEd25519Signer: Send + Sync + std::fmt::Debug {
 
 /// Signs via the ssh-agent at `socket_path` for the given Ed25519 identity.
 /// The private key is never handled by nosh (AUTH-04 / decision D-04).
+///
+/// Only available on Unix (the ssh-agent protocol uses Unix domain sockets).
+/// The Windows build uses [`FileSigner`] instead (WIN-01).
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct AgentSigner {
     socket_path: PathBuf,
@@ -39,6 +43,7 @@ pub struct AgentSigner {
     key32: [u8; 32],
 }
 
+#[cfg(unix)]
 impl AgentSigner {
     /// Build an agent signer for `public_key`, talking to the agent socket at
     /// `socket_path` (typically `$SSH_AUTH_SOCK`). Rejects non-Ed25519 keys.
@@ -56,6 +61,7 @@ impl AgentSigner {
     }
 }
 
+#[cfg(unix)]
 impl RawEd25519Signer for AgentSigner {
     fn sign(&self, msg: &[u8]) -> anyhow::Result<[u8; 64]> {
         let mut client = ssh_agent_client_rs::Client::connect(&self.socket_path)
@@ -107,6 +113,124 @@ impl InProcessEd25519Signer {
         let mut seed = [0u8; 32];
         getrandom_seed(&mut seed);
         Self::new(SigningKey::from_bytes(&seed))
+    }
+}
+
+/// An on-disk OpenSSH Ed25519 signer — the documented, Windows-scoped exception
+/// to "never handle the private key" (WIN-02). Loads the key at construction
+/// time, holds only the `ed25519_dalek::SigningKey` (which is `ZeroizeOnDrop`),
+/// and explicitly zeroizes the transient seed copy (D-05). The `ssh_key::PrivateKey`
+/// and the raw seed bytes are dropped at end of [`FileSigner::from_path`] — key
+/// material is held in the narrowest possible scope. Passphrase-encrypted keys
+/// are detected and rejected with actionable guidance (D-06).
+///
+/// On all platforms (Linux opt-in, Windows required — D-03/D-04):
+/// - Linux: `--identity-file` is opt-in; ssh-agent remains the default.
+/// - Windows: `--identity-file` is the ONLY auth path (no agent available).
+///
+/// The private key bytes are never written to logs, `Debug` output, or error
+/// messages (D-05 / PITFALL 12).
+pub struct FileSigner {
+    key: ed25519_dalek::SigningKey,
+}
+
+impl FileSigner {
+    /// Load an on-disk OpenSSH Ed25519 private key from `path`.
+    ///
+    /// A best-effort, non-fatal permission warning is emitted via `tracing` if
+    /// the file appears group/other-accessible (Unix) or if ACL verification is
+    /// unavailable (Windows — see D-10 / PITFALL 13). The warning does NOT
+    /// prevent loading.
+    ///
+    /// Returns an error if:
+    /// - The file does not exist or cannot be read.
+    /// - The key is passphrase-encrypted — use an unencrypted key, or ssh-agent
+    ///   on Linux (`--identity`) (D-06).
+    /// - The key is not an Ed25519 key.
+    ///
+    /// The `ssh_key::PrivateKey` and the raw 32-byte seed are dropped before
+    /// this function returns (D-05 / PITFALL 12).
+    pub fn from_path(path: &std::path::Path) -> anyhow::Result<Self> {
+        // Best-effort permission check BEFORE loading — emitted even for keys
+        // that then fail validation so the user knows about the perm issue too.
+        warn_if_loose_permissions(path);
+
+        let private = ssh_key::PrivateKey::read_openssh_file(path)
+            .with_context(|| format!("read identity file {}", path.display()))?;
+
+        if private.is_encrypted() {
+            anyhow::bail!(
+                "identity file {} is passphrase-encrypted; v1.1 supports only \
+                 unencrypted Ed25519 keys — decrypt it (ssh-keygen -p) or, on \
+                 Linux, use ssh-agent (--identity)",
+                path.display()
+            );
+        }
+
+        let kp = private
+            .key_data()
+            .ed25519()
+            .context("identity file is not an Ed25519 key (Ed25519 only in this milestone)")?;
+
+        // Narrow scope: extract the 32-byte seed, build the dalek key, then
+        // zeroize the seed immediately (D-05 / PITFALL 12).
+        let mut seed = kp.private.to_bytes();
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        zeroize::Zeroize::zeroize(&mut seed);
+        // `private` is dropped here — ssh-key wraps key material in Zeroizing
+        // internally, so its drop will also scrub its internal copy.
+
+        Ok(Self { key })
+    }
+}
+
+impl RawEd25519Signer for FileSigner {
+    fn sign(&self, msg: &[u8]) -> anyhow::Result<[u8; 64]> {
+        use ed25519_dalek::Signer as _;
+        Ok(self.key.sign(msg).to_bytes())
+    }
+
+    fn public_key32(&self) -> [u8; 32] {
+        self.key.verifying_key().to_bytes()
+    }
+}
+
+/// Manual `Debug` impl: prints ONLY the SHA256 fingerprint of the public key —
+/// NEVER the key bytes (D-05). Mirrors `NoshPublicKey`'s redacted Debug.
+impl std::fmt::Debug for FileSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fp = crate::keys::NoshPublicKey::from_raw(self.key.verifying_key().to_bytes())
+            .fingerprint();
+        f.debug_struct("FileSigner")
+            .field("fingerprint", &fp)
+            .finish()
+    }
+}
+
+/// Emit a best-effort, NON-fatal warning if the identity file's permissions
+/// appear loose (D-10 / PITFALL 13). Never hard-refuses; any metadata error
+/// is silently ignored.
+fn warn_if_loose_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    "identity file is group/other-accessible; restrict it (chmod 600)"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::warn!(
+            path = %path.display(),
+            "identity file permissions are not verified on this platform \
+             (Windows ACLs are not read by std::fs); ensure the key file \
+             is not shared with other users (PITFALL 13 — ACL gap)"
+        );
     }
 }
 
@@ -300,6 +424,133 @@ mod tests {
     use super::*;
     use crate::keys::extract_spki_from_cert;
 
+    // A known passphrase-encrypted OpenSSH Ed25519 private key fixture.
+    // Generated with: ssh-keygen -t ed25519 -N "testpass"
+    // Used to test that FileSigner::from_path rejects encrypted keys (D-06).
+    const ENCRYPTED_KEY_FIXTURE: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+        b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABB33bc92B\n\
+        H5j0shY3HwxARVAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIB8aqZXnRAjBPbOq\n\
+        v2uyCyK6VU3XiEZJfjdJl3ae8+mPAAAAoBipRd2TNMqykQ0BV6DxKVXkzMNwvptYr22a6o\n\
+        pmx34IZR+mMATg3uTUntZoyb+MFE4EkLGJGfyRkiD2zl1mpiNYEczSHE2GjTuPJcbDUYLe\n\
+        0CtdCZGAq24Upd9XrpbOLMogfXxZm3ZG7D6R15app5CIBxXGbq+L+jTXjzdcueL2FsFPBG\n\
+        gTJchpzhndSMxKN2rxvFVBk/Tivx8vXYztM0I=\n\
+        -----END OPENSSH PRIVATE KEY-----";
+
+    #[test]
+    fn filesigner_sign_verifies() {
+        use ed25519_dalek::{Verifier, VerifyingKey};
+        use ssh_key::private::Ed25519Keypair;
+
+        // Generate a fresh key and write it to a tempfile.
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("id_ed25519");
+
+        // Build a known Ed25519 key seed for reproducibility.
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        let kp = Ed25519Keypair::from_seed(&seed);
+        let private = ssh_key::PrivateKey::from(kp);
+        private
+            .write_openssh_file(&key_path, ssh_key::LineEnding::LF)
+            .unwrap();
+
+        let signer = FileSigner::from_path(&key_path).unwrap();
+        let pk32 = signer.public_key32();
+        let msg = b"filesigner-certificate-verify-test";
+        let sig = signer.sign(msg).unwrap();
+
+        let vk = VerifyingKey::from_bytes(&pk32).unwrap();
+        vk.verify(msg, &ed25519_dalek::Signature::from_bytes(&sig))
+            .expect("FileSigner signature must verify");
+    }
+
+    #[test]
+    fn filesigner_rejects_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("id_ed25519_encrypted");
+        std::fs::write(&key_path, ENCRYPTED_KEY_FIXTURE).unwrap();
+
+        let err = FileSigner::from_path(&key_path).unwrap_err();
+        let msg = err.to_string();
+        // Must contain guidance text (D-06).
+        assert!(
+            msg.contains("passphrase-encrypted"),
+            "error must mention 'passphrase-encrypted', got: {msg}"
+        );
+        // Must NOT leak key bytes or base64 body in error.
+        assert!(
+            !msg.contains("b3Blbn"),
+            "error must not contain key base64 body, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn filesigner_debug_redacts() {
+        use ssh_key::private::Ed25519Keypair;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("id_ed25519");
+        let seed = [7u8; 32];
+        let kp = Ed25519Keypair::from_seed(&seed);
+        let private = ssh_key::PrivateKey::from(kp);
+        private
+            .write_openssh_file(&key_path, ssh_key::LineEnding::LF)
+            .unwrap();
+
+        let signer = FileSigner::from_path(&key_path).unwrap();
+        let debug_str = format!("{:?}", signer);
+
+        // Must contain "fingerprint" and "SHA256:" (keys.rs NoshPublicKey format).
+        assert!(
+            debug_str.contains("fingerprint"),
+            "Debug must contain 'fingerprint', got: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("SHA256:"),
+            "Debug must contain 'SHA256:', got: {debug_str}"
+        );
+        // Must be short — no 64-hex-char key body.
+        assert!(
+            debug_str.len() < 200,
+            "Debug output suspiciously long (potential key leak), got: {debug_str}"
+        );
+        // Must not contain raw key bytes represented as sequences of the seed byte.
+        assert!(
+            !debug_str.contains("07070707"),
+            "Debug must not contain raw key bytes, got: {debug_str}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn loose_permissions_warns_but_loads() {
+        use ssh_key::private::Ed25519Keypair;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("id_ed25519");
+        let seed = [5u8; 32];
+        let kp = Ed25519Keypair::from_seed(&seed);
+        let private = ssh_key::PrivateKey::from(kp);
+        private
+            .write_openssh_file(&key_path, ssh_key::LineEnding::LF)
+            .unwrap();
+
+        // chmod 644 — world-readable, should warn but NOT fail load.
+        let mut perms = std::fs::metadata(&key_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&key_path, perms).unwrap();
+
+        // The load MUST succeed even with loose permissions (non-fatal warning D-10).
+        let result = FileSigner::from_path(&key_path);
+        assert!(
+            result.is_ok(),
+            "FileSigner::from_path must succeed even with 0644 key — permission check is non-fatal (D-10)"
+        );
+    }
+
     #[test]
     fn inprocess_sign_verifies() {
         use ed25519_dalek::{Verifier, VerifyingKey};
@@ -321,7 +572,8 @@ mod tests {
     }
 
     /// Live ssh-agent round-trip (AUTH-04). Ignored unless ssh-agent + ssh-keygen
-    /// are available; run with `--ignored`.
+    /// are available; run with `--ignored`. Unix-only (ssh-agent uses Unix sockets).
+    #[cfg(unix)]
     #[test]
     #[ignore = "requires ssh-agent and ssh-keygen on PATH"]
     fn agent_ed25519_sign_roundtrip() {

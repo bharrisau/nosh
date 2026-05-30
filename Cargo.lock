@@ -957,6 +957,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -973,7 +974,6 @@ dependencies = [
  "nosh-proto",
  "nosh-server",
  "quinn",
- "rcgen",
  "rustls",
  "serde_json",
  "ssh-agent-client-rs",
