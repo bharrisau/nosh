@@ -315,11 +315,15 @@ impl RawModeGuard {
         // escape sequences, and Ctrl-C terminates the process (exit 130) instead
         // of being delivered to the read loop as byte 0x03.
         //
-        // ENABLE_VIRTUAL_TERMINAL_INPUT  0x0200 — stdin handle flag
-        // ENABLE_PROCESSED_INPUT         0x0001 — must be CLEARED for raw Ctrl-C
-        // ENABLE_LINE_INPUT              0x0002 — cleared by crossterm already
-        // ENABLE_ECHO_INPUT              0x0004 — cleared by crossterm already
-        // ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004 — stdout handle flag (different handle)
+        // Stdin handle flags (STD_INPUT_HANDLE):
+        //   ENABLE_PROCESSED_INPUT         0x0001 — must be CLEARED (Ctrl-C → 0x03)
+        //   ENABLE_LINE_INPUT              0x0002 — cleared by crossterm already
+        //   ENABLE_ECHO_INPUT              0x0004 — cleared by crossterm already
+        //   ENABLE_VIRTUAL_TERMINAL_INPUT  0x0200 — must be SET (ANSI escape sequences)
+        //
+        // Stdout handle flags (STD_OUTPUT_HANDLE; numeric values are independent
+        // of the stdin flags — 0x0004 on stdout is a DIFFERENT constant than on stdin):
+        //   ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004 — must be SET (render ANSI from server)
         #[cfg(windows)]
         {
             use std::io;
@@ -389,17 +393,31 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         // Restore Windows console modes BEFORE disable_raw_mode so the console
         // is in a sane state even if disable_raw_mode is called during panic unwind.
+        //
+        // Invariant: if `enable()` returned `Ok(Self {...})` then both handles
+        // were valid at construction time. They should still be valid here, but
+        // if the process detached from its console after `enable()` returned,
+        // `GetStdHandle` may return INVALID_HANDLE_VALUE (-1 as isize) or NULL
+        // (0). Guard against both before calling SetConsoleMode so restoration is
+        // attempted safely and skipped cleanly if the console detached (WR-01).
         #[cfg(windows)]
         {
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             use windows_sys::Win32::System::Console::{
                 GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
             };
-            // SAFETY: borrowed handles; we only call SetConsoleMode on them.
+            // SAFETY: GetStdHandle returns a borrowed handle; we do not close it.
             let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
             let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-            // Ignore errors — best effort in Drop (T-09-02 mitigation).
-            let _ = unsafe { SetConsoleMode(stdin_handle, self.orig_stdin_mode) };
-            let _ = unsafe { SetConsoleMode(stdout_handle, self.orig_stdout_mode) };
+            // Only restore if we have plausibly valid handles; ignore errors
+            // regardless — best effort in Drop (T-09-02 mitigation).
+            // Note: HANDLE is isize; NULL is 0 (not is_null() — that's for pointers).
+            if stdin_handle != INVALID_HANDLE_VALUE && stdin_handle != 0 {
+                let _ = unsafe { SetConsoleMode(stdin_handle, self.orig_stdin_mode) };
+            }
+            if stdout_handle != INVALID_HANDLE_VALUE && stdout_handle != 0 {
+                let _ = unsafe { SetConsoleMode(stdout_handle, self.orig_stdout_mode) };
+            }
         }
         let _ = crossterm::terminal::disable_raw_mode();
     }
