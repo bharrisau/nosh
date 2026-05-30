@@ -93,6 +93,18 @@ fn default_known_hosts() -> anyhow::Result<PathBuf> {
 /// 2. Unix: ssh-agent via `SSH_AUTH_SOCK` + optional `--identity` key selector
 /// 3. Windows (no --identity-file): default to `%USERPROFILE%\.ssh\id_ed25519`
 fn resolve_identity(args: &Args) -> anyhow::Result<ClientIdentity> {
+    // Warn if --identity is supplied on a platform where it has no effect.
+    // On Unix, --identity selects which ssh-agent key to use. On Windows,
+    // ssh-agent is not available and --identity is silently discarded; the
+    // user almost certainly wants --identity-file instead.
+    #[cfg(not(unix))]
+    if args.identity.is_some() {
+        tracing::warn!(
+            "--identity is only used on Unix (ssh-agent key selector); \
+             on Windows use --identity-file instead"
+        );
+    }
+
     // Branch 1: explicit --identity-file (all platforms, no SSH_AUTH_SOCK needed).
     if let Some(ref path) = args.identity_file {
         return ClientIdentity::from_identity_file(path);
