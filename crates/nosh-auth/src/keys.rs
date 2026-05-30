@@ -125,7 +125,15 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<NoshPublicKey>> {
             Err(e) => {
                 // Log only the key-type token (first whitespace-delimited field)
                 // and the parse error — never the full line or key material (D-07).
-                let key_type = line.split_whitespace().next().unwrap_or("<empty>");
+                // Cap the logged token: for a malformed line with no whitespace,
+                // split_whitespace().next() returns the entire line, which could
+                // be a multi-kilobyte base64 blob (IN-03 / D-07 invariant).
+                let key_type_raw = line.split_whitespace().next().unwrap_or("<empty>");
+                let key_type = if key_type_raw.len() > 64 {
+                    "<malformed-no-whitespace>"
+                } else {
+                    key_type_raw
+                };
                 tracing::warn!(
                     key_type,
                     error = %e,
