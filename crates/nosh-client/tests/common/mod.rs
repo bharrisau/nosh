@@ -8,10 +8,12 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use nosh_auth::{InProcessEd25519Signer, NoshPublicKey, RawEd25519Signer};
 use nosh_client::client::{self, ClientIdentity};
+use nosh_server::registry::SessionRegistry;
 use nosh_server::server::{self, AuthLimits};
 use ssh_key::private::Ed25519Keypair;
 use ssh_key::{LineEnding, PrivateKey};
@@ -68,6 +70,8 @@ fn fill_random(buf: &mut [u8; 32]) {
 pub struct TestServer {
     pub addr: SocketAddr,
     pub handle: tokio::task::JoinHandle<()>,
+    /// The shared session registry — tests can query orphan counts, etc.
+    pub registry: Arc<SessionRegistry>,
     _dir: TempDir,
 }
 
@@ -94,6 +98,21 @@ pub async fn spawn_server_with_shell(
     limits: AuthLimits,
     shell_override: Option<String>,
 ) -> TestServer {
+    // Default registry: cap=5, idle_timeout=0 (disabled). Tests that need to
+    // inspect the registry can call spawn_server_with_registry instead.
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    spawn_server_with_registry(host_key, authorized, limits, shell_override, registry).await
+}
+
+/// Full-control spawn: caller supplies its own `Arc<SessionRegistry>` so it can
+/// assert orphan counts, inject custom caps/timeouts, etc.
+pub async fn spawn_server_with_registry(
+    host_key: &TestKey,
+    authorized: &[&NoshPublicKey],
+    limits: AuthLimits,
+    shell_override: Option<String>,
+    registry: Arc<SessionRegistry>,
+) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let host_key_path = dir.path().join("host_ed25519");
     let auth_path = dir.path().join("authorized_keys");
@@ -114,12 +133,14 @@ pub async fn spawn_server_with_shell(
     let endpoint =
         server::make_endpoint(bind, &host_key_path, &auth_path).expect("server endpoint");
     let addr = endpoint.local_addr().expect("server local_addr");
+    let registry_for_task = registry.clone();
     let handle = tokio::spawn(async move {
-        let _ = server::run_accept_loop(endpoint, limits, shell_override).await;
+        let _ = server::run_accept_loop(endpoint, registry_for_task, limits, shell_override).await;
     });
     TestServer {
         addr,
         handle,
+        registry,
         _dir: dir,
     }
 }

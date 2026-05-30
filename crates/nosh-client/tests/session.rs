@@ -234,9 +234,14 @@ async fn sess09_clean_close() {
     }
 }
 
-/// SESS-10: after the client disconnects mid-session, the server SIGHUPs and
-/// reaps the shell — no zombie/orphan. We capture the shell's pid from the
-/// session, drop the connection, and assert the pid is reaped (gone or not Z).
+/// SESS-10: after a transport-level client disconnect, the server ORPHANS the
+/// session (Phase 5, D-02 / Pitfall #7): the shell must NOT be SIGHUPed and
+/// must NOT become a zombie. The shell process stays running until the reaper
+/// detects shell exit or idle timeout.
+///
+/// The abrupt `conn.close()` here is seen by the server as an ApplicationClosed
+/// transport event (not a SessionClose protocol message), so the server treats
+/// it as transport loss → orphan.
 #[tokio::test]
 async fn sess10_no_zombie_after_disconnect() {
     let Some((endpoint, conn, _srv)) = connect_session_server().await else {
@@ -253,37 +258,27 @@ async fn sess10_no_zombie_after_disconnect() {
     // Read until we see the PID line.
     let pid = read_pid(&mut recv).await.expect("shell printed its pid");
 
-    // Abruptly drop the client connection/endpoint (simulates disconnect).
+    // Abruptly drop the client connection/endpoint (simulates transport loss).
     conn.close(0u32.into(), b"client gone");
     drop(conn);
     endpoint.close(0u32.into(), b"client gone");
     drop(endpoint);
 
-    // The server should SIGHUP + reap. Poll /proc for up to ~5s: the pid must
-    // either be gone OR not be a zombie (state != 'Z').
-    let mut ok = false;
-    for _ in 0..50 {
-        match proc_state(pid) {
-            None => {
-                ok = true; // process gone — reaped
-                break;
-            }
-            Some(state) if state != 'Z' => {
-                // still shutting down (e.g. 'S'/'R'); keep polling
-            }
-            Some('Z') => {
-                // zombie right now — keep polling; reaper may not have run yet
-            }
-            Some(_) => {}
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    // Final check: definitely not a lingering zombie.
+    // Phase 5 behavior: the server ORPHANS the session (no SIGHUP, PTY stays
+    // open). The shell process must NOT become a zombie. We poll /proc briefly
+    // and assert the shell is either still running (orphaned) or is already
+    // gone and not a zombie (clean exit).
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let final_state = proc_state(pid);
     assert!(
-        ok || final_state.map(|s| s != 'Z').unwrap_or(true),
-        "shell pid {pid} must be reaped (gone or non-zombie), got state {final_state:?} (SESS-10)"
+        // Shell still alive as an orphan (expected), OR process is gone but
+        // not a zombie (also acceptable — shell may have exited naturally).
+        final_state.map(|s| s != 'Z').unwrap_or(true),
+        "shell pid {pid} must NOT be a zombie (SESS-10); state: {final_state:?}"
     );
+    // Note: shell process may still be running as an orphaned session. The
+    // per-identity cap (default 5) and the background reaper will clean it up.
+    // We do not assert the shell is gone here; persistence.rs tests that aspect.
 }
 
 /// Read PtyData frames until a line like `PID:<n>` (with `<n>` a non-empty run

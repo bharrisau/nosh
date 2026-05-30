@@ -5,6 +5,11 @@
 //! handshake (client cert pinned against `authorized_keys`) and caps concurrent
 //! unauthenticated connections. Phase 3 replaces the echo loops with a real PTY
 //! login-shell session framed over a single bidi QUIC stream (D-01).
+//!
+//! Phase 5 adds session persistence: a `SessionRegistry` tracks every session so
+//! that a transport-level disconnect (network loss, crash) orphans the session
+//! (PTY stays open, no SIGHUP — Pitfall #7 / D-02) while an explicit
+//! `SessionClose` or normal shell exit tears down immediately (D-01).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -18,6 +23,7 @@ use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use tokio::sync::mpsc;
 
+use crate::registry::SessionRegistry;
 use crate::session;
 
 /// Pre-auth DoS limits for the accept loop (decision D-13 / FOOTGUN-3).
@@ -99,11 +105,18 @@ pub fn make_endpoint(
 /// handshakes and enforcing an auth-completion timeout (AUTH-05 / D-13). The
 /// per-connection permit is released as soon as the handshake resolves, so the
 /// cap bounds unauthenticated state rather than total live sessions.
+///
+/// The `registry` is constructed by the caller (main.rs or tests) from CLI/env
+/// config and shared into every connection task. The reaper is spawned once here.
 pub async fn run_accept_loop(
     endpoint: quinn::Endpoint,
+    registry: Arc<SessionRegistry>,
     limits: AuthLimits,
     shell_override: Option<String>,
 ) -> anyhow::Result<()> {
+    // Spawn the background zombie/idle reaper once for this server instance.
+    let _reaper = registry.spawn_reaper();
+
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent));
     while let Some(incoming) = endpoint.accept().await {
         // Bound concurrent pre-auth connections: if all permits are taken,
@@ -121,11 +134,12 @@ pub async fn run_accept_loop(
         };
         let timeout = limits.auth_timeout;
         let shell = shell_override.clone();
+        let registry = registry.clone();
         tokio::spawn(async move {
             // The permit bounds PRE-AUTH state only (D-13): it is released the
             // moment the handshake resolves (success, failure, or timeout), so
             // long-lived authenticated sessions do not consume pre-auth capacity.
-            if let Err(e) = handle_connection(incoming, timeout, permit, shell).await {
+            if let Err(e) = handle_connection(incoming, timeout, permit, shell, registry).await {
                 tracing::warn!("connection handler ended: {e:#}");
             }
         });
@@ -143,6 +157,24 @@ const CLOSE_AUTH: u32 = 2;
 /// PTY output read chunk size.
 const PTY_CHUNK: usize = 8 * 1024;
 
+/// How the session loop ended (D-02).
+///
+/// Used to decide between orphan-on-transport-loss (keep MasterPty open,
+/// no SIGHUP — Pitfall #7) and immediate teardown (shell exit or clean
+/// client-initiated close).
+enum SessionEnd {
+    /// The shell process exited with an exit code.
+    ShellExited(i32),
+    /// The client sent an explicit `SessionClose` (or unexpected `SessionOpen`).
+    /// Typing `exit` in the shell triggers this path after the shell exits
+    /// and the server sends its own SessionClose first (ShellExited). This
+    /// variant is for client-initiated close before the shell exits.
+    ClientClosed,
+    /// A send/recv error or a read error — the transport was lost unexpectedly.
+    /// The session must be ORPHANED, NOT torn down (D-01/D-02, Pitfall #7).
+    TransportLost,
+}
+
 /// Handle one connection: after auth, drive a real PTY login-shell session over
 /// a single bidirectional stream until the shell exits or the client
 /// disconnects.
@@ -151,6 +183,7 @@ async fn handle_connection(
     auth_timeout: Duration,
     permit: tokio::sync::OwnedSemaphorePermit,
     shell_override: Option<String>,
+    registry: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
     // AUTH-05: bound the time a connection may stay half-open. The TLS handshake
     // (including client-cert verification) completes when `incoming` resolves;
@@ -196,10 +229,16 @@ async fn handle_connection(
         Err(e) => return clean_exit(e),
     };
 
-    run_session(conn, peer, peer_identity, send, recv, shell_override).await
+    run_session(conn, peer, peer_identity, send, recv, shell_override, registry).await
 }
 
 /// Drive a single PTY session over the established bidi stream.
+///
+/// Phase 5: builds a `SessionSlot`, registers it Active, feeds every outgoing
+/// PTY chunk into the slot's `SequencedOutputBuffer`, and at session end
+/// subdivides the outcome:
+/// - `ShellExited` / `ClientClosed` → immediate teardown + `registry.remove`
+/// - `TransportLost` → orphan (NO SIGHUP, keep MasterPty open, D-01/D-02/Pitfall #7)
 async fn run_session(
     conn: quinn::Connection,
     peer: SocketAddr,
@@ -207,6 +246,7 @@ async fn run_session(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     shell_override: Option<String>,
+    registry: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
     // First frame must be SessionOpen.
     let open = match nosh_proto::read_message(&mut recv).await {
@@ -230,12 +270,16 @@ async fn run_session(
     let (term, cols, rows, client_env) = open;
 
     let passwd = session::lookup_self(shell_override.as_deref());
-    let (mut sess, reader, writer) =
+    let (sess, reader, writer) =
         session::open(&passwd, &term, cols, rows, &client_env, identity).context("open session")?;
 
+    // Capture the identity raw bytes for registry key lookups before the
+    // Session moves into the slot.
     let session_id = sess.session_id;
     let username = sess.username.clone();
     let fingerprint = sess.identity.fingerprint();
+    let identity_raw = *sess.identity.key32();
+
     let span = tracing::info_span!(
         "session",
         %session_id,
@@ -246,13 +290,25 @@ async fn run_session(
     let _enter = span.enter();
     tracing::info!(%term, cols, rows, child_pid = ?sess.child_pid(), "session open");
 
-    // Take the child so its exit can be awaited concurrently (the select loop
-    // needs `&mut sess` for resize, so the child cannot live inside `sess`).
-    let child = sess
-        .take_child()
-        .context("session has no child to wait on")?;
+    // Move the Session into a SessionSlot and register it as Active.
+    // The slot keeps MasterPty alive for the duration; resize goes through it.
+    let slot = crate::registry::SessionSlot::new(sess);
+    registry.register_active(slot.clone());
+
+    // Take the child FROM the session INSIDE the slot so its exit can be awaited
+    // concurrently. We need the child for the wait_task, but the slot's session
+    // lock must be used for resize. Taking the child here means try_wait in the
+    // slot's session returns None (child gone), which is fine — reaper uses
+    // slot.try_wait() for already-orphaned sessions only.
+    let child = {
+        let mut guard = slot.session.lock().unwrap();
+        guard.take_child().context("session has no child to wait on")?
+    };
     // Wait for the shell exit on a dedicated task; the JoinHandle resolves once
-    // with the exit code (SESS-08). On disconnect we abort it and reap manually.
+    // with the exit code (SESS-08). On orphan we DETACH (not abort) so the shell
+    // keeps running; the reaper observes exit via the slot's try_wait seam
+    // (which uses the held child — but since we took the child here, we re-put
+    // a None; the reaper falls back to SIGHUP+drop). See Pitfall #7.
     let mut wait_task = tokio::spawn(session::wait_child(child));
 
     // OUTPUT pump: a blocking thread reads PTY output and forwards chunks; an
@@ -286,28 +342,33 @@ async fn run_session(
         }
     });
 
-    // Pump until the shell exits (Some(code)) or the client disconnects (None).
-    let session_outcome = loop {
+    // Pump until the shell exits, the client closes cleanly, or the transport
+    // is lost (D-02). The outcome drives the post-loop teardown/orphan split.
+    let session_end: SessionEnd = loop {
         tokio::select! {
             // Shell exited: capture the code and tell the client.
             res = &mut wait_task => {
-                break Some(res.unwrap_or(1));
+                break SessionEnd::ShellExited(res.unwrap_or(1));
             }
-            // PTY output ready: frame it to the client. Drain remaining output
-            // even as the shell is exiting so the last bytes are delivered.
+            // PTY output ready: sequence it into the output buffer and frame it
+            // to the client (D-10). Drain remaining output even as the shell is
+            // exiting so the last bytes are delivered.
             chunk = out_rx.recv() => {
                 match chunk {
                     Some(data) => {
+                        // Feed into the sequenced output buffer (D-10) before sending.
+                        slot.push_output(&data);
                         if nosh_proto::write_message(&mut send, &Message::PtyData { data })
                             .await
                             .is_err()
                         {
-                            break None;
+                            // Send failed → transport lost (not a clean close).
+                            break SessionEnd::TransportLost;
                         }
                     }
                     None => {
                         // Output pump ended (PTY EOF). Await the exit code.
-                        break Some((&mut wait_task).await.unwrap_or(1));
+                        break SessionEnd::ShellExited((&mut wait_task).await.unwrap_or(1));
                     }
                 }
             }
@@ -315,31 +376,41 @@ async fn run_session(
             msg = nosh_proto::read_message(&mut recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
+                        // Update last_active while client is driving input (D-03).
+                        slot.touch();
                         if in_tx.send(data).await.is_err() {
-                            break None;
+                            break SessionEnd::TransportLost;
                         }
                     }
                     Ok(Message::Resize { cols, rows }) => {
-                        if let Err(e) = sess.resize(cols, rows) {
+                        // Route resize through the slot delegate (D-02 / plan notes).
+                        slot.touch();
+                        if let Err(e) = slot.resize(cols, rows) {
                             tracing::warn!("resize failed: {e}");
                         } else {
                             tracing::debug!(cols, rows, "resize");
                         }
                     }
                     Ok(Message::SessionClose { .. }) | Ok(Message::SessionOpen { .. }) => {
-                        break None; // client signalled end (or unexpected reopen)
+                        // Client sent an explicit close (or unexpected reopen).
+                        // D-01: explicit SessionClose → teardown, NOT orphan.
+                        break SessionEnd::ClientClosed;
                     }
-                    Err(_) => break None, // stream/connection closed by the client
+                    Err(_) => {
+                        // Stream/connection closed without a SessionClose → transport loss.
+                        // D-02: this is NOT a clean close; orphan the session (Pitfall #7).
+                        break SessionEnd::TransportLost;
+                    }
                 }
             }
         }
     };
 
-    // Stop the input pump.
+    // Stop the input pump channel (unblocks the writer task).
     drop(in_tx);
 
-    match session_outcome {
-        Some(exit_code) => {
+    match session_end {
+        SessionEnd::ShellExited(exit_code) => {
             // Shell exited normally: drain ALL remaining PTY output (the output
             // reader thread closes `out_rx` on PTY EOF, so recv() eventually
             // yields None), then deliver the exit code and close cleanly with a
@@ -348,6 +419,7 @@ async fn run_session(
             loop {
                 match tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await {
                     Ok(Some(data)) => {
+                        slot.push_output(&data);
                         let _ =
                             nosh_proto::write_message(&mut send, &Message::PtyData { data }).await;
                     }
@@ -372,21 +444,48 @@ async fn run_session(
             // the stream; a short bounded fallback covers a client that lingers.
             let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
             conn.close(CLOSE_OK.into(), b"shell exited");
+            // Shell already exited — remove the slot from the registry (D-01).
+            registry.remove(&identity_raw, session_id);
         }
-        None => {
-            // Client disconnected (or protocol end): SIGHUP the shell, then let
-            // the in-flight wait task reap it so no zombie/orphan remains
-            // (SESS-10). The child was moved into `wait_task`; SIGHUP unblocks
-            // its blocking `wait()`, which reaps. Await it (bounded) for
-            // deterministic teardown.
-            tracing::info!("client disconnected; reaping shell");
-            sess.sighup();
+
+        SessionEnd::ClientClosed => {
+            // Client sent an explicit SessionClose (typing exit/quitting cleanly).
+            // D-01: must NOT leave a lingering session. SIGHUP the shell and reap.
+            tracing::info!("client closed session; reaping shell");
+            // The wait_task owns the child; SIGHUP via the slot's session sighup
+            // (which SIGHUPs by child_pid, which is still recorded on the Session
+            // even though the child was taken).
+            slot.sighup();
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
-            conn.close(CLOSE_OK.into(), b"client disconnected");
+            conn.close(CLOSE_OK.into(), b"client closed");
+            // Clean close — remove from registry immediately (D-01).
+            registry.remove(&identity_raw, session_id);
+        }
+
+        SessionEnd::TransportLost => {
+            // Transport-level disconnect (network loss, crash, failed send/recv).
+            // D-02 / Pitfall #7: do NOT SIGHUP, do NOT reap, do NOT drop the
+            // Session — the MasterPty stays open because the Session lives on
+            // inside the slot held by the registry.
+            //
+            // Detach the wait_task (drop the handle without aborting) so the
+            // shell keeps running. The reaper will observe the shell's eventual
+            // exit via periodic try_wait.
+            //
+            // The in-flight I/O bridge tasks (output_reader, input_writer) are
+            // aborted below — they read/write the now-dead QUIC stream, but the
+            // PTY master fd remains open inside the slot regardless.
+            tracing::info!("transport lost; orphaning session (PTY kept alive, no SIGHUP)");
+            // Transition the slot to Orphaned; the registry enforces the cap.
+            registry.orphan(&slot);
+            // Detach wait_task — do NOT abort; the shell must keep running.
+            drop(wait_task);
         }
     }
 
-    // Best-effort: ensure the blocking I/O tasks unwind.
+    // Best-effort: ensure the blocking I/O tasks unwind (the PTY master fd stays
+    // open via the slot on the orphan path — aborting the I/O bridge tasks does
+    // not close it).
     output_reader.abort();
     input_writer.abort();
     Ok(())
