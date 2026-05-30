@@ -83,6 +83,13 @@ Recent decisions affecting current work:
 - At Phase 6 start: review PITFALLS.md 13-item reattach checklist before planning; state machine spec is the risk
 - At Phase 8 start: confirm `ring` 0.17.14 precompiled x86_64-windows assembly objects are present (no NASM/CMake needed)
 
+**From 2026-05-30 live Windows→Linux validation (native Windows client authenticated + opened PTY session OK):**
+
+- `authorized_keys` must IGNORE unsupported/unparseable entries (warn + skip, like sshd) — currently `load_authorized_keys` (`crates/nosh-auth/src/keys.rs:118`) propagates the first parse error via `?`, so a single RSA/ECDSA/malformed line rejects the entire file. Real-world `authorized_keys` files routinely contain non-Ed25519 keys.
+- Client needs a **connection timeout** when no server responds — `connect(...).await` (`crates/nosh-client/src/client.rs:188-190`) has no timeout and hangs; wrap in `tokio::time::timeout` with a clear error.
+- Unused `PathBuf` import warning on Windows builds — `crates/nosh-auth/src/signer.rs:15` is only used by the `#[cfg(unix)]` `AgentSigner`; gate the import.
+- Investigate Windows `quinn_udp` `WSAEMSGSIZE` (Os code 10040) sendmsg warning (len 1389, ECN Ect0) — connection still succeeded, likely benign GSO/segmentation-offload fallback, but confirm it doesn't degrade Windows reliability or spam logs.
+
 ### Blockers/Concerns
 
 - Phase 6 (Cold Reattach): state machine correctness and two-factor authorization design are the principal risk; must be correct from first implementation (cannot retrofit identity check after token-only build without a protocol change)
