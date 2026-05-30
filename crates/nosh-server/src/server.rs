@@ -21,7 +21,7 @@ use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
 use rustls::pki_types::CertificateDer;
 use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::registry::SessionRegistry;
 use crate::session;
@@ -340,7 +340,8 @@ async fn run_session(
     // Phase 6: store the writer in the slot so a reattach pump can reclaim it
     // on TransportLost. We start with the writer in the slot and take it into
     // the blocking input task; on clean exit we drop it (session over); on
-    // TransportLost we recover it via a oneshot so the slot holds it for reattach.
+    // TransportLost the input task stores the writer back into the slot when it
+    // exits (W2 fix — reliable hand-back, no racy oneshot).
     slot.return_pty_writer(writer);
 
     // OUTPUT pump: a blocking thread reads PTY output and forwards chunks; an
@@ -363,21 +364,26 @@ async fn run_session(
     });
 
     // INPUT pump: writes from the client stream go to the PTY. The blocking
-    // writer is taken from the slot. A oneshot channel lets us recover the writer
-    // on TransportLost so the reattach pump can reclaim it.
+    // writer is taken from the slot. W2 fix: instead of recovering the writer
+    // via a racy 200 ms oneshot, the task ALWAYS stores the writer back into the
+    // slot when it exits (`in_tx` dropped on any session-end). This guarantees
+    // an orphaned slot always has a usable writer, so a later reattach never
+    // accepts a session it cannot drive. The task holds its own `Arc` clone of
+    // the slot for the hand-back.
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (writer_return_tx, writer_return_rx) = oneshot::channel::<crate::session::PtyWriter>();
     let writer_for_task = slot.take_pty_writer().expect("writer was just stored in slot");
-    let input_writer = tokio::task::spawn_blocking(move || {
+    let slot_for_writer = slot.clone();
+    let mut input_writer = tokio::task::spawn_blocking(move || {
         let mut writer = writer_for_task;
         while let Some(bytes) = in_rx.blocking_recv() {
             if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
                 break;
             }
         }
-        // Return the writer via the oneshot for TransportLost recovery.
-        // If the receiver was dropped (clean exit), this is a no-op.
-        let _ = writer_return_tx.send(writer);
+        // Hand the writer back to the slot unconditionally. On TransportLost the
+        // reattach pump reclaims it from the slot; on clean exit the slot (and
+        // its writer) is dropped with the session — harmless.
+        slot_for_writer.return_pty_writer(writer);
     });
 
     // Pump until the shell exits, the client closes cleanly, or the transport
@@ -520,18 +526,15 @@ async fn run_session(
             // inside the slot held by the registry.
             tracing::info!("transport lost; orphaning session (PTY kept alive, no SIGHUP)");
 
-            // Phase 6: recover the PTY writer from the (now-ending) input task
-            // so the reattach pump can reclaim it. The in_tx drop above unblocks
-            // the writer task, which then sends the writer back via writer_return_tx.
-            // Wait briefly; if recovery fails, the reattach pump will error and
-            // re-orphan, which is safe.
-            let recovered_writer = tokio::time::timeout(Duration::from_millis(200), writer_return_rx)
-                .await
-                .ok()
-                .and_then(|r| r.ok());
-            if let Some(w) = recovered_writer {
-                slot.return_pty_writer(w);
-            }
+            // W2 fix: the input task stores the writer back into the slot on
+            // exit. The `drop(in_tx)` above unblocks it; AWAIT its completion so
+            // the writer is guaranteed to be in the slot BEFORE we orphan — no
+            // racy 200 ms timeout that could leave the orphan writer-less and
+            // permanently un-reattachable. We bound the await generously in case
+            // the task is blocked inside a PTY write; on the rare timeout the
+            // slot may lack a writer, and a later reattach will cleanly reject
+            // (take_pty_writer None → re-orphan) rather than wedge.
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut input_writer).await;
 
             // Transition the slot to Orphaned; the registry enforces the cap.
             registry.orphan(&slot);
@@ -725,18 +728,20 @@ async fn run_reattach_session(
         }
     });
 
-    // INPUT pump with writer recovery on TransportLost.
+    // INPUT pump. W2 fix: store the writer back into the slot on exit (same as
+    // run_session) so an orphaned-then-reattached session always has a usable
+    // writer — no racy oneshot recovery.
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (writer_return_tx, writer_return_rx) = oneshot::channel::<crate::session::PtyWriter>();
     let writer_for_task = slot.take_pty_writer().expect("writer was just stored");
-    let input_writer = tokio::task::spawn_blocking(move || {
+    let slot_for_writer = slot.clone();
+    let mut input_writer = tokio::task::spawn_blocking(move || {
         let mut w = writer_for_task;
         while let Some(bytes) = in_rx.blocking_recv() {
             if w.write_all(&bytes).is_err() || w.flush().is_err() {
                 break;
             }
         }
-        let _ = writer_return_tx.send(w);
+        slot_for_writer.return_pty_writer(w);
     });
 
     // The wait_task is the orphan-exit watcher (wait_task from the original
@@ -829,14 +834,10 @@ async fn run_reattach_session(
         }
         SessionEnd::TransportLost => {
             tracing::info!("transport lost during reattach; re-orphaning");
-            // Recover writer and re-orphan.
-            let recovered_writer = tokio::time::timeout(Duration::from_millis(200), writer_return_rx)
-                .await
-                .ok()
-                .and_then(|r| r.ok());
-            if let Some(w) = recovered_writer {
-                slot.return_pty_writer(w);
-            }
+            // W2 fix: await the input task so it stores the writer back into the
+            // slot BEFORE we orphan — the re-orphaned slot always has a usable
+            // writer for the next reattach.
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut input_writer).await;
             registry.orphan(&slot);
             // The original exit watcher is still alive; no new watcher needed.
         }
