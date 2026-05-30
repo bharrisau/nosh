@@ -161,6 +161,13 @@ impl Session {
         self.child.as_mut()
     }
 
+    /// Clone a new PTY reader from the master PTY. Used by the reattach pump to
+    /// get a fresh reader handle after the original pump's reader was consumed.
+    /// May fail if the PTY has already been closed (shell exited).
+    pub fn try_clone_reader(&self) -> anyhow::Result<PtyReader> {
+        self.master.try_clone_reader().context("clone pty reader for reattach")
+    }
+
     /// SIGHUP the shell (best effort). Pair with [`reap_child`] to guarantee no
     /// zombie/orphan remains (SESS-10).
     pub fn sighup(&self) {

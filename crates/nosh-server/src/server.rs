@@ -21,7 +21,7 @@ use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
 use rustls::pki_types::CertificateDer;
 use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::registry::SessionRegistry;
 use crate::session;
@@ -224,51 +224,57 @@ async fn handle_connection(
     tracing::info!(%peer, alpn = %alpn, "connection accepted");
 
     // The client opens exactly one bidi stream and sends SessionOpen first.
-    let (send, recv) = match conn.accept_bi().await {
+    let (send, mut recv) = match conn.accept_bi().await {
         Ok(pair) => pair,
         Err(e) => return clean_exit(e),
     };
 
-    run_session(conn, peer, peer_identity, send, recv, shell_override, registry).await
+    // Phase 6 (D-04): dispatch on the first frame — SessionOpen → fresh session,
+    // Reattach → reattach path, anything else → protocol close.
+    match nosh_proto::read_message(&mut recv).await {
+        Ok(Message::SessionOpen { term, cols, rows, env }) => {
+            run_session(conn, peer, peer_identity, send, recv, term, cols, rows, env, shell_override, registry).await
+        }
+        Ok(Message::Reattach { token, last_acked_seq }) => {
+            run_reattach_session(conn, peer, peer_identity, send, recv, last_acked_seq, token, registry).await
+        }
+        Ok(other) => {
+            tracing::warn!(%peer, ?other, "expected SessionOpen or Reattach as first frame");
+            conn.close(CLOSE_PROTOCOL.into(), b"expected SessionOpen or Reattach");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(%peer, "failed to read first frame: {e}");
+            conn.close(CLOSE_PROTOCOL.into(), b"bad first frame");
+            Ok(())
+        }
+    }
 }
 
 /// Drive a single PTY session over the established bidi stream.
 ///
-/// Phase 5: builds a `SessionSlot`, registers it Active, feeds every outgoing
+/// Phase 5/6: builds a `SessionSlot`, registers it Active, feeds every outgoing
 /// PTY chunk into the slot's `SequencedOutputBuffer`, and at session end
 /// subdivides the outcome:
 /// - `ShellExited` / `ClientClosed` → immediate teardown + `registry.remove`
 /// - `TransportLost` → orphan (NO SIGHUP, keep MasterPty open, D-01/D-02/Pitfall #7)
+///
+/// Phase 6: after registering the slot, emits `SessionOpened { token }` so the
+/// client can reattach later. Also handles `Ack { seq }` frames during the pump
+/// loop (D-08 continuous acking).
 async fn run_session(
     conn: quinn::Connection,
     peer: SocketAddr,
     identity: nosh_auth::NoshPublicKey,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    term: String,
+    cols: u16,
+    rows: u16,
+    client_env: Vec<(String, String)>,
     shell_override: Option<String>,
     registry: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
-    // First frame must be SessionOpen.
-    let open = match nosh_proto::read_message(&mut recv).await {
-        Ok(Message::SessionOpen {
-            term,
-            cols,
-            rows,
-            env,
-        }) => (term, cols, rows, env),
-        Ok(other) => {
-            tracing::warn!(?other, "expected SessionOpen as first frame");
-            conn.close(CLOSE_PROTOCOL.into(), b"expected SessionOpen");
-            return Ok(());
-        }
-        Err(e) => {
-            tracing::warn!("failed to read SessionOpen: {e}");
-            conn.close(CLOSE_PROTOCOL.into(), b"bad first frame");
-            return Ok(());
-        }
-    };
-    let (term, cols, rows, client_env) = open;
-
     let passwd = session::lookup_self(shell_override.as_deref());
     let (sess, reader, writer) =
         session::open(&passwd, &term, cols, rows, &client_env, identity).context("open session")?;
@@ -295,6 +301,18 @@ async fn run_session(
     let slot = crate::registry::SessionSlot::new(sess);
     registry.register_active(slot.clone());
 
+    // Phase 6 (D-03): send SessionOpened immediately so the client has the
+    // initial reattach token. Token MUST NOT be logged (D-07).
+    let initial_token = slot.token();
+    if nosh_proto::write_message(&mut send, &Message::SessionOpened { token: initial_token })
+        .await
+        .is_err()
+    {
+        // Transport already gone before the session even started.
+        registry.remove(&identity_raw, session_id);
+        return Ok(());
+    }
+
     // Take the child FROM the session INSIDE the slot so its exit can be awaited
     // concurrently. We need the child for the wait_task, but the slot's session
     // lock must be used for resize. Taking the child here means try_wait in the
@@ -310,6 +328,12 @@ async fn run_session(
     // (which uses the held child — but since we took the child here, we re-put
     // a None; the reaper falls back to SIGHUP+drop). See Pitfall #7.
     let mut wait_task = tokio::spawn(session::wait_child(child));
+
+    // Phase 6: store the writer in the slot so a reattach pump can reclaim it
+    // on TransportLost. We start with the writer in the slot and take it into
+    // the blocking input task; on clean exit we drop it (session over); on
+    // TransportLost we recover it via a oneshot so the slot holds it for reattach.
+    slot.return_pty_writer(writer);
 
     // OUTPUT pump: a blocking thread reads PTY output and forwards chunks; an
     // async task drains them into PtyData frames on the stream.
@@ -331,15 +355,21 @@ async fn run_session(
     });
 
     // INPUT pump: writes from the client stream go to the PTY. The blocking
-    // writer is moved into a dedicated blocking task fed by a channel.
+    // writer is taken from the slot. A oneshot channel lets us recover the writer
+    // on TransportLost so the reattach pump can reclaim it.
     let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
-    let mut writer = writer;
+    let (writer_return_tx, writer_return_rx) = oneshot::channel::<crate::session::PtyWriter>();
+    let writer_for_task = slot.take_pty_writer().expect("writer was just stored in slot");
     let input_writer = tokio::task::spawn_blocking(move || {
+        let mut writer = writer_for_task;
         while let Some(bytes) = in_rx.blocking_recv() {
             if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
                 break;
             }
         }
+        // Return the writer via the oneshot for TransportLost recovery.
+        // If the receiver was dropped (clean exit), this is a no-op.
+        let _ = writer_return_tx.send(writer);
     });
 
     // Pump until the shell exits, the client closes cleanly, or the transport
@@ -481,6 +511,20 @@ async fn run_session(
             // Session — the MasterPty stays open because the Session lives on
             // inside the slot held by the registry.
             tracing::info!("transport lost; orphaning session (PTY kept alive, no SIGHUP)");
+
+            // Phase 6: recover the PTY writer from the (now-ending) input task
+            // so the reattach pump can reclaim it. The in_tx drop above unblocks
+            // the writer task, which then sends the writer back via writer_return_tx.
+            // Wait briefly; if recovery fails, the reattach pump will error and
+            // re-orphan, which is safe.
+            let recovered_writer = tokio::time::timeout(Duration::from_millis(200), writer_return_rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok());
+            if let Some(w) = recovered_writer {
+                slot.return_pty_writer(w);
+            }
+
             // Transition the slot to Orphaned; the registry enforces the cap.
             registry.orphan(&slot);
 
@@ -516,6 +560,262 @@ async fn run_session(
     // Best-effort: ensure the blocking I/O tasks unwind (the PTY master fd stays
     // open via the slot on the orphan path — aborting the I/O bridge tasks does
     // not close it).
+    output_reader.abort();
+    input_writer.abort();
+    Ok(())
+}
+
+/// Phase 6: handle a cold reattach on a fresh QUIC connection (D-03/D-04/D-06).
+///
+/// 1. Authorize via `registry.reattach` (two-factor: token + TLS identity).
+/// 2. Rotate the token and send `ReattachOk { new_token, replaying_from_seq, truncated }`.
+/// 3. Replay buffered output (seq > last_acked_seq) as `PtyData` frames.
+/// 4. Reclaim the PTY reader/writer from the slot and run the pump loop.
+/// 5. On success, mark the slot `Active`; on failure at any step, re-orphan.
+///
+/// ALL rejection causes emit the same opaque `ReattachErr` wire frame (D-07
+/// no-oracle invariant). Token and new_token are NEVER logged.
+async fn run_reattach_session(
+    conn: quinn::Connection,
+    peer: SocketAddr,
+    identity: nosh_auth::NoshPublicKey,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    last_acked_seq: u64,
+    token: [u8; 16],
+    registry: Arc<crate::registry::SessionRegistry>,
+) -> anyhow::Result<()> {
+    use crate::registry::SessionSlot;
+
+    // ── Step 1: Two-factor reattach authorization ─────────────────────────────
+    let slot = match registry.reattach(&token, &identity) {
+        Ok(s) => s,
+        Err(_) => {
+            // ALL rejection causes take this identical path (D-07 no-oracle).
+            // Log identity fingerprint only; never the token.
+            tracing::info!(identity = %identity.fingerprint(), "reattach rejected");
+            let _ = nosh_proto::write_message(&mut send, &Message::ReattachErr).await;
+            conn.close(CLOSE_PROTOCOL.into(), b"reattach rejected");
+            return Ok(());
+        }
+    };
+
+    let session_id = slot.session_id;
+    let identity_raw = *slot.identity.key32();
+    let fingerprint = slot.identity.fingerprint();
+
+    let span = tracing::info_span!(
+        "reattach",
+        %session_id,
+        %peer,
+        identity = %fingerprint,
+    );
+    let _enter = span.enter();
+
+    // Helper: re-orphan the slot if we fail mid-rebind (slot is Reconnecting;
+    // transition it back to Orphaned so it can be reattached again).
+    let re_orphan = |slot: &Arc<SessionSlot>, registry: &Arc<crate::registry::SessionRegistry>| {
+        registry.orphan(slot);
+    };
+
+    // ── Step 2: Compute replay, rotate token, send ReattachOk ────────────────
+    let (chunks, replaying_from_seq, truncated) = slot.replay_from(last_acked_seq);
+    // Rotate token (single-use, D-05). MUST NOT be logged.
+    let new_token = slot.rotate_token();
+
+    if nosh_proto::write_message(
+        &mut send,
+        &Message::ReattachOk { new_token, replaying_from_seq, truncated },
+    )
+    .await
+    .is_err()
+    {
+        re_orphan(&slot, &registry);
+        return Ok(());
+    }
+
+    // ── Step 3: Replay buffered output (D-09 no dup/gap within retained range) ─
+    for (_seq, data) in &chunks {
+        if nosh_proto::write_message(&mut send, &Message::PtyData { data: data.to_vec() })
+            .await
+            .is_err()
+        {
+            re_orphan(&slot, &registry);
+            return Ok(());
+        }
+    }
+    tracing::info!(
+        replaying_from_seq,
+        chunks = chunks.len(),
+        truncated,
+        "replay complete"
+    );
+
+    // ── Step 4: Reclaim PTY reader/writer ────────────────────────────────────
+    // Reader: clone a new reader from the master (drain any bytes that
+    // accumulated in the kernel PTY buffer while the session was orphaned).
+    let reader = match slot.clone_pty_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("failed to clone PTY reader for reattach: {e}");
+            re_orphan(&slot, &registry);
+            return Ok(());
+        }
+    };
+
+    // Writer: take from the slot (stored by the prior TransportLost path).
+    let writer = match slot.take_pty_writer() {
+        Some(w) => w,
+        None => {
+            tracing::warn!("PTY writer not available for reattach (session may have exited)");
+            re_orphan(&slot, &registry);
+            return Ok(());
+        }
+    };
+
+    // ── Step 5: Transition to Active and start pump ──────────────────────────
+    slot.mark_active();
+    tracing::info!("reattach successful; session is Active");
+
+    // Store the writer back in the slot for the next potential TransportLost.
+    // We then follow the same pump pattern as run_session.
+    slot.return_pty_writer(writer);
+
+    // OUTPUT pump.
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut reader = reader;
+    let output_reader = tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; PTY_CHUNK];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // INPUT pump with writer recovery on TransportLost.
+    let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (writer_return_tx, writer_return_rx) = oneshot::channel::<crate::session::PtyWriter>();
+    let writer_for_task = slot.take_pty_writer().expect("writer was just stored");
+    let input_writer = tokio::task::spawn_blocking(move || {
+        let mut w = writer_for_task;
+        while let Some(bytes) = in_rx.blocking_recv() {
+            if w.write_all(&bytes).is_err() || w.flush().is_err() {
+                break;
+            }
+        }
+        let _ = writer_return_tx.send(w);
+    });
+
+    // The wait_task is the orphan-exit watcher (wait_task from the original
+    // run_session) — still alive and Arc::ptr_eq-bound to this slot. We do NOT
+    // re-spawn a second wait_task here; the original watcher remains the durable
+    // shell-exit observer. When the shell exits eventually, the original watcher
+    // will call registry.remove_slot (idempotent). For the reattach pump we only
+    // need a way to detect shell exit; we use a separate task that non-blockingly
+    // polls every 500ms (the child was taken, so try_wait is None — but we can
+    // poll the output channel EOF as the shell-exit signal).
+    // The output pump closes when the PTY EOF is hit (shell exited or closed).
+
+    let session_end: SessionEnd = loop {
+        tokio::select! {
+            chunk = out_rx.recv() => {
+                match chunk {
+                    Some(data) => {
+                        slot.push_output(&data);
+                        if nosh_proto::write_message(&mut send, &Message::PtyData { data })
+                            .await
+                            .is_err()
+                        {
+                            break SessionEnd::TransportLost;
+                        }
+                    }
+                    None => {
+                        // PTY EOF: shell exited. Shell exit code is tracked by the
+                        // original wait_task watcher; we close with code 0 (approximate).
+                        break SessionEnd::ShellExited(0);
+                    }
+                }
+            }
+            msg = nosh_proto::read_message(&mut recv) => {
+                match msg {
+                    Ok(Message::PtyData { data }) => {
+                        slot.touch();
+                        if in_tx.send(data).await.is_err() {
+                            break SessionEnd::TransportLost;
+                        }
+                    }
+                    Ok(Message::Resize { cols, rows }) => {
+                        slot.touch();
+                        if let Err(e) = slot.resize(cols, rows) {
+                            tracing::warn!("resize failed on reattach: {e}");
+                        }
+                    }
+                    Ok(Message::SessionClose { .. }) => {
+                        break SessionEnd::ClientClosed;
+                    }
+                    Ok(Message::Ack { seq }) => {
+                        slot.touch();
+                        slot.trim_acked(seq);
+                    }
+                    Ok(_) => {} // ignore unexpected frames
+                    Err(_) => {
+                        break SessionEnd::TransportLost;
+                    }
+                }
+            }
+        }
+    };
+
+    drop(in_tx);
+
+    match session_end {
+        SessionEnd::ShellExited(_exit_code) => {
+            tracing::info!("shell exited during reattach session");
+            // The original watcher will call remove_slot. Send SessionClose.
+            // We don't have the exact exit code (the original wait_task has it);
+            // send 0 as approximate. The client will see the connection close.
+            let _ = nosh_proto::write_message(
+                &mut send,
+                &Message::SessionClose {
+                    exit_code: 0,
+                    reason: "shell exited".to_string(),
+                },
+            )
+            .await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+            conn.close(CLOSE_OK.into(), b"shell exited");
+            // Remove the slot (the original watcher may also do this; remove is idempotent).
+            registry.remove(&identity_raw, session_id);
+        }
+        SessionEnd::ClientClosed => {
+            tracing::info!("client closed reattach session");
+            slot.sighup();
+            conn.close(CLOSE_OK.into(), b"client closed");
+            registry.remove(&identity_raw, session_id);
+        }
+        SessionEnd::TransportLost => {
+            tracing::info!("transport lost during reattach; re-orphaning");
+            // Recover writer and re-orphan.
+            let recovered_writer = tokio::time::timeout(Duration::from_millis(200), writer_return_rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok());
+            if let Some(w) = recovered_writer {
+                slot.return_pty_writer(w);
+            }
+            registry.orphan(&slot);
+            // The original exit watcher is still alive; no new watcher needed.
+        }
+    }
+
     output_reader.abort();
     input_writer.abort();
     Ok(())

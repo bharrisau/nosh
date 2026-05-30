@@ -229,12 +229,18 @@ pub struct SessionSlot {
     /// Single-use CSPRNG reattach token (D-05). Rotated on every successful
     /// reattach. MUST NOT be logged — log only `identity.fingerprint()` (D-07).
     token: Mutex<[u8; 16]>,
+    /// The PTY master writer. Taken by the pump on each attach; returned to the
+    /// slot by the TransportLost path so a reattach pump can reclaim it.
+    /// `None` while a pump is running (writer is in the blocking task).
+    pub pty_writer: Mutex<Option<crate::session::PtyWriter>>,
 }
 
 impl SessionSlot {
     /// Wrap a `Session` in a new Active slot.
     ///
     /// Initializes the reattach token to a fresh CSPRNG uuid v4 (D-05).
+    /// The PTY writer is stored as `None` initially; the caller (server) stores
+    /// it via `pty_writer` after taking it from the session.
     pub fn new(session: Session) -> Arc<SessionSlot> {
         let identity = session.identity.clone();
         let session_id = session.session_id;
@@ -246,7 +252,30 @@ impl SessionSlot {
             state: Mutex::new(SlotState::Active),
             last_active: Mutex::new(Instant::now()),
             token: Mutex::new(Uuid::new_v4().into_bytes()),
+            pty_writer: Mutex::new(None),
         })
+    }
+
+    /// Take the PTY writer out of the slot for use by the I/O pump.
+    /// Returns `None` if the writer is currently held by a pump (or never stored).
+    pub fn take_pty_writer(&self) -> Option<crate::session::PtyWriter> {
+        self.pty_writer.lock().unwrap().take()
+    }
+
+    /// Return the PTY writer to the slot (called by the TransportLost path so
+    /// a future reattach pump can reclaim it).
+    pub fn return_pty_writer(&self, w: crate::session::PtyWriter) {
+        *self.pty_writer.lock().unwrap() = Some(w);
+    }
+
+    /// Clone a new PTY reader from the master (for the reattach pump).
+    /// `portable_pty::MasterPty::try_clone_reader` is used; may fail if the PTY
+    /// has already been closed (shell exited).
+    pub fn clone_pty_reader(&self) -> anyhow::Result<crate::session::PtyReader> {
+        self.session
+            .lock()
+            .unwrap()
+            .try_clone_reader()
     }
 
     /// Update `last_active` to now. Call cheaply while the client is attached
