@@ -103,7 +103,14 @@ impl NoshPublicKey {
 }
 
 /// Load an OpenSSH `authorized_keys` file into pinned keys (match on key only;
-/// options/comments are ignored — decision D-07). Non-Ed25519 lines are an error.
+/// options/comments are ignored — decision D-07).
+///
+/// Unsupported key types (non-Ed25519) and malformed lines are logged via
+/// `tracing::warn` and skipped — this matches `sshd(8)` behaviour. The
+/// accepted-key set is a strict subset of the set that
+/// `NoshPublicKey::from_openssh_line` accepts, so skipping a bad line is
+/// fail-closed: no malformed line is ever coerced into an accepted key
+/// (T-09-04 security invariant).
 pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<NoshPublicKey>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read authorized_keys {}", path.display()))?;
@@ -113,10 +120,19 @@ pub fn load_authorized_keys(path: &Path) -> anyhow::Result<Vec<NoshPublicKey>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        keys.push(
-            NoshPublicKey::from_openssh_line(line)
-                .with_context(|| format!("authorized_keys entry: {line}"))?,
-        );
+        match NoshPublicKey::from_openssh_line(line) {
+            Ok(key) => keys.push(key),
+            Err(e) => {
+                // Log only the key-type token (first whitespace-delimited field)
+                // and the parse error — never the full line or key material (D-07).
+                let key_type = line.split_whitespace().next().unwrap_or("<empty>");
+                tracing::warn!(
+                    key_type,
+                    error = %e,
+                    "authorized_keys entry unsupported or malformed; skipping (sshd behaviour)"
+                );
+            }
+        }
     }
     Ok(keys)
 }
@@ -283,6 +299,95 @@ mod tests {
         let k1 = NoshPublicKey::from_raw([1u8; 32]);
         let k2 = NoshPublicKey::from_raw([2u8; 32]);
         assert_ne!(k1.fingerprint(), k2.fingerprint(), "distinct keys must have distinct fingerprints");
+    }
+
+    // ── authorized_keys warn+skip tests (T-09-04 / ROBUST-01) ─────────────────
+
+    /// A minimal valid ssh-ed25519 public key line for test fixtures.
+    /// (Key: all-zero 32 bytes, base64-encoded in the OpenSSH wire format.)
+    const VALID_ED25519_LINE: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP5OAQXqCeqHDMTf0SnL0jxqJTMFZKzw3LZ7dLVJqPiB test-comment";
+
+    /// A representative ssh-rsa public key line (not Ed25519, not supported).
+    const RSA_LINE: &str =
+        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAQQCt6d20tlxUoRqfVJCM8tFg1/tgIH6N0B7H9IFaobIWA2mz4HhTHnxaSKb8JOa/bD7f8p3IlA7rL1h1yN4JxX7 rsa-comment";
+
+    /// A completely malformed / garbage line.
+    const GARBAGE_LINE: &str = "not-a-key garbage here $$$";
+
+    /// Test 1: mixed file loads exactly one key (the Ed25519 one).
+    #[test]
+    fn mixed_authorized_keys_loads_one_ed25519() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized_keys");
+        let content = format!("{}\n{}\n{}\n", VALID_ED25519_LINE, RSA_LINE, GARBAGE_LINE);
+        fs::write(&path, content).unwrap();
+
+        let keys = load_authorized_keys(&path)
+            .expect("load_authorized_keys must succeed even with mixed entries");
+
+        assert_eq!(
+            keys.len(),
+            1,
+            "mixed file must produce exactly 1 key (the Ed25519 one)"
+        );
+
+        // Fingerprint of the loaded key must match the known Ed25519 fixture.
+        let expected = NoshPublicKey::from_openssh_line(VALID_ED25519_LINE)
+            .expect("test fixture must parse")
+            .fingerprint();
+        assert_eq!(
+            keys[0].fingerprint(),
+            expected,
+            "loaded key fingerprint must match the Ed25519 fixture"
+        );
+    }
+
+    /// Test 2: a file with only unsupported/malformed lines loads 0 keys and
+    /// returns Ok (not Err) — warn+skip is fail-closed, not fail-open.
+    #[test]
+    fn all_bad_authorized_keys_returns_empty_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized_keys");
+        let content = format!("{}\n{}\n", RSA_LINE, GARBAGE_LINE);
+        fs::write(&path, content).unwrap();
+
+        let keys = load_authorized_keys(&path)
+            .expect("load_authorized_keys must return Ok even if no keys parse");
+
+        assert!(
+            keys.is_empty(),
+            "all-bad file must produce 0 keys, got {}",
+            keys.len()
+        );
+    }
+
+    /// Test 3 (fail-closed): the set of accepted keys after skipping bad lines
+    /// is a subset of the original; no malformed line becomes an accepted key.
+    #[test]
+    fn skip_is_fail_closed_no_bad_key_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized_keys");
+        // Mix: one valid Ed25519, one RSA (rejected by from_openssh_line), one garbage.
+        let content = format!("{}\n{}\n{}\n", VALID_ED25519_LINE, RSA_LINE, GARBAGE_LINE);
+        fs::write(&path, content).unwrap();
+
+        let keys = load_authorized_keys(&path).unwrap();
+
+        // None of the accepted keys' fingerprints can match the RSA or garbage lines
+        // (which have no valid Ed25519 representation). This trivially holds when
+        // len == 1, but assert explicitly so the invariant is documented.
+        for k in &keys {
+            // The only accepted key must be the Ed25519 one.
+            let fp = k.fingerprint();
+            let expected_fp = NoshPublicKey::from_openssh_line(VALID_ED25519_LINE)
+                .unwrap()
+                .fingerprint();
+            assert_eq!(
+                fp, expected_fp,
+                "accepted key must match the valid Ed25519 fixture, not a malformed entry"
+            );
+        }
     }
 
     #[test]
