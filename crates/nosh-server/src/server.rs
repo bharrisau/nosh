@@ -396,11 +396,11 @@ async fn run_session(
                         // D-01: explicit SessionClose → teardown, NOT orphan.
                         break SessionEnd::ClientClosed;
                     }
-                    // Phase 6 reattach control frames — not expected in a live session pump.
-                    // Ack is handled in Phase 6 (plan 06-03); ignore silently for now.
-                    Ok(Message::Ack { .. }) => {
+                    // Phase 6: client sends Ack{seq} periodically; trim the output buffer
+                    // so acked bytes don't linger (D-08 continuous acking).
+                    Ok(Message::Ack { seq }) => {
                         slot.touch();
-                        // trim_acked will be wired in Plan 06-03
+                        slot.trim_acked(seq);
                     }
                     Ok(Message::SessionOpened { .. })
                     | Ok(Message::Reattach { .. })

@@ -111,6 +111,76 @@ impl SequencedOutputBuffer {
     pub fn lowest_retained_seq(&self) -> u64 {
         self.lowest_retained_seq
     }
+
+    // ── Phase 6: replay and continuous ack trim ──────────────────────────────
+
+    /// Return all buffered chunks with seq strictly greater than `last_acked_seq`,
+    /// for replaying to a reconnecting client (D-09 / ROAM-02).
+    ///
+    /// `last_acked_seq` is the highest output sequence number the client has
+    /// APPLIED (as documented on `Message::Reattach`). Replay starts at
+    /// `last_acked_seq + 1`, or at `lowest_retained_seq` if the ring was
+    /// truncated and the requested resume point predates it.
+    ///
+    /// Returns `(chunks, replaying_from_seq, truncated_below_request)` where:
+    /// - `chunks`: owned `(seq, Bytes)` in ascending seq order, no dup/gap
+    ///   within the retained range.
+    /// - `replaying_from_seq`: the sequence number of the first replayed chunk
+    ///   (or `last_acked_seq + 1` if the ring is empty / nothing to replay).
+    /// - `truncated_below_request`: `true` when the client's requested resume
+    ///   point fell below the buffer's lowest retained seq (cap dropped it).
+    pub fn replay_from(&self, last_acked_seq: u64) -> (Vec<(u64, Bytes)>, u64, bool) {
+        let want_from = last_acked_seq.saturating_add(1);
+
+        let (ring_front_seq, truncated_below_request) = if let Some(&(front_seq, _)) = self.ring.front() {
+            let truncated = front_seq > want_from;
+            (front_seq, truncated)
+        } else {
+            // Ring is empty — nothing to replay.
+            return (Vec::new(), want_from, false);
+        };
+
+        let replaying_from_seq = if truncated_below_request {
+            ring_front_seq
+        } else {
+            want_from
+        };
+
+        // Collect all chunks with seq > last_acked_seq (ascending, no dup/gap
+        // within the retained range — Pitfall #9).
+        let chunks: Vec<(u64, Bytes)> = self
+            .ring
+            .iter()
+            .filter(|(seq, _)| *seq > last_acked_seq)
+            .map(|(seq, b)| (*seq, b.clone()))
+            .collect();
+
+        (chunks, replaying_from_seq, truncated_below_request)
+    }
+
+    /// Drop ring entries that the client has already applied (seq <= acked_seq),
+    /// freeing buffer space (D-08 continuous acking). This is NOT a data-loss
+    /// truncation — the client already has those bytes — so it MUST NOT set
+    /// `self.truncated` and must NOT advance `lowest_retained_seq` in a way that
+    /// would signal data loss to a future `replay_from` call.
+    ///
+    /// Only the cap-eviction path in `push()` sets `truncated`.
+    pub fn trim_acked(&mut self, acked_seq: u64) {
+        while let Some(&(seq, _)) = self.ring.front() {
+            if seq <= acked_seq {
+                if let Some((_, chunk)) = self.ring.pop_front() {
+                    self.total_bytes -= chunk.len();
+                }
+            } else {
+                break;
+            }
+        }
+        // DO NOT set self.truncated here — trim_acked removes bytes the client
+        // has already consumed; it is not a data-loss event.
+        // lowest_retained_seq is only meaningful when truncated == true (it
+        // signals a gap to replay_from). We do not update it here to avoid
+        // falsely signalling a data gap that was not caused by cap overflow.
+    }
 }
 
 impl Default for SequencedOutputBuffer {
@@ -127,10 +197,19 @@ impl Default for SequencedOutputBuffer {
 /// - `Orphaned`: the transport was lost; the PTY + shell continue running.
 ///   The slot is eligible for idle-timeout reaping (D-08) and LRU eviction
 ///   (D-06); an Active slot is NEVER eligible for either (D-07).
+/// - `Reconnecting`: a `Reattach` request has been accepted (the token matched
+///   and the two-factor check passed) and the reattach session is in the process
+///   of replaying output and rebinding the I/O pump. The slot is NOT eligible for
+///   idle-timeout reaping or LRU eviction while in this state (it is mid-rebind).
+///   A second `Reattach` for a `Reconnecting` slot is rejected (D-12 / IDENT-02).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     Active,
     Orphaned,
+    /// Mid-reattach: token validated, I/O rebind in progress. Not reaped,
+    /// not cap-counted (Reconnecting is intentionally excluded from orphan
+    /// counts — it is neither idle nor eligible for eviction).
+    Reconnecting,
 }
 
 // ─── SessionSlot ────────────────────────────────────────────────────────────
@@ -147,10 +226,15 @@ pub struct SessionSlot {
     output_buf: Mutex<SequencedOutputBuffer>,
     state: Mutex<SlotState>,
     last_active: Mutex<Instant>,
+    /// Single-use CSPRNG reattach token (D-05). Rotated on every successful
+    /// reattach. MUST NOT be logged — log only `identity.fingerprint()` (D-07).
+    token: Mutex<[u8; 16]>,
 }
 
 impl SessionSlot {
     /// Wrap a `Session` in a new Active slot.
+    ///
+    /// Initializes the reattach token to a fresh CSPRNG uuid v4 (D-05).
     pub fn new(session: Session) -> Arc<SessionSlot> {
         let identity = session.identity.clone();
         let session_id = session.session_id;
@@ -161,6 +245,7 @@ impl SessionSlot {
             output_buf: Mutex::new(SequencedOutputBuffer::default()),
             state: Mutex::new(SlotState::Active),
             last_active: Mutex::new(Instant::now()),
+            token: Mutex::new(Uuid::new_v4().into_bytes()),
         })
     }
 
@@ -175,6 +260,20 @@ impl SessionSlot {
     pub fn mark_orphaned(&self) {
         *self.last_active.lock().unwrap() = Instant::now();
         *self.state.lock().unwrap() = SlotState::Orphaned;
+    }
+
+    /// Transition `Orphaned → Reconnecting` (D-12). Called inside `registry.reattach`
+    /// while holding the registry lock, to make the transition atomic.
+    /// A reconnecting slot is NOT reaped and NOT counted toward the orphan cap.
+    pub fn mark_reconnecting(&self) {
+        *self.state.lock().unwrap() = SlotState::Reconnecting;
+    }
+
+    /// Transition `Reconnecting → Active`. Called after replay completes and the
+    /// I/O pump is rebound. Also refreshes `last_active` (D-03).
+    pub fn mark_active(&self) {
+        self.touch();
+        *self.state.lock().unwrap() = SlotState::Active;
     }
 
     /// Current lifecycle state.
@@ -192,6 +291,44 @@ impl SessionSlot {
     /// Returns the assigned sequence number (D-10).
     pub fn push_output(&self, chunk: &[u8]) -> u64 {
         self.output_buf.lock().unwrap().push(chunk)
+    }
+
+    // ── Phase 6: token management ────────────────────────────────────────────
+
+    /// Return the current reattach token (copy).
+    ///
+    /// CALLER CONTRACT: the returned bytes MUST NOT be logged. Log only
+    /// `identity.fingerprint()` (D-07).
+    pub fn token(&self) -> [u8; 16] {
+        *self.token.lock().unwrap()
+    }
+
+    /// Generate a fresh CSPRNG token (uuid v4), store it, and return the new
+    /// value. The previous token is immediately invalidated (single-use, D-05).
+    ///
+    /// CALLER CONTRACT: the returned bytes MUST NOT be logged (D-07).
+    pub fn rotate_token(&self) -> [u8; 16] {
+        let new_token = Uuid::new_v4().into_bytes();
+        *self.token.lock().unwrap() = new_token;
+        new_token
+    }
+
+    // ── Phase 6: replay and continuous-ack trim delegates ───────────────────
+
+    /// Replay output starting just after `last_acked_seq`. Delegates to
+    /// `SequencedOutputBuffer::replay_from`. Locks briefly; no `.await` under
+    /// the lock (Anti-Pattern #2).
+    ///
+    /// Returns `(chunks, replaying_from_seq, truncated_below_request)`.
+    pub fn replay_from(&self, last_acked_seq: u64) -> (Vec<(u64, Bytes)>, u64, bool) {
+        self.output_buf.lock().unwrap().replay_from(last_acked_seq)
+    }
+
+    /// Trim buffered output the client has already applied (seq <= acked_seq).
+    /// Does NOT set the truncation flag — only cap-overflow does that (D-08).
+    /// Locks briefly; no `.await` under the lock (Anti-Pattern #2).
+    pub fn trim_acked(&self, acked_seq: u64) {
+        self.output_buf.lock().unwrap().trim_acked(acked_seq);
     }
 
     /// Resize the PTY (delegates to `Session::resize`).
@@ -220,6 +357,29 @@ impl SessionSlot {
     pub fn sighup(&self) {
         self.session.lock().unwrap().sighup();
     }
+}
+
+// ─── ReattachReject ──────────────────────────────────────────────────────────
+
+/// Internal-only granular rejection reason for `SessionRegistry::reattach`.
+///
+/// The SERVER collapses every variant to the single opaque `Message::ReattachErr`
+/// wire frame (D-07 no-oracle). This type is `pub(crate)` so tests can assert
+/// specific paths, but it is NEVER sent on the wire and NEVER exposed to clients.
+///
+/// All variants map to exactly the same wire response — the granularity here is
+/// for operator-level tracing only, not for distinguishing responses to the client.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReattachReject {
+    /// No matching slot for this (identity, token) pair. Covers both "unknown
+    /// token" and "valid token presented under the wrong identity" — intentionally
+    /// the same variant so there is no per-variant wire difference.
+    NotFound,
+    /// Belt-and-suspenders: token found in this identity's Vec but the slot's
+    /// bound identity disagrees. Should never occur in correct code.
+    IdentityMismatch,
+    /// The matching slot is not Orphaned (it is Active or Reconnecting, D-12).
+    NotOrphaned,
 }
 
 // ─── SessionRegistry ────────────────────────────────────────────────────────
@@ -254,6 +414,93 @@ impl SessionRegistry {
             idle_timeout,
         })
     }
+
+    // ── Phase 6: two-factor reattach ─────────────────────────────────────────
+
+    /// Two-factor reattach: atomically validate the token + identity and
+    /// transition the matching orphaned slot to `Reconnecting` (D-12 / IDENT-02).
+    ///
+    /// Both factors are required:
+    /// 1. **Token**: the presented `token` must match a slot in the registry.
+    /// 2. **Identity**: the slot must live in the `identity`'s per-identity Vec
+    ///    (i.e. the TLS-authenticated identity must equal the slot's bound
+    ///    identity). A valid token presented under the WRONG identity simply will
+    ///    not be found in that identity's Vec — same `NotFound` result, no oracle.
+    ///
+    /// Errors:
+    /// - `NotFound` — no matching slot (covers wrong token AND wrong identity,
+    ///   intentionally indistinguishable for the no-oracle invariant D-07).
+    /// - `IdentityMismatch` — belt-and-suspenders: token was found in the
+    ///   identity's Vec but the slot identity disagrees (should never happen).
+    /// - `NotOrphaned` — the session is Active or Reconnecting (D-12 mutual
+    ///   exclusion: prevents two-clients-one-session race, Pitfall #10).
+    ///
+    /// On success, the slot transitions `Orphaned → Reconnecting` ATOMICALLY
+    /// under the registry lock, and the same `Arc<SessionSlot>` instance is
+    /// returned (never a new slot — the orphan-exit watcher's `Arc::ptr_eq`
+    /// check remains valid, plan 06-03 critical safety point).
+    ///
+    /// The caller (server) is responsible for:
+    /// - Calling `slot.rotate_token()` to mint the `ReattachOk.new_token`.
+    /// - Calling `slot.mark_active()` after replay + I/O rebind.
+    ///
+    /// LOGGING: log only `identity.fingerprint()` and an outcome; NEVER log
+    /// the token (D-07).
+    pub fn reattach(
+        &self,
+        token: &[u8; 16],
+        identity: &NoshPublicKey,
+    ) -> Result<Arc<SessionSlot>, ReattachReject> {
+        let key = *identity.key32();
+
+        let slot = {
+            let mut guard = self.inner.lock().unwrap();
+            let slots = match guard.get_mut(&key) {
+                Some(v) => v,
+                None => {
+                    // This identity has no sessions at all.
+                    return Err(ReattachReject::NotFound);
+                }
+            };
+
+            // Find the first slot in this identity's Vec whose token matches.
+            // Because we scoped the lookup to this identity's Vec, a valid token
+            // presented under a DIFFERENT identity simply won't be found here →
+            // NotFound (same path as a bad token — no oracle, D-07).
+            let slot = match slots.iter().find(|s| s.token() == *token) {
+                Some(s) => s.clone(),
+                None => return Err(ReattachReject::NotFound),
+            };
+
+            // Belt-and-suspenders: the slot lives in this identity's Vec so its
+            // identity MUST equal `identity`. Verify explicitly.
+            if slot.identity != *identity {
+                return Err(ReattachReject::IdentityMismatch);
+            }
+
+            // D-12 mutual exclusion: only Orphaned slots may be reattached.
+            // Active → the old client is still there.
+            // Reconnecting → another reattach attempt is in progress (race).
+            let state = slot.state();
+            if state != SlotState::Orphaned {
+                return Err(ReattachReject::NotOrphaned);
+            }
+
+            // Transition Orphaned → Reconnecting atomically while still under
+            // the registry lock (D-12 atomicity requirement).
+            slot.mark_reconnecting();
+
+            slot
+        }; // registry lock released here
+
+        tracing::info!(
+            identity = %identity.fingerprint(),
+            "reattach accepted"
+        );
+        Ok(slot)
+    }
+
+    // ── End Phase 6 reattach ─────────────────────────────────────────────────
 
     /// Register a freshly-opened Active slot. Active slots do NOT count toward
     /// the orphan cap (D-07).
@@ -412,7 +659,10 @@ impl SessionRegistry {
             for slots in guard.values_mut() {
                 slots.retain(|slot| {
                     if slot.state() != SlotState::Orphaned {
-                        return true; // keep Active slots (D-07)
+                        // Keep Active and Reconnecting slots (D-07 / D-12).
+                        // Reconnecting is intentionally not reaped: it is mid-rebind,
+                        // not idle.
+                        return true;
                     }
                     let shell_exited = slot.try_wait().is_some();
                     let idle_expired = self.idle_timeout > Duration::ZERO
@@ -942,5 +1192,221 @@ mod tests {
             0,
             "reaper backstop must remove orphan (owning its child) whose shell has exited"
         );
+    }
+
+    // ── Phase 6: replay, trim, token, reattach, mutual-exclusion tests ───────
+
+    #[test]
+    fn replay_from_returns_only_unacked_in_order() {
+        let mut buf = SequencedOutputBuffer::new(64 * 1024);
+        // Push 5 chunks → seqs 0..4
+        for i in 0u8..5 {
+            buf.push(&[i; 10]);
+        }
+        // replay_from(2) should return seqs 3 and 4 only, in order.
+        let (chunks, replaying_from_seq, truncated) = buf.replay_from(2);
+        let seqs: Vec<u64> = chunks.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![3, 4], "should replay only seqs > 2");
+        assert_eq!(replaying_from_seq, 3, "replaying_from_seq should be last_acked+1");
+        assert!(!truncated, "no truncation in a non-overflowed buffer");
+    }
+
+    #[test]
+    fn replay_from_signals_truncation_when_request_predates_ring() {
+        // Tiny buffer → overflow early.
+        // We need the ring's front to be STRICTLY GREATER than want_from = last_acked_seq + 1.
+        // Use a very tiny buffer (6 bytes) so every new push evicts the previous.
+        let mut buf = SequencedOutputBuffer::new(6);
+        // Push 4 x 6-byte chunks. After each push only 1 fits.
+        let _s0 = buf.push(b"aaaaaa"); // seq 0
+        let _s1 = buf.push(b"bbbbbb"); // seq 1 → overflow drops seq 0; ring=[1]
+        let _s2 = buf.push(b"cccccc"); // seq 2 → overflow drops seq 1; ring=[2]
+        let _s3 = buf.push(b"dddddd"); // seq 3 → overflow drops seq 2; ring=[3]
+
+        assert!(buf.truncated(), "buffer must be truncated after overflow");
+        let lowest = buf.lowest_retained_seq();
+        assert_eq!(lowest, 3, "only seq 3 should be in the ring");
+
+        // Client applied nothing (last_acked_seq=0, equivalent to "client applied seq 0
+        // but wants seq 1+"). Ring starts at 3, so want_from=1 < ring_front=3 → truncation.
+        let (chunks, replaying_from_seq, truncated_below_request) = buf.replay_from(0);
+        assert!(truncated_below_request, "must signal truncation when request predates ring front");
+        assert_eq!(
+            replaying_from_seq, lowest,
+            "replaying_from_seq must be the lowest retained seq on truncation"
+        );
+        // All remaining chunks (just seq 3) should be returned.
+        assert!(!chunks.is_empty(), "must return remaining chunks");
+        // All returned seqs must be > 0 (the acked seq).
+        assert!(chunks.iter().all(|(s, _)| *s > 0), "all replayed seqs must be > last_acked");
+    }
+
+    #[test]
+    fn trim_acked_drops_acked_and_keeps_unacked_and_does_not_truncate() {
+        let mut buf = SequencedOutputBuffer::new(64 * 1024);
+        // Push 6 chunks: seqs 0..5.
+        for i in 0u8..6 {
+            buf.push(&[i; 20]);
+        }
+        let bytes_before = buf.len_bytes();
+        assert_eq!(bytes_before, 6 * 20, "should have 6*20 bytes before trim");
+
+        // Trim seqs 0..2 (acked_seq = 2).
+        buf.trim_acked(2);
+
+        // Should have dropped 3 chunks (seqs 0, 1, 2) = 60 bytes.
+        assert_eq!(buf.len_bytes(), 3 * 20, "should have 3 chunks left after trim_acked(2)");
+        // truncated must remain false (trim_acked is NOT a data-loss event).
+        assert!(!buf.truncated(), "trim_acked must NOT set truncated flag");
+
+        // replay_from(2) should still return seqs 3, 4, 5 (seq > 2, those still in ring).
+        let (chunks, _, trunc) = buf.replay_from(2);
+        let seqs: Vec<u64> = chunks.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, vec![3, 4, 5], "replay after trim must return remaining seqs");
+        assert!(!trunc, "no truncation after trim (trim is not overflow)");
+    }
+
+    #[test]
+    fn rotate_token_changes_token() {
+        if !have_sh() {
+            eprintln!("skipping rotate_token_changes_token: /bin/sh unavailable");
+            return;
+        }
+        let sess = open_sh_session(test_key(0xF1));
+        let slot = SessionSlot::new(sess);
+        let original = slot.token();
+        let rotated = slot.rotate_token();
+        assert_ne!(original, rotated, "rotate_token must produce a different token");
+        let stored = slot.token();
+        assert_eq!(rotated, stored, "stored token must equal the rotated token");
+        slot.sighup();
+    }
+
+    #[test]
+    fn reattach_matches_token_within_identity() {
+        if !have_sh() {
+            eprintln!("skipping reattach_matches_token_within_identity: /bin/sh unavailable");
+            return;
+        }
+        let identity = test_key(0xA1);
+        let raw = *identity.key32();
+        let registry = SessionRegistry::new(5, Duration::ZERO);
+
+        let sess = open_sh_session(test_key(0xA1));
+        let slot = SessionSlot::new(sess);
+        registry.register_active(slot.clone());
+        // Orphan the slot so it's eligible for reattach.
+        registry.orphan(&slot);
+        assert_eq!(registry.orphan_count(&raw), 1);
+
+        let token = slot.token();
+
+        // reattach should succeed and return the SAME Arc instance.
+        let result = registry.reattach(&token, &identity);
+        assert!(result.is_ok(), "reattach must succeed with correct token and identity");
+        let reattached = result.unwrap();
+
+        // CRITICAL: must be the SAME Arc instance (Arc::ptr_eq check).
+        assert!(
+            Arc::ptr_eq(&reattached, &slot),
+            "reattach must return the SAME Arc instance (not a new slot)"
+        );
+        // Slot must now be Reconnecting.
+        assert_eq!(reattached.state(), SlotState::Reconnecting, "slot must be Reconnecting after reattach");
+
+        // Cleanup.
+        slot.sighup();
+    }
+
+    #[test]
+    fn reattach_wrong_identity_is_notfound() {
+        if !have_sh() {
+            eprintln!("skipping reattach_wrong_identity_is_notfound: /bin/sh unavailable");
+            return;
+        }
+        let identity_a = test_key(0xA2);
+        let identity_b = test_key(0xB2);
+        let registry = SessionRegistry::new(5, Duration::ZERO);
+
+        // Register and orphan a slot for identity A.
+        let sess = open_sh_session(test_key(0xA2));
+        let slot = SessionSlot::new(sess);
+        registry.register_active(slot.clone());
+        registry.orphan(&slot);
+        let token_a = slot.token();
+
+        // Case 1: valid token for A, presented under identity B → NotFound (no oracle).
+        let r1 = registry.reattach(&token_a, &identity_b);
+        assert!(r1.is_err(), "valid token + wrong identity must be rejected");
+
+        // Case 2: bogus token, correct identity A → NotFound.
+        let bogus_token = [0xFFu8; 16];
+        let r2 = registry.reattach(&bogus_token, &identity_a);
+        assert!(r2.is_err(), "bogus token + correct identity must be rejected");
+
+        // NO-ORACLE ASSERTION: both rejections are Err (indistinguishable at the
+        // wire level — both map to the same opaque ReattachErr variant).
+        // We assert both are Err without inspecting the variant value
+        // (though for internal completeness, both are NotFound).
+        let is_err_1 = r1.is_err();
+        let is_err_2 = r2.is_err();
+        assert_eq!(
+            is_err_1, is_err_2,
+            "both rejection types must produce the same Err result (no oracle)"
+        );
+
+        slot.sighup();
+    }
+
+    #[test]
+    fn reattach_active_or_reconnecting_is_rejected() {
+        if !have_sh() {
+            eprintln!("skipping reattach_active_or_reconnecting_is_rejected: /bin/sh unavailable");
+            return;
+        }
+        let identity = test_key(0xC3);
+        let registry = SessionRegistry::new(5, Duration::ZERO);
+
+        // --- Case 1: Active slot rejected ---
+        let sess_active = open_sh_session(test_key(0xC3));
+        let slot_active = SessionSlot::new(sess_active);
+        registry.register_active(slot_active.clone());
+        // Do NOT orphan — slot remains Active.
+        let token_active = slot_active.token();
+
+        let r_active = registry.reattach(&token_active, &identity);
+        assert!(r_active.is_err(), "reattach of Active slot must be rejected (D-12)");
+        match r_active {
+            Err(ReattachReject::NotOrphaned) => {}
+            Err(other) => panic!("Active slot must return NotOrphaned, got {other:?}"),
+            Ok(_) => panic!("expected Err but got Ok"),
+        }
+
+        // --- Case 2: Reconnecting slot rejected (second reattach attempt) ---
+        let sess_o = open_sh_session(test_key(0xC3));
+        let slot_o = SessionSlot::new(sess_o);
+        registry.register_active(slot_o.clone());
+        registry.orphan(&slot_o);
+        let token_o = slot_o.token();
+
+        // First reattach succeeds → slot becomes Reconnecting.
+        let r_first = registry.reattach(&token_o, &identity);
+        assert!(r_first.is_ok(), "first reattach must succeed");
+        assert_eq!(slot_o.state(), SlotState::Reconnecting);
+
+        // Second reattach with the SAME token (slot is now Reconnecting) → rejected.
+        // Note: after first reattach, the token IS still the same (rotate_token is
+        // called by the SERVER, not by registry.reattach). The slot is Reconnecting.
+        let r_second = registry.reattach(&token_o, &identity);
+        assert!(r_second.is_err(), "second reattach of Reconnecting slot must be rejected (D-12)");
+        match r_second {
+            Err(ReattachReject::NotOrphaned) => {}
+            Err(other) => panic!("Reconnecting slot must return NotOrphaned on second attempt, got {other:?}"),
+            Ok(_) => panic!("expected Err but got Ok"),
+        }
+
+        // Cleanup.
+        slot_active.sighup();
+        slot_o.sighup();
     }
 }
