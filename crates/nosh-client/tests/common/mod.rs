@@ -61,9 +61,7 @@ impl TestKey {
 }
 
 fn fill_random(buf: &mut [u8; 32]) {
-    use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").unwrap();
-    f.read_exact(buf).unwrap();
+    getrandom::getrandom(buf).expect("getrandom failed");
 }
 
 /// A running in-process server with its trust-file scratch dir.

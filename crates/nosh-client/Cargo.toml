@@ -45,6 +45,7 @@ ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "s
 ed25519-dalek = "2.2"
 tokio = { workspace = true, features = ["signal", "process"] }
 tempfile = "3"
+getrandom = "0.2"
 # Enable quinn's qlog feature for the test build so the migration test can
 # attach a QlogStream (D-05). Feature-unification means this propagates into
 # the test binary without affecting the production binary path.

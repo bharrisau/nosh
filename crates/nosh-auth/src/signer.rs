@@ -107,7 +107,8 @@ impl InProcessEd25519Signer {
         Ok(Self::new(key))
     }
 
-    /// Generate a fresh random key (tests).
+    /// Generate a fresh random key (tests only).
+    #[cfg(test)]
     pub fn generate() -> Self {
         use ed25519_dalek::SigningKey;
         let mut seed = [0u8; 32];
@@ -235,11 +236,12 @@ fn warn_if_loose_permissions(path: &std::path::Path) {
 }
 
 /// Fill `buf` with OS randomness (small helper to avoid pulling rand directly).
+/// Uses the `getrandom` crate so this works on all platforms (Linux, macOS,
+/// Windows) — the original `/dev/urandom` open panicked on Windows.
+/// Only used in `#[cfg(test)]` code.
+#[cfg(test)]
 fn getrandom_seed(buf: &mut [u8; 32]) {
-    use std::io::Read;
-    // /dev/urandom is always available on the Linux spike target.
-    let mut f = std::fs::File::open("/dev/urandom").expect("open /dev/urandom");
-    f.read_exact(buf).expect("read /dev/urandom");
+    getrandom::getrandom(buf).expect("getrandom failed");
 }
 
 impl RawEd25519Signer for InProcessEd25519Signer {
