@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: M3 Roaming + Windows Client
 status: executed
-stopped_at: Phase 9 executed + opus-verified (human_needed); milestone lifecycle (audit→complete→cleanup) paused pending Windows-host re-validation
+stopped_at: Phase 9 done + Windows-host validation PASSED; milestone lifecycle (audit→complete→cleanup) ready to run
 last_updated: "2026-05-30T06:45:00.000Z"
 last_activity: 2026-05-30 -- Phase 09 (Windows Client Polish & Hardening) executed, reviewed, opus-verified
 progress:
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-05-29)
 
 ## Current Position
 
-Phase: 9 (executed + opus-verified, human_needed)
+Phase: 9 (done + Windows-host validated)
 Plan: All complete (4–9)
-Status: Milestone lifecycle paused — run `/gsd:autonomous` to trigger audit→complete→cleanup (or validate Phase 9 on a Windows host first)
-Last activity: 2026-05-30 -- Phase 09 executed, reviewed, opus-verified
+Status: Windows validation PASSED — milestone lifecycle ready; run `/gsd:autonomous` to trigger audit→complete→cleanup
+Last activity: 2026-05-30 -- Phase 09 Windows-host validation passed (vim/arrows/~./roaming confirmed)
 
 ```
 Progress: [██████████] 100% (6/6 phases executed)
@@ -85,7 +85,7 @@ Recent decisions affecting current work:
 
 **From 2026-05-30 live Windows→Linux validation (native Windows client authenticated + opened PTY session OK):**
 
-> **RESOLVED in Phase 9** (commits `eb2659b` VT-console+`~.`, `2bf6c9d` migration log, `5af3757` authorized_keys skip, `43ba8ac` connect timeout+PathBuf gate, `2d4db1e`/`edb77b8`/`83c6186` review fixes). Verified 6/6 on Linux; opus-verified `human_needed` for the Windows-runtime confirmations (VT input behavior, `~.` end-to-end on Windows, PathBuf warning-absence). **Still OPEN:** only the `WSAEMSGSIZE` investigation below (deliberately deferred) and the Windows-host re-test of the fixes (rebuild on Windows and confirm vim/less/arrows/PageUp-Down, Ctrl-C→remote, and `~.` quit). Validation WIN: network roaming confirmed working on the live Windows client (effectively ROAM-01 SC#4 / D-06 passing).
+> **RESOLVED in Phase 9 + VALIDATED on Windows host (2026-05-30).** Plan commits `eb2659b` VT-console+`~.`, `2bf6c9d` migration log, `5af3757` authorized_keys skip, `43ba8ac` connect timeout+PathBuf gate, `2d4db1e`/`edb77b8`/`83c6186` review fixes. Plus three Windows-validation follow-up fixes: `1c6afde` (HANDLE type, windows-sys 0.59 build break), `f83093e` (poll terminal::size() instead of EventStream — the real fix for vim REPLACE mode / dead arrows: EventStream was draining the console input queue), `263a60b` (restore terminal before process::exit). **Windows-host validation PASSED** (operator sign-off in docs/windows-client-test.md): vim NORMAL mode + arrows/PageUp-Down, less controllable, `~.` quits, Ctrl-C→remote, clean exit restores prompt, network roaming survives real path change. Phase 8 D-02 and Phase 9 Windows `human_needed` items are now CONFIRMED. **Still OPEN:** only the `WSAEMSGSIZE` investigation below (deliberately deferred; connection works) and a process item — wire a git remote so `windows-cross.yml` CI compiles the `#[cfg(windows)]` path automatically (would have caught `1c6afde`).
 
 
 - `authorized_keys` must IGNORE unsupported/unparseable entries (warn + skip, like sshd) — currently `load_authorized_keys` (`crates/nosh-auth/src/keys.rs:118`) propagates the first parse error via `?`, so a single RSA/ECDSA/malformed line rejects the entire file. Real-world `authorized_keys` files routinely contain non-Ed25519 keys.
