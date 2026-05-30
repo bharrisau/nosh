@@ -1,37 +1,40 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-29T12:25:20.506Z",
-  "phase": null,
-  "phase_name": "Milestone v1.1 setup — research deferred",
-  "phase_dir": null,
+  "timestamp": "2026-05-30T00:00:00.000Z",
+  "source": "gsd:execute-phase",
+  "partial": false,
+  "phase": 6,
+  "phase_name": "Cold Reattach Protocol",
+  "phase_dir": ".planning/phases/06-cold-reattach-protocol",
   "plan": null,
   "task": null,
-  "total_tasks": null,
-  "status": "paused",
-  "context": "research",
+  "total_tasks": 15,
+  "status": "phase-complete",
   "completed_tasks": [
-    {"id": 1, "name": "Scope v1.1 milestone (M3 Roaming + Windows Client) via questioning", "status": "done"},
-    {"id": 2, "name": "Set planning granularity coarse -> balanced for correctness-sensitive roaming work", "status": "done", "commit": "a9961f5"},
-    {"id": 3, "name": "Update PROJECT.md (Current Milestone v1.1, Active reqs, Out of Scope reconciled), reset STATE.md, clear phase dirs", "status": "done", "commit": "a9961f5"},
-    {"id": 4, "name": "Archive v1.0 research to .planning/milestones/v1.0-research/ before overwrite", "status": "done"},
-    {"id": 5, "name": "Stage full v1.1 research brief (4 researchers + synthesizer)", "status": "done", "commit": "f3608f2"}
+    "06-01: Add five reattach Message variants",
+    "06-01: Round-trip test the new variants",
+    "06-02: Add Reconnecting state and audit all SlotState uses",
+    "06-02: Add a single-use token to SessionSlot",
+    "06-02: Add SequencedOutputBuffer::replay_from and trim_acked",
+    "06-02: Add SessionSlot replay/trim delegates",
+    "06-02: Implement SessionRegistry::reattach (two-factor, atomic, opaque)",
+    "06-02: Unit tests for reattach, replay, trim, rotation, mutual exclusion",
+    "06-03: Dispatch the first frame in handle_connection",
+    "06-03: Implement run_reattach_session: authorize, rebind, replay, ack",
+    "06-03: Server-side reattach integration smoke",
+    "06-04: Add reattach-aware client helpers",
+    "06-04: Wire the reconnect supervisor into the client binary",
+    "06-04: SC#1 happy-path replay integration test",
+    "06-04: SC#2/3 no-oracle negative test and SC#4 mutual-exclusion test"
   ],
-  "remaining_tasks": [
-    {"id": 6, "name": "Run v1.1 research: spawn 4 gsd:gsd-project-researcher (Stack/Features/Architecture/Pitfalls) in parallel, then gsd:gsd-research-synthesizer for SUMMARY.md", "status": "not_started"},
-    {"id": 7, "name": "Define REQUIREMENTS.md (REQ-IDs, scoped per category) from research + locked scope decisions", "status": "not_started"},
-    {"id": 8, "name": "Spawn gsd:gsd-roadmapper to create v1.1 ROADMAP.md (continue phase numbering from v1.0's phase 3 -> start at phase 4)", "status": "not_started"}
-  ],
+  "remaining_tasks": [],
   "blockers": [],
   "human_actions_pending": [],
-  "decisions": [
-    {"decision": "v1.1 scope = M3 roaming on Linux + a bounded Windows-client slice", "rationale": "Roaming is the next headline differentiator on the proven v1.0 foundation; native Windows server (ConPTY) stays M6 to avoid two hard unrelated problems in one milestone", "phase": "v1.1"},
-    {"decision": "Session persistence = Mosh-style (survive until shell exits), configurable idle timeout default 0 (disabled), per-identity cap to bound memory", "rationale": "User preference matches Mosh; cap compensates for the disabled-by-default timeout on a network-facing daemon", "phase": "v1.1"},
-    {"decision": "Cold reattach is 1-RTT, authorization bound to the authenticated SSH identity; 0-RTT stays deferred", "rationale": "Matches brief; 1-RTT dwarfed by Wi-Fi/DHCP bring-up; identity binding prevents session hijack", "phase": "v1.1"},
-    {"decision": "Windows client signs from an on-disk OpenSSH key file (agent integration deferred); temporary Windows-only exception to 'never handle the private key' invariant; Linux ssh-agent path untouched", "rationale": "Smallest viable Windows client slice", "phase": "v1.1"},
-    {"decision": "Roaming validated headless via forced path change; real Wi-Fi->cellular as a human-verified live check", "rationale": "Deterministic, automatable validation; live run confirms reality", "phase": "v1.1"},
-    {"decision": "Granularity set to balanced for v1.1", "rationale": "Roaming has subtle ordering-dependent protocol bugs; finer plan-level checkpoints reduce risk vs the coarse v1.0 spike", "phase": "v1.1"}
+  "decisions": [],
+  "uncommitted_files": [
+    ".planning/phases/06-cold-reattach-protocol/06-VERIFICATION.md",
+    ".planning/HANDOFF.json"
   ],
-  "uncommitted_files": [],
-  "next_action": "Run the v1.1 research from .planning/RESEARCH-BRIEF-v1.1.md: spawn the 4 gsd:gsd-project-researcher agents in parallel (use the gsd: namespace prefix — bare names fail after the plugin reload), wait for all 4, then spawn gsd:gsd-research-synthesizer to write SUMMARY.md. Then continue to requirements -> roadmap.",
-  "context_notes": "Mid /gsd:new-milestone for v1.1. Milestone setup (PROJECT.md/STATE.md/config) is committed. Research was deferred at the user's request so it can be triggered later via a one-liner. The research step previously errored ONLY because /reload-plugins re-registered GSD agents under the gsd: namespace mid-session; the staged brief hard-codes the prefixed agent names so the deferred run is unaffected. Roadmap should continue phase numbering (v1.0 ended at phase 3 -> v1.1 starts at phase 4); --reset-phase-numbers was NOT requested."
+  "next_action": "Phase 7: Connection Migration (--no-transition was set, no auto-advance)",
+  "context_notes": "Phase 6 complete. All 15 tasks done across 4 waves. cargo test --workspace green (61 tests). cargo clippy clean. All 4 roadmap success criteria covered by tests. last_acked_seq convention locked: highest-applied, server replays seq > last_acked_seq."
 }
