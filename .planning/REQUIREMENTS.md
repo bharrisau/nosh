@@ -16,7 +16,7 @@ Threading the authenticated SSH identity into the server-side session is the arc
 
 ### Roaming
 
-- [ ] **ROAM-01**: A live session survives a client IP/path change (NAT rebind, interface switch) by continuing the *same* QUIC connection via connection migration, with no re-handshake and no extra round trips — validated headless via a forced path change, with a real Wi-Fi→cellular run as a human live check
+- [x] **ROAM-01**: A live session survives a client IP/path change (NAT rebind, interface switch) by continuing the *same* QUIC connection via connection migration, with no re-handshake and no extra round trips — validated headless via a forced path change, with a real Wi-Fi→cellular run as a human live check
 - [ ] **ROAM-02**: After a disconnect or resume-from-suspend, the client reconnects to its orphaned session in 1 RTT via a sequence-numbered cold-reattach message; the server replays output the client had not yet acknowledged, with no duplicated or dropped bytes
 
 ### Session Persistence
@@ -88,7 +88,7 @@ Which phases cover which requirements. Phase numbering continues from v1.0 (ende
 |-------------|-------|--------|
 | IDENT-01 | Phase 4 | Complete |
 | IDENT-02 | Phase 6 | Pending |
-| ROAM-01 | Phase 7 | Pending |
+| ROAM-01 | Phase 7 | Complete |
 | ROAM-02 | Phase 6 | Pending |
 | PERSIST-01 | Phase 5 | Pending |
 | PERSIST-02 | Phase 5 | Pending |

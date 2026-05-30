@@ -23,7 +23,7 @@ Full detail archived at `.planning/milestones/v1.0-ROADMAP.md`.
 - [x] **Phase 4: Identity Threading** — Wire `Session.identity` from the authenticated TLS handshake (fills the deliberate v1.0 seam) (completed 2026-05-30)
 - [x] **Phase 5: Session Persistence** — Orphaned sessions survive client disconnect; per-identity cap and idle timeout in place before first orphan (completed 2026-05-30)
 - [x] **Phase 6: Cold Reattach Protocol** — 1-RTT reconnect to an orphaned session with two-factor authorization (SSH handshake + token) (completed 2026-05-30)
-- [ ] **Phase 7: Connection Migration Validation** — Explicit migration config plus headless and live test coverage confirming zero-RTT roaming
+- [x] **Phase 7: Connection Migration Validation** — Explicit migration config plus headless and live test coverage confirming zero-RTT roaming (completed 2026-05-30)
 - [ ] **Phase 8: Windows Client** — Native Windows client connects to a Linux server with on-disk key signing, raw mode, resize, and locale propagation
 
 ## Phase Details
@@ -98,5 +98,5 @@ Plans:
 | 4. Identity Threading | v1.1 | 2/2 | Complete | 2026-05-30 |
 | 5. Session Persistence | v1.1 | 3/3 | Complete | 2026-05-30 |
 | 6. Cold Reattach Protocol | v1.1 | 4/4 | Complete | 2026-05-30 |
-| 7. Connection Migration Validation | v1.1 | 0/? | Not started | - |
+| 7. Connection Migration Validation | v1.1 | 2/2 | Complete   | 2026-05-30 |
 | 8. Windows Client | v1.1 | 0/? | Not started | - |
