@@ -467,19 +467,36 @@ async fn run_session(
             // D-02 / Pitfall #7: do NOT SIGHUP, do NOT reap, do NOT drop the
             // Session — the MasterPty stays open because the Session lives on
             // inside the slot held by the registry.
-            //
-            // Detach the wait_task (drop the handle without aborting) so the
-            // shell keeps running. The reaper will observe the shell's eventual
-            // exit via periodic try_wait.
-            //
-            // The in-flight I/O bridge tasks (output_reader, input_writer) are
-            // aborted below — they read/write the now-dead QUIC stream, but the
-            // PTY master fd remains open inside the slot regardless.
             tracing::info!("transport lost; orphaning session (PTY kept alive, no SIGHUP)");
             // Transition the slot to Orphaned; the registry enforces the cap.
             registry.orphan(&slot);
-            // Detach wait_task — do NOT abort; the shell must keep running.
-            drop(wait_task);
+
+            // EXIT-DETECTION (Phase 5 BLOCKER fix): the shell child was taken
+            // into `wait_task`, so the slot's `try_wait()` is permanently None
+            // and the reaper can never see this orphan's shell exit. Instead of
+            // detaching `wait_task` (which would leak the SessionSlot + MasterPty
+            // forever under the default idle_timeout=0), spawn a watcher that
+            // KEEPS the shell running, awaits its eventual exit, then removes the
+            // specific slot instance from the registry — releasing the MasterPty
+            // and freeing the per-identity cap slot.
+            //
+            // `remove_slot` is instance-keyed (Arc::ptr_eq), so once Phase 6
+            // reattach swaps a live connection onto a slot, a stale watcher from
+            // a prior orphan generation cannot evict the reattached slot. It is
+            // also idempotent: if the LRU cap already evicted this slot (and
+            // SIGHUP'd it), the watcher's later removal is a harmless no-op.
+            let watcher_registry = registry.clone();
+            let watcher_slot = slot.clone();
+            tokio::spawn(async move {
+                // Await the shell's own exit — do NOT abort; the shell must keep
+                // running while the orphan is alive (preserves SC#1).
+                let _exit = wait_task.await;
+                tracing::info!(
+                    session_id = %watcher_slot.session_id,
+                    "orphaned shell exited; removing slot (PTY released)"
+                );
+                watcher_registry.remove_slot(&watcher_slot);
+            });
         }
     }
 

@@ -341,6 +341,28 @@ impl SessionRegistry {
         }
     }
 
+    /// Remove a SPECIFIC slot instance (identity by `Arc` pointer identity, not
+    /// just `session_id`). Idempotent: if the slot is already gone (e.g. evicted
+    /// by the LRU cap, or reaped), this is a no-op.
+    ///
+    /// This is the event-driven exit path: the orphan-exit watcher spawned in
+    /// `run_session` awaits the shell's `wait_task` and then calls this to drop
+    /// the dead orphan's slot — releasing the `MasterPty` and freeing the
+    /// per-identity cap slot. Keying on the `Arc` instance (via [`Arc::ptr_eq`])
+    /// ensures that once Phase 6 reattach swaps a live connection back onto a
+    /// slot under the same `session_id`, an exit watcher from a PRIOR orphan
+    /// generation can never remove the freshly-reattached slot.
+    pub fn remove_slot(&self, slot: &Arc<SessionSlot>) {
+        let key = *slot.identity.key32();
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(slots) = guard.get_mut(&key) {
+            slots.retain(|s| !Arc::ptr_eq(s, slot));
+            if slots.is_empty() {
+                guard.remove(&key);
+            }
+        }
+    }
+
     /// Number of ORPHANED slots for an identity (test seam).
     pub fn orphan_count(&self, identity_raw: &[u8; 32]) -> usize {
         self.inner
@@ -369,6 +391,17 @@ impl SessionRegistry {
     ///
     /// Victims are COLLECTED under the lock but SIGHUPed/dropped AFTER
     /// releasing it (Anti-Pattern #2: no blocking ops under the lock).
+    ///
+    /// EXIT-DETECTION OWNERSHIP (Phase 5 BLOCKER fix): in the production server
+    /// path the shell `Child` is `take_child()`'d out of the `Session` into a
+    /// dedicated `wait_task` BEFORE the slot is orphaned, so `slot.try_wait()`
+    /// returns `None` for real orphans. Exited-orphan removal is therefore
+    /// EVENT-DRIVEN: an exit-watcher task awaits `wait_task` and calls
+    /// [`Self::remove_slot`] when the shell exits (see `run_session`). The
+    /// `try_wait()` branch below is retained as a genuine BACKSTOP for any slot
+    /// that still owns its child (e.g. unit tests, or future code paths that do
+    /// not hand the child to a watcher); it is harmless when the child was taken.
+    /// The reaper's load-bearing production duty is idle-timeout sweeping (D-08).
     pub fn reap_once(&self) {
         let now = Instant::now();
 
@@ -782,10 +815,100 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reaper_removes_exited_orphan() {
+    /// Exercise the PRODUCTION ownership path: the shell child is TAKEN out of
+    /// the Session (into a wait task) before the slot is orphaned — exactly as
+    /// `server.rs::run_session` does. The event-driven exit watcher (mirroring
+    /// the `TransportLost` arm) must remove the slot once the shell exits,
+    /// releasing the MasterPty and freeing the cap slot.
+    ///
+    /// This test FAILS against the pre-fix code (which `drop(wait_task)`s and
+    /// relies on the reaper's `try_wait`, permanently None for a taken child →
+    /// orphan_count stays 1) and PASSES after the fix.
+    #[tokio::test]
+    async fn exited_orphan_removed_via_real_taken_child_path() {
         if !have_sh() {
-            eprintln!("skipping reaper_removes_exited_orphan: /bin/sh unavailable");
+            eprintln!("skipping exited_orphan_removed_via_real_taken_child_path: /bin/sh unavailable");
+            return;
+        }
+
+        use crate::session;
+
+        let registry = SessionRegistry::new(5, Duration::ZERO);
+        let key = test_key(0x31);
+        let raw = *key.key32();
+
+        // Open a real /bin/sh and feed it a long `sleep` so the shell stays
+        // alive (running orphan) until we explicitly make it exit. We keep the
+        // writer alive so the shell's stdin does not hit EOF.
+        let passwd = session::lookup_self(Some("/bin/sh"));
+        let (mut sess, _reader, mut writer) =
+            session::open(&passwd, "xterm", 80, 24, &[], test_key(0x31)).expect("open /bin/sh");
+        use std::io::Write as _;
+        writer.write_all(b"sleep 60\n").expect("write sleep");
+        writer.flush().expect("flush");
+        // PRODUCTION PATH: take the child into a wait task BEFORE orphaning, so
+        // the slot's `try_wait()` is permanently None (child gone).
+        let child = sess.take_child().expect("session has a child");
+        let pid = sess.child_pid().expect("child pid");
+        let slot = SessionSlot::new(sess);
+        registry.register_active(slot.clone());
+        registry.orphan(&slot);
+        assert_eq!(registry.orphan_count(&raw), 1, "slot must be orphaned");
+
+        // Spawn the exit watcher exactly as the server's TransportLost arm does.
+        let wait_task = tokio::spawn(crate::session::wait_child(child));
+        let watcher_registry = registry.clone();
+        let watcher_slot = slot.clone();
+        let watcher = tokio::spawn(async move {
+            let _ = wait_task.await;
+            watcher_registry.remove_slot(&watcher_slot);
+        });
+
+        // The orphaned shell is still running: it must NOT be removed yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.orphan_count(&raw),
+            1,
+            "a still-RUNNING orphan must not be removed"
+        );
+
+        // Now make the orphaned shell exit (SIGHUP by pid — the child was taken
+        // but the pid is still recorded on the Session, just like ClientClosed).
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGHUP,
+        );
+
+        // The watcher should observe the exit and remove the slot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if registry.orphan_count(&raw) == 0 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "exited orphan was not removed within 5s; orphan_count={}",
+                    registry.orphan_count(&raw)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        watcher.await.unwrap();
+        assert_eq!(
+            registry.orphan_count(&raw),
+            0,
+            "exit watcher must remove the orphan whose shell has exited (no slot/MasterPty leak)"
+        );
+    }
+
+    /// Backstop coverage: a slot that STILL OWNS its child (child not taken)
+    /// is reaped by `reap_once()` via `try_wait` once its shell exits. This
+    /// keeps the reaper's exit branch honest for any path that does not hand the
+    /// child to a watcher.
+    #[test]
+    fn reaper_backstop_removes_exited_orphan_with_owned_child() {
+        if !have_sh() {
+            eprintln!("skipping reaper_backstop_removes_exited_orphan_with_owned_child: /bin/sh unavailable");
             return;
         }
 
@@ -793,8 +916,8 @@ mod tests {
         let key = test_key(0x30);
         let raw = *key.key32();
 
-        let sess = open_sh_session(test_key(0x30));
-        let slot = SessionSlot::new(sess);
+        // Child is NOT taken — the slot retains it, so try_wait works.
+        let slot = SessionSlot::new(open_sh_session(test_key(0x30)));
         registry.register_active(slot.clone());
         registry.orphan(&slot);
 
@@ -817,7 +940,7 @@ mod tests {
         assert_eq!(
             registry.orphan_count(&raw),
             0,
-            "reaper must remove orphan whose shell has already exited"
+            "reaper backstop must remove orphan (owning its child) whose shell has exited"
         );
     }
 }

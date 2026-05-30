@@ -150,9 +150,10 @@ async fn transport_loss_orphans_without_sighup() {
     let hup_file = format!("/tmp/nosh_hup_test_{}", std::process::id());
     let _ = std::fs::remove_file(&hup_file); // clean up any stale file
 
-    // Script: install a HUP trap that writes to a file, then run a long sleep.
+    // Script: install a HUP trap that writes to a file, print our own PID so the
+    // test can probe shell liveness via /proc after disconnect, then sleep.
     let script = format!(
-        "trap 'echo GOTHUP > {hup_file}' HUP; echo READY; sleep 60\n"
+        "trap 'echo GOTHUP > {hup_file}' HUP; echo PID=$$; echo READY; sleep 60\n"
     );
 
     let (mut send, mut recv) = client::open_session(
@@ -169,7 +170,22 @@ async fn transport_loss_orphans_without_sighup() {
         .await
         .unwrap();
 
-    // Wait until we see READY so the trap is installed.
+    // Parse the shell's executed PID (a bare `PID=<digits>` line, distinct from
+    // the echoed `PID=$$` command) so we can probe shell liveness via /proc, and
+    // wait until we see READY (also from execution) so the HUP trap is installed.
+    // The PTY echoes typed input back, so we must skip the echoed script line and
+    // read until the shell's actual output appears.
+    // Match a bare numeric `PID=<digits>` (the executed output). The echoed
+    // command line contains `PID=$$` whose first char after `=` is `$`, which
+    // fails the digit parse, so only the real PID is captured. A shell prompt
+    // (`$ `) may prefix the line, so we scan all `PID=` occurrences.
+    let parse_pid = |s: &str| -> Option<u32> {
+        s.match_indices("PID=").find_map(|(i, _)| {
+            let rest = &s[i + 4..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().ok()
+        })
+    };
     let mut buf = Vec::new();
     let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -178,7 +194,9 @@ async fn transport_loss_orphans_without_sighup() {
         {
             Ok(Ok(Message::PtyData { data })) => {
                 buf.extend_from_slice(&data);
-                if String::from_utf8_lossy(&buf).contains("READY") {
+                let out = String::from_utf8_lossy(&buf);
+                // Require BOTH the executed PID line AND READY (post-execution).
+                if out.contains("READY") && parse_pid(&out).is_some() {
                     break;
                 }
             }
@@ -186,9 +204,16 @@ async fn transport_loss_orphans_without_sighup() {
             Ok(Err(_)) => break,
         }
         if std::time::Instant::now() > ready_deadline {
-            panic!("shell did not print READY within 10s");
+            panic!(
+                "shell did not print PID + READY within 10s; buffer so far: {:?}",
+                String::from_utf8_lossy(&buf)
+            );
         }
     }
+
+    let out = String::from_utf8_lossy(&buf).into_owned();
+    let shell_pid = parse_pid(&out);
+    let proc_alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
 
     // Abruptly drop the QUIC connection WITHOUT sending SessionClose.
     // From the server's perspective this is a transport-level loss → orphan.
@@ -228,6 +253,18 @@ async fn transport_loss_orphans_without_sighup() {
         "shell must NOT have received SIGHUP on transport loss (Pitfall #7); \
          HUP indicator file exists: {hup_file}"
     );
+
+    // TERTIARY assertion: the orphaned shell process is STILL ALIVE after the
+    // transport loss (SC#1: MasterPty kept open, shell not killed). Probe /proc
+    // directly using the PID the shell printed.
+    if let Some(pid) = shell_pid {
+        assert!(
+            proc_alive(pid),
+            "orphaned shell (pid {pid}) must still be running after transport loss (SC#1)"
+        );
+    } else {
+        panic!("could not parse shell PID from session output: {out:?}");
+    }
 
     // Cleanup: clean up the HUP file if somehow present.
     let _ = std::fs::remove_file(&hup_file);
