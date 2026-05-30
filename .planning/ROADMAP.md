@@ -3,7 +3,7 @@
 ## Milestones
 
 - ✅ **v1.0 M0–M2 Architecture-Validation Spike** — Phases 1-3 (shipped 2026-05-29)
-- **v1.1 M3 Roaming + Windows Client** — Phases 4-8 (in progress)
+- **v1.1 M3 Roaming + Windows Client** — Phases 4-9 (in progress)
 
 ## Phases
 
@@ -25,6 +25,7 @@ Full detail archived at `.planning/milestones/v1.0-ROADMAP.md`.
 - [x] **Phase 6: Cold Reattach Protocol** — 1-RTT reconnect to an orphaned session with two-factor authorization (SSH handshake + token) (completed 2026-05-30)
 - [x] **Phase 7: Connection Migration Validation** — Explicit migration config plus headless and live test coverage confirming zero-RTT roaming (completed 2026-05-30)
 - [x] **Phase 8: Windows Client** — Native Windows client connects to a Linux server with on-disk key signing, raw mode, resize, and locale propagation (completed 2026-05-30)
+- [x] **Phase 9: Windows Client Polish & Hardening** — VT console-input + `~.` escape, authorized_keys warn+skip, connect timeout, server migration logging (completed 2026-05-30; Windows-runtime items pending human-host confirmation)
 
 ## Phase Details
 
@@ -120,6 +121,6 @@ Plans:
 **Plans:** 3 plans
 
 Plans:
-- [ ] 09-01-PLAN.md — Windows VT console-input mode + ssh-style `~.` local-quit escape (WIN-02) (Wave 1)
-- [ ] 09-02-PLAN.md — authorized_keys warn+skip, client connect timeout, signer.rs PathBuf import gate (ROBUST-01, WIN-02) (Wave 2)
-- [ ] 09-03-PLAN.md — server logs connection migration (remote_address change) at INFO (OBS-01) (Wave 1)
+- [x] 09-01-PLAN.md — Windows VT console-input mode + ssh-style `~.` local-quit escape (WIN-02) (Wave 1)
+- [x] 09-02-PLAN.md — authorized_keys warn+skip, client connect timeout, signer.rs PathBuf import gate (ROBUST-01, WIN-02) (Wave 2)
+- [x] 09-03-PLAN.md — server logs connection migration (remote_address change) at INFO (OBS-01) (Wave 1)

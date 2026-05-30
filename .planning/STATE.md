@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: M3 Roaming + Windows Client
-status: planning
-stopped_at: Phase 4 context gathered
-last_updated: "2026-05-30T05:31:22.924Z"
-last_activity: 2026-05-29 -- Phase 05 planning complete
+status: executed
+stopped_at: Phase 9 executed + opus-verified (human_needed); milestone lifecycle (audit→complete→cleanup) paused pending Windows-host re-validation
+last_updated: "2026-05-30T06:45:00.000Z"
+last_activity: 2026-05-30 -- Phase 09 (Windows Client Polish & Hardening) executed, reviewed, opus-verified
 progress:
-  total_phases: 5
-  completed_phases: 3
-  total_plans: 11
-  completed_plans: 9
-  percent: 60
+  total_phases: 6
+  completed_phases: 6
+  total_plans: 18
+  completed_plans: 18
+  percent: 100
 ---
 
 # Project State
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-29)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 5 — session persistence
+**Current focus:** v1.1 phases 4–9 all executed + verified. Milestone lifecycle (audit → complete → cleanup) paused pending Windows-host re-validation of Phase 9 fixes.
 
 ## Current Position
 
-Phase: 5
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-05-29 -- Phase 05 planning complete
+Phase: 9 (executed + opus-verified, human_needed)
+Plan: All complete (4–9)
+Status: Milestone lifecycle paused — run `/gsd:autonomous` to trigger audit→complete→cleanup (or validate Phase 9 on a Windows host first)
+Last activity: 2026-05-30 -- Phase 09 executed, reviewed, opus-verified
 
 ```
-Progress: [████████░░] 82%
+Progress: [██████████] 100% (6/6 phases executed)
 ```
 
 ## Performance Metrics
@@ -84,6 +84,9 @@ Recent decisions affecting current work:
 - At Phase 8 start: confirm `ring` 0.17.14 precompiled x86_64-windows assembly objects are present (no NASM/CMake needed)
 
 **From 2026-05-30 live Windows→Linux validation (native Windows client authenticated + opened PTY session OK):**
+
+> **RESOLVED in Phase 9** (commits `eb2659b` VT-console+`~.`, `2bf6c9d` migration log, `5af3757` authorized_keys skip, `43ba8ac` connect timeout+PathBuf gate, `2d4db1e`/`edb77b8`/`83c6186` review fixes). Verified 6/6 on Linux; opus-verified `human_needed` for the Windows-runtime confirmations (VT input behavior, `~.` end-to-end on Windows, PathBuf warning-absence). **Still OPEN:** only the `WSAEMSGSIZE` investigation below (deliberately deferred) and the Windows-host re-test of the fixes (rebuild on Windows and confirm vim/less/arrows/PageUp-Down, Ctrl-C→remote, and `~.` quit). Validation WIN: network roaming confirmed working on the live Windows client (effectively ROAM-01 SC#4 / D-06 passing).
+
 
 - `authorized_keys` must IGNORE unsupported/unparseable entries (warn + skip, like sshd) — currently `load_authorized_keys` (`crates/nosh-auth/src/keys.rs:118`) propagates the first parse error via `?`, so a single RSA/ECDSA/malformed line rejects the entire file. Real-world `authorized_keys` files routinely contain non-Ed25519 keys.
 - Client needs a **connection timeout** when no server responds — `connect(...).await` (`crates/nosh-client/src/client.rs:188-190`) has no timeout and hangs; wrap in `tokio::time::timeout` with a clear error.
