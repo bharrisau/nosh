@@ -84,6 +84,13 @@ pub fn build_server_config(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     server_config.transport_config(Arc::new(nosh_proto::transport_config(false)));
 
+    // D-01 / Pitfall #1 (ROAM-01): set migration(true) EXPLICITLY even though it
+    // is the quinn default. A future quinn release could change this default, or a
+    // stray audit edit could clear it, silently disabling connection migration
+    // (roaming). Explicit is safe; implicit would kill the whole roaming value prop
+    // without a compiler or test failure to catch it.
+    server_config.migration(true);
+
     Ok(server_config)
 }
 
