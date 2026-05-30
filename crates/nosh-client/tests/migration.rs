@@ -144,6 +144,32 @@ async fn run_migration_test() {
     // rather than relying solely on sequence.len() >= 80 or SessionClose.
     let mut done_received = false;
 
+    // PTY output is a raw byte stream, NOT framed on line boundaries: a single
+    // PtyData chunk may carry a partial line, multiple lines, or coalesce the
+    // shell prompt with the first output (e.g. "$ LINE:0" with the trailing
+    // "\r\n" arriving in the NEXT chunk). The previous per-chunk `text.lines()`
+    // parse dropped LINE:0 whenever the "$ " prompt was coalesced onto the same
+    // line as LINE:0 (strip_prefix("LINE:") failed on "$ LINE:0"), and could
+    // also drop a token split mid-digits across a chunk boundary. To parse
+    // correctly we accumulate all output in `parse_buf` and only consume
+    // COMPLETE (newline-terminated) lines, leaving any partial tail buffered for
+    // the next chunk. We also locate the `LINE:` token anywhere in the line
+    // (not just at the start) so a coalesced prompt prefix does not hide it.
+    let mut parse_buf = String::new();
+
+    // Extract the numeric value following the LAST `LINE:` token in `line`, if
+    // any (and only if it is immediately followed by digits, then end-of-line).
+    // Returns None for a bare prompt, partial token, or non-LINE output.
+    fn parse_line_token(line: &str) -> Option<u32> {
+        let trimmed = line.trim();
+        let idx = trimmed.rfind("LINE:")?;
+        let rest = &trimmed[idx + "LINE:".len()..];
+        if rest.is_empty() {
+            return None;
+        }
+        rest.parse::<u32>().ok()
+    }
+
     loop {
         // Drain the re-injected first frame before reading from the network
         // (CR-01: ensures no data is silently dropped when PtyData races ahead
@@ -169,48 +195,55 @@ async fn run_migration_test() {
                     t_last_pre = Instant::now();
                 }
 
-                // Parse LINE:<n> occurrences from this chunk.
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    if let Some(rest) = trimmed.strip_prefix("LINE:") {
-                        if let Ok(n) = rest.trim().parse::<u32>() {
-                            if !rebind_done && t_first_post.is_none() {
-                                // Still pre-rebind; update the last-pre timer.
-                                t_last_pre = Instant::now();
-                            }
-                            // t_first_post is now captured at the PtyData-frame level
-                            // (outside this inner loop) to avoid counting buffered lines
-                            // from the same chunk that triggered the rebind (WR-02 fix).
-                            sequence.push(n);
+                // Accumulate raw output and parse only COMPLETE newline-terminated
+                // lines, leaving any partial tail in `parse_buf` for the next chunk.
+                // This is robust to chunk boundaries that split a line anywhere
+                // (mid-token or before the trailing newline) and to a shell prompt
+                // coalesced onto the same line as LINE:0 (e.g. "$ LINE:0").
+                parse_buf.push_str(&text);
+                while let Some(nl) = parse_buf.find('\n') {
+                    // Split off the complete line (including the newline), keep the rest.
+                    let rest = parse_buf.split_off(nl + 1);
+                    let line = std::mem::replace(&mut parse_buf, rest);
+                    let line = line.trim();
 
-                            // Once we've seen LINE:10, snapshot stats + trigger rebind.
-                            if !rebind_done && n >= rebind_after {
-                                pre_stats = conn.stats();
-                                rtt = conn.rtt().max(conn.stats().path.rtt);
-                                t_last_pre = Instant::now();
-
-                                // D-02: force path change via fresh 127.0.0.1:0 socket.
-                                let new_addr = rebind_client(&endpoint)
-                                    .expect("rebind to fresh loopback socket");
-                                t_rebind = Instant::now();
-                                eprintln!(
-                                    "[migration] rebind done after LINE:{n}; new local addr: {new_addr}"
-                                );
-
-                                // Pitfall #2 mitigation: send a tiny frame immediately
-                                // after rebind so the server can see data from the new
-                                // path and advance its anti-amplification budget, reducing
-                                // the stall duration (D-04 recommendation, 07-RESEARCH §4).
-                                let _ = client::send_input(&mut send, b"").await;
-
-                                rebind_done = true;
-                                just_rebound = true;
-                            }
+                    if let Some(n) = parse_line_token(line) {
+                        if !rebind_done && t_first_post.is_none() {
+                            // Still pre-rebind; update the last-pre timer.
+                            t_last_pre = Instant::now();
                         }
-                    } else if trimmed == "DONE" {
+                        // t_first_post is captured at the PtyData-frame level
+                        // (outside this loop) to avoid counting buffered lines from
+                        // the same chunk that triggered the rebind (WR-02 fix).
+                        sequence.push(n);
+
+                        // Once we've seen LINE:10, snapshot stats + trigger rebind.
+                        if !rebind_done && n >= rebind_after {
+                            pre_stats = conn.stats();
+                            rtt = conn.rtt().max(conn.stats().path.rtt);
+                            t_last_pre = Instant::now();
+
+                            // D-02: force path change via fresh 127.0.0.1:0 socket.
+                            let new_addr = rebind_client(&endpoint)
+                                .expect("rebind to fresh loopback socket");
+                            t_rebind = Instant::now();
+                            eprintln!(
+                                "[migration] rebind done after LINE:{n}; new local addr: {new_addr}"
+                            );
+
+                            // Pitfall #2 mitigation: send a tiny frame immediately
+                            // after rebind so the server can see data from the new
+                            // path and advance its anti-amplification budget, reducing
+                            // the stall duration (D-04 recommendation, 07-RESEARCH §4).
+                            let _ = client::send_input(&mut send, b"").await;
+
+                            rebind_done = true;
+                            just_rebound = true;
+                        }
+                    } else if line == "DONE" || line.ends_with("DONE") {
                         // Shell finished the sequence; signal the outer loop to exit.
                         done_received = true;
-                        break; // break inner for-loop
+                        break; // break the line-draining loop
                     }
                 }
 
