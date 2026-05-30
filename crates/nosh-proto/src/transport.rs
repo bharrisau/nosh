@@ -9,6 +9,14 @@ use quinn::TransportConfig;
 const DATAGRAM_BUFFER: usize = 1 << 20;
 /// Keep-alive interval (client side). Comfortably below both the 30s QUIC
 /// default idle timeout and our 300s `MAX_IDLE_TIMEOUT`.
+///
+/// Pitfall #4 / ROAM-01: these two constants are intentionally LEFT UNCHANGED
+/// for connection migration. The 300 s idle timeout is far longer than any
+/// loopback or real-network path-validation window (ms-to-seconds scale), so a
+/// migrating connection will NOT idle-out mid-path-validation. The client
+/// keep-alive at 15 s keeps the new path warm and prevents the server from
+/// treating a quiet post-migration shell as idle. Do NOT lower MAX_IDLE_TIMEOUT
+/// or disable KEEP_ALIVE without re-validating the migration test.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Finite idle timeout for a quiet interactive shell. Never `None` — an
 /// infinite timeout risks permanently hung futures on a broken path.
