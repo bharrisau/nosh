@@ -40,6 +40,12 @@ pub struct ResizeWatcher {
 
     #[cfg(windows)]
     stream: crossterm::event::EventStream,
+    /// Set to `true` once `EventStream` is permanently exhausted (e.g. the
+    /// console handle was closed). When `true`, `next_resize()` parks forever
+    /// via `std::future::pending()` instead of returning immediately, which
+    /// would cause a resize-message flood in the `tokio::select!` pump loop.
+    #[cfg(windows)]
+    stream_done: bool,
 }
 
 impl ResizeWatcher {
@@ -61,6 +67,7 @@ impl ResizeWatcher {
         {
             Ok(Self {
                 stream: crossterm::event::EventStream::new(),
+                stream_done: false,
             })
         }
 
@@ -88,6 +95,13 @@ impl ResizeWatcher {
 
         #[cfg(windows)]
         {
+            // If the stream was previously exhausted, park forever. Returning
+            // immediately would cause a resize-message flood in the pump loop's
+            // tokio::select! (the arm fires on every iteration once exhausted).
+            if self.stream_done {
+                std::future::pending::<()>().await;
+                return;
+            }
             use futures::StreamExt;
             // Loop until we see a Resize event; ignore all other events
             // (key events etc. are handled via tokio::io::stdin in run_pump).
@@ -96,8 +110,10 @@ impl ResizeWatcher {
                     return;
                 }
             }
-            // Stream ended — return to avoid an infinite loop if EventStream
-            // is somehow exhausted (should not happen in practice).
+            // Stream permanently exhausted (console handle closed or unrecoverable
+            // error). Mark done and park so the pump loop does not spin.
+            self.stream_done = true;
+            std::future::pending::<()>().await;
         }
     }
 }
