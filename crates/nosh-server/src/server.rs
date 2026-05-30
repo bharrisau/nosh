@@ -233,10 +233,12 @@ async fn handle_connection(
     // Reattach → reattach path, anything else → protocol close.
     match nosh_proto::read_message(&mut recv).await {
         Ok(Message::SessionOpen { term, cols, rows, env }) => {
-            run_session(conn, peer, peer_identity, send, recv, term, cols, rows, env, shell_override, registry).await
+            run_session(conn, peer, peer_identity, send, recv, SessionOpenParams {
+                term, cols, rows, client_env: env, shell_override,
+            }, registry).await
         }
         Ok(Message::Reattach { token, last_acked_seq }) => {
-            run_reattach_session(conn, peer, peer_identity, send, recv, last_acked_seq, token, registry).await
+            run_reattach_session(conn, peer, peer_identity, send, recv, (token, last_acked_seq), registry).await
         }
         Ok(other) => {
             tracing::warn!(%peer, ?other, "expected SessionOpen or Reattach as first frame");
@@ -249,6 +251,15 @@ async fn handle_connection(
             Ok(())
         }
     }
+}
+
+/// Session-open parameters (collapsed to reduce argument count past clippy's limit).
+struct SessionOpenParams {
+    term: String,
+    cols: u16,
+    rows: u16,
+    client_env: Vec<(String, String)>,
+    shell_override: Option<String>,
 }
 
 /// Drive a single PTY session over the established bidi stream.
@@ -268,13 +279,10 @@ async fn run_session(
     identity: nosh_auth::NoshPublicKey,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    term: String,
-    cols: u16,
-    rows: u16,
-    client_env: Vec<(String, String)>,
-    shell_override: Option<String>,
+    params: SessionOpenParams,
     registry: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
+    let SessionOpenParams { term, cols, rows, client_env, shell_override } = params;
     let passwd = session::lookup_self(shell_override.as_deref());
     let (sess, reader, writer) =
         session::open(&passwd, &term, cols, rows, &client_env, identity).context("open session")?;
@@ -581,11 +589,11 @@ async fn run_reattach_session(
     identity: nosh_auth::NoshPublicKey,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    last_acked_seq: u64,
-    token: [u8; 16],
+    reattach_params: ([u8; 16], u64), // (token, last_acked_seq)
     registry: Arc<crate::registry::SessionRegistry>,
 ) -> anyhow::Result<()> {
     use crate::registry::SessionSlot;
+    let (token, last_acked_seq) = reattach_params;
 
     // ── Step 1: Two-factor reattach authorization ─────────────────────────────
     let slot = match registry.reattach(&token, &identity) {
@@ -595,6 +603,10 @@ async fn run_reattach_session(
             // Log identity fingerprint only; never the token.
             tracing::info!(identity = %identity.fingerprint(), "reattach rejected");
             let _ = nosh_proto::write_message(&mut send, &Message::ReattachErr).await;
+            // Finish the send stream so the client can read the ReattachErr frame
+            // before the connection is closed.
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_millis(200), send.stopped()).await;
             conn.close(CLOSE_PROTOCOL.into(), b"reattach rejected");
             return Ok(());
         }

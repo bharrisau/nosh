@@ -235,6 +235,125 @@ pub fn collect_client_env() -> Vec<(String, String)> {
     env
 }
 
+// ── Phase 6: reattach helpers ──────────────────────────────────────────────
+
+/// Outcome of a reattach attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReattachOutcome {
+    /// Reattach succeeded. The client MUST replace its stored token with
+    /// `new_token` immediately (single-use rotation, D-05).
+    /// Token MUST NOT be logged — log only the identity fingerprint.
+    Ok {
+        /// Rotated single-use reattach token.
+        new_token: [u8; 16],
+        /// The sequence number of the first replayed chunk.
+        replaying_from_seq: u64,
+        /// `true` when the server's buffer was truncated below the requested
+        /// resume point. Display a notice to the user (D-09).
+        truncated: bool,
+    },
+    /// Reattach failed — session gone, token expired, wrong identity, or
+    /// already-attached (D-07 opaque/uniform error). Do NOT retry indefinitely
+    /// on this outcome; the session is terminal (D-11).
+    Err,
+}
+
+/// Open the session bidi stream, send `SessionOpen`, and read the server's
+/// `SessionOpened { token }` response (Phase 6 D-03). Returns the stream pair
+/// plus the initial reattach token.
+///
+/// The token MUST NOT be logged — log only the identity fingerprint (D-07).
+pub async fn open_session_with_token(
+    conn: &quinn::Connection,
+    term: String,
+    cols: u16,
+    rows: u16,
+    env: Vec<(String, String)>,
+) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream, [u8; 16])> {
+    let (send, mut recv) = open_session(conn, term, cols, rows, env).await?;
+    // Read the next frame; the server sends SessionOpened immediately after
+    // registering the slot (before any PTY output — guaranteed by the server).
+    match nosh_proto::read_message(&mut recv).await {
+        Ok(Message::SessionOpened { token }) => Ok((send, recv, token)),
+        Ok(other) => anyhow::bail!("expected SessionOpened, got {:?}", other),
+        Err(e) => anyhow::bail!("failed to read SessionOpened: {e}"),
+    }
+}
+
+/// Send a `Reattach` frame as the FIRST frame on a new connection's bidi stream.
+///
+/// `last_acked_seq` is the highest output sequence number the client has applied
+/// (as documented on `Message::Reattach`). Use the value tracked by the client;
+/// 0 if the client applied nothing since the last fresh open.
+pub async fn send_reattach(
+    send: &mut quinn::SendStream,
+    token: [u8; 16],
+    last_acked_seq: u64,
+) -> anyhow::Result<()> {
+    nosh_proto::write_message(send, &Message::Reattach { token, last_acked_seq })
+        .await
+        .context("send Reattach")
+}
+
+/// Send a periodic `Ack { seq }` frame (D-08 continuous acking). `seq` is the
+/// highest output sequence number the client has applied.
+pub async fn send_ack(send: &mut quinn::SendStream, seq: u64) -> anyhow::Result<()> {
+    nosh_proto::write_message(send, &Message::Ack { seq })
+        .await
+        .context("send Ack")
+}
+
+/// Read the server's reply to a `Reattach` frame (the first frame on the new
+/// stream after sending `Reattach`). Returns `ReattachOutcome::Ok` or `::Err`.
+pub async fn await_reattach_reply(recv: &mut quinn::RecvStream) -> anyhow::Result<ReattachOutcome> {
+    match nosh_proto::read_message(recv).await {
+        Ok(Message::ReattachOk {
+            new_token,
+            replaying_from_seq,
+            truncated,
+        }) => Ok(ReattachOutcome::Ok {
+            new_token,
+            replaying_from_seq,
+            truncated,
+        }),
+        Ok(Message::ReattachErr) => Ok(ReattachOutcome::Err),
+        Ok(other) => anyhow::bail!("unexpected reply to Reattach: {:?}", other),
+        Err(e) => anyhow::bail!("failed to read reattach reply: {e}"),
+    }
+}
+
+/// Headless reattach driver for integration tests. Opens a bidi stream, sends
+/// `Reattach { token, last_acked_seq }`, awaits the reply:
+/// - On `ReattachOutcome::Ok`: collects subsequent `PtyData` until `SessionClose`
+///   or stream close (like `collect_until_close`), returns the output + exit code.
+/// - On `ReattachOutcome::Err` (including connection-level errors from the server
+///   closing the connection after sending ReattachErr): returns
+///   `(ReattachOutcome::Err, vec![], 0)`.
+pub async fn reattach_collect(
+    conn: &quinn::Connection,
+    token: [u8; 16],
+    last_acked_seq: u64,
+) -> anyhow::Result<(ReattachOutcome, Vec<u8>, i32)> {
+    let (mut send, mut recv) = conn.open_bi().await.context("open bi for reattach")?;
+    send_reattach(&mut send, token, last_acked_seq).await?;
+    // await_reattach_reply may fail with a connection error if the server closed
+    // the connection (on rejection, the server sends ReattachErr then closes the
+    // connection). Treat any read error here as a ReattachErr outcome — the
+    // server has indicated rejection by closing the connection.
+    let outcome = match await_reattach_reply(&mut recv).await {
+        Ok(o) => o,
+        Err(_) => ReattachOutcome::Err,
+    };
+    match outcome {
+        ReattachOutcome::Err => Ok((ReattachOutcome::Err, Vec::new(), 0)),
+        ref ok @ ReattachOutcome::Ok { .. } => {
+            let ok_clone = ok.clone();
+            let (output, exit_code) = collect_until_close(&mut recv).await?;
+            Ok((ok_clone, output, exit_code))
+        }
+    }
+}
+
 /// Open the session bidi stream and send the `SessionOpen` frame.
 pub async fn open_session(
     conn: &quinn::Connection,
@@ -281,6 +400,9 @@ pub async fn send_resize(send: &mut quinn::SendStream, cols: u16, rows: u16) -> 
 /// single `PtyData` frame, then read frames collecting all PTY output until a
 /// `SessionClose` arrives (or the stream closes). Returns the collected output
 /// bytes and the exit code. No terminal/raw-mode involvement, so it runs in CI.
+///
+/// Phase 6: reads and discards the `SessionOpened` frame (the initial reattach
+/// token) that the server now sends right after session open.
 pub async fn run_session_collect(
     conn: &quinn::Connection,
     term: &str,
@@ -289,7 +411,9 @@ pub async fn run_session_collect(
     env: Vec<(String, String)>,
     input_script: &[u8],
 ) -> anyhow::Result<(Vec<u8>, i32)> {
-    let (mut send, mut recv) = open_session(conn, term.to_string(), cols, rows, env).await?;
+    // open_session_with_token reads the SessionOpened frame and discards the token.
+    let (mut send, mut recv, _token) =
+        open_session_with_token(conn, term.to_string(), cols, rows, env).await?;
     send_input(&mut send, input_script).await?;
     collect_until_close(&mut recv).await
 }
