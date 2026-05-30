@@ -85,10 +85,15 @@ async fn run_migration_test() {
     .await
     .expect("open session stream");
 
-    // Discard the leading SessionOpened control frame that the server sends
+    // Wait for the leading SessionOpened control frame the server sends
     // immediately after opening the session (Phase 6 D-03). We drive frames
     // manually here instead of using run_session_collect so we can interleave
     // the rebind mid-stream.
+    //
+    // If the first frame is NOT SessionOpened (rare but possible when PtyData
+    // races ahead), re-inject it into the main loop via pending_first_frame so
+    // no data — including LINE:0 — is silently discarded (CR-01 fix).
+    let mut pending_first_frame: Option<Message> = None;
     {
         let first = tokio::time::timeout(
             Duration::from_secs(10),
@@ -97,17 +102,13 @@ async fn run_migration_test() {
         .await
         .expect("no hang waiting for first frame")
         .expect("read first frame");
-        // Expect SessionOpened; if we got PtyData already, push it back by
-        // noting its content — but our LINE parser handles leading non-LINE
-        // data gracefully.
         if let Message::SessionOpened { .. } = first {
             // Discarded as expected.
         } else {
-            // PtyData arrived before SessionOpened — process it in the main loop
-            // below. We cannot un-read it, but the parser will skip non-LINE lines.
-            // This can happen if the shell emits a prompt before the server token
-            // frame is constructed. Not an error.
-            eprintln!("[migration] note: first frame was not SessionOpened; proceeding");
+            // PtyData arrived before SessionOpened — re-inject into the main
+            // loop so its data (potentially LINE:0) is not lost.
+            eprintln!("[migration] note: first frame was not SessionOpened; re-injecting into main loop");
+            pending_first_frame = Some(first);
         }
     }
 
@@ -134,15 +135,30 @@ async fn run_migration_test() {
     let mut rebind_done = false;
     let mut t_rebind = Instant::now();
     let mut t_first_post: Option<Instant> = None;
+    // WR-02: set to true on the same frame that triggers the rebind; cleared at
+    // the end of each outer-loop iteration. Prevents t_first_post from being
+    // captured from buffered data in the same PtyData chunk as the rebind (which
+    // would understate the actual anti-amplification stall to near-zero).
+    let mut just_rebound = false;
+    // WR-01: tracks shell DONE sentinel so the outer loop can break cleanly
+    // rather than relying solely on sequence.len() >= 80 or SessionClose.
+    let mut done_received = false;
 
     loop {
-        let frame = tokio::time::timeout(
-            Duration::from_secs(10),
-            nosh_proto::read_message(&mut recv),
-        )
-        .await
-        .expect("no hang waiting for frame")
-        .expect("read frame (no ConnectionError)");
+        // Drain the re-injected first frame before reading from the network
+        // (CR-01: ensures no data is silently dropped when PtyData races ahead
+        // of SessionOpened).
+        let frame = if let Some(f) = pending_first_frame.take() {
+            f
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                nosh_proto::read_message(&mut recv),
+            )
+            .await
+            .expect("no hang waiting for frame")
+            .expect("read frame (no ConnectionError)")
+        };
 
         match frame {
             Message::PtyData { data } => {
@@ -161,10 +177,10 @@ async fn run_migration_test() {
                             if !rebind_done && t_first_post.is_none() {
                                 // Still pre-rebind; update the last-pre timer.
                                 t_last_pre = Instant::now();
-                            } else if rebind_done && t_first_post.is_none() {
-                                // First post-rebind frame: record for stall measurement.
-                                t_first_post = Some(Instant::now());
                             }
+                            // t_first_post is now captured at the PtyData-frame level
+                            // (outside this inner loop) to avoid counting buffered lines
+                            // from the same chunk that triggered the rebind (WR-02 fix).
                             sequence.push(n);
 
                             // Once we've seen LINE:10, snapshot stats + trigger rebind.
@@ -188,15 +204,22 @@ async fn run_migration_test() {
                                 let _ = client::send_input(&mut send, b"").await;
 
                                 rebind_done = true;
+                                just_rebound = true;
                             }
                         }
                     } else if trimmed == "DONE" {
-                        // Shell finished the sequence. Break out.
+                        // Shell finished the sequence; signal the outer loop to exit.
+                        done_received = true;
+                        break; // break inner for-loop
                     }
                 }
 
-                // Record first post-rebind frame time from any data (not just LINE:).
-                if rebind_done && t_first_post.is_none() {
+                // Record first post-rebind frame time (WR-02 fix): only capture
+                // t_first_post from frames that arrived AFTER the rebind — not from
+                // the same PtyData chunk that triggered it (just_rebound). Data
+                // buffered in that chunk was received before the rebind and would
+                // understate the real anti-amplification stall to near-zero.
+                if rebind_done && t_first_post.is_none() && !just_rebound {
                     t_first_post = Some(Instant::now());
                 }
             }
@@ -211,6 +234,17 @@ async fn run_migration_test() {
                 // Unexpected frame; skip (Ack, Resize responses, etc.) — not an error.
                 let _ = other;
             }
+        }
+
+        // WR-02: clear the just_rebound flag after each outer-loop iteration so
+        // subsequent frames are eligible for t_first_post capture.
+        just_rebound = false;
+
+        // WR-01: if the shell sent DONE, exit the outer loop cleanly without
+        // waiting for SessionClose or the 80-line count. This prevents a 30s
+        // timeout if the shell crashed early (e.g. before emitting 80 lines).
+        if done_received {
+            break;
         }
 
         // Check if the connection has a transport error (D-03).
