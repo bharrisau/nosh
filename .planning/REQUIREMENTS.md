@@ -12,18 +12,18 @@ Requirements for the M3 milestone (roaming + bounded Windows-client slice). Each
 Threading the authenticated SSH identity into the server-side session is the architectural prerequisite for persistence and reattach — it fills the deliberate v1.0 seam at `Session.identity`.
 
 - [x] **IDENT-01**: The server threads the authenticated peer's SSH identity (SPKI extracted from the TLS handshake) into `Session.identity` on every new connection, before any session message is processed
-- [ ] **IDENT-02**: Cold reattach is authorized by two factors — the full SSH/TLS mutual handshake re-runs on every reconnection, AND the presented reattach token must match an orphaned session bound to that same SSH identity (token is a selector, never a sole credential)
+- [x] **IDENT-02**: Cold reattach is authorized by two factors — the full SSH/TLS mutual handshake re-runs on every reconnection, AND the presented reattach token must match an orphaned session bound to that same SSH identity (token is a selector, never a sole credential)
 
 ### Roaming
 
 - [x] **ROAM-01**: A live session survives a client IP/path change (NAT rebind, interface switch) by continuing the *same* QUIC connection via connection migration, with no re-handshake and no extra round trips — validated headless via a forced path change, with a real Wi-Fi→cellular run as a human live check
-- [ ] **ROAM-02**: After a disconnect or resume-from-suspend, the client reconnects to its orphaned session in 1 RTT via a sequence-numbered cold-reattach message; the server replays output the client had not yet acknowledged, with no duplicated or dropped bytes
+- [x] **ROAM-02**: After a disconnect or resume-from-suspend, the client reconnects to its orphaned session in 1 RTT via a sequence-numbered cold-reattach message; the server replays output the client had not yet acknowledged, with no duplicated or dropped bytes
 
 ### Session Persistence
 
-- [ ] **PERSIST-01**: An orphaned session (PTY + shell + terminal state) survives client disconnect Mosh-style — it lives until the shell exits, with the master PTY held open so the shell is not SIGHUP'd; a background reaper prevents zombie shell processes
-- [ ] **PERSIST-02**: Orphaned-session lifetime is governed by a configurable idle timeout that defaults to `0` (disabled — Mosh behavior)
-- [ ] **PERSIST-03**: A configurable per-identity cap bounds persisted-session memory and is enforced before the first orphaned session is stored
+- [x] **PERSIST-01**: An orphaned session (PTY + shell + terminal state) survives client disconnect Mosh-style — it lives until the shell exits, with the master PTY held open so the shell is not SIGHUP'd; a background reaper prevents zombie shell processes
+- [x] **PERSIST-02**: Orphaned-session lifetime is governed by a configurable idle timeout that defaults to `0` (disabled — Mosh behavior)
+- [x] **PERSIST-03**: A configurable per-identity cap bounds persisted-session memory and is enforced before the first orphaned session is stored
 
 ### Windows Client
 
@@ -87,12 +87,12 @@ Which phases cover which requirements. Phase numbering continues from v1.0 (ende
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | IDENT-01 | Phase 4 | Complete |
-| IDENT-02 | Phase 6 | Pending |
+| IDENT-02 | Phase 6 | Complete |
 | ROAM-01 | Phase 7 | Complete |
-| ROAM-02 | Phase 6 | Pending |
-| PERSIST-01 | Phase 5 | Pending |
-| PERSIST-02 | Phase 5 | Pending |
-| PERSIST-03 | Phase 5 | Pending |
+| ROAM-02 | Phase 6 | Complete |
+| PERSIST-01 | Phase 5 | Complete |
+| PERSIST-02 | Phase 5 | Complete |
+| PERSIST-03 | Phase 5 | Complete |
 | WIN-01 | Phase 8 | Complete |
 | WIN-02 | Phase 8 | Complete |
 | WIN-03 | Phase 8 | Complete |
