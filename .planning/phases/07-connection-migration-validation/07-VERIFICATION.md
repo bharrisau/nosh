@@ -115,3 +115,15 @@ No blocking gaps. All three automatable success criteria are genuinely achieved 
 
 _Verified: 2026-05-30_
 _Verifier: Claude (gsd-verifier, opus, adversarial pass)_
+
+---
+
+## Post-Verification Addendum (flake discovered + fixed)
+
+During Phase 8 work, the migration validation test `migration_survives_path_change` was found to be **flaky (~50% failure)** — the initial opus verification above passed on lucky runs. Failure mode: `D-03 FAIL: sequence must start at LINE:0, got LINE:1` (LINE:0 intermittently dropped).
+
+**Root cause:** a test-side parsing bug, NOT a client/protocol defect. PTY output is an unframed byte stream; on ~50% of runs the shell prompt coalesced with the first output into a single chunk `"$ LINE:0"` with no trailing newline, and the old `text.lines()` + `strip_prefix("LINE:")` parser silently dropped it.
+
+**Fix:** commit `f7bd80a` — buffer partial lines across chunks and locate the `LINE:` token with `rfind`. Assertion NOT weakened; no retries/sleeps added; D-03/D-04/D-05 guarantees preserved.
+
+**Re-verification:** 20/20 (fixer) + 15/15 (independent orchestrator run) = **35/35 PASS, 0 FAIL**. The migration validation test is now stable. SC#1–SC#3 remain VERIFIED on a now-reliable test; SC#4 (Wi-Fi→cellular live check, D-06) remains the non-blocking human item. Status unchanged: human_needed.
