@@ -351,8 +351,30 @@ impl SessionSlot {
     /// CALLER CONTRACT: the returned bytes MUST NOT be logged (D-07).
     pub fn rotate_token(&self) -> [u8; 16] {
         let new_token = Uuid::new_v4().into_bytes();
-        *self.token.lock().unwrap() = new_token;
+        self.commit_token(new_token);
         new_token
+    }
+
+    /// Mint a fresh CSPRNG token candidate WITHOUT storing it (the prior token
+    /// stays valid). Pair with [`Self::commit_token`] to rotate only AFTER the
+    /// `ReattachOk` carrying this candidate is confirmed delivered (W1 fix):
+    /// if the send fails, the slot keeps the prior token so the client's
+    /// indefinite retry (D-10) can still succeed with the token it already
+    /// holds. Otherwise a failed send would leave the slot holding a token the
+    /// client never received, making the session permanently un-reattachable.
+    ///
+    /// CALLER CONTRACT: the returned bytes MUST NOT be logged (D-07).
+    pub fn mint_token_candidate(&self) -> [u8; 16] {
+        Uuid::new_v4().into_bytes()
+    }
+
+    /// Commit a previously-minted token candidate as the slot's live token,
+    /// invalidating the prior one (single-use, D-05). Call this only after the
+    /// `ReattachOk` carrying `new_token` has been successfully written/flushed.
+    ///
+    /// CALLER CONTRACT: `new_token` MUST NOT be logged (D-07).
+    pub fn commit_token(&self, new_token: [u8; 16]) {
+        *self.token.lock().unwrap() = new_token;
     }
 
     // ── Phase 6: replay and continuous-ack trim delegates ───────────────────

@@ -630,10 +630,16 @@ async fn run_reattach_session(
         registry.orphan(slot);
     };
 
-    // ── Step 2: Compute replay, rotate token, send ReattachOk ────────────────
+    // ── Step 2: Compute replay, send ReattachOk, THEN commit the rotated token ─
     let (chunks, replaying_from_seq, truncated) = slot.replay_from(last_acked_seq);
-    // Rotate token (single-use, D-05). MUST NOT be logged.
-    let new_token = slot.rotate_token();
+    // W1 fix: mint a token CANDIDATE without rotating yet. The prior token stays
+    // valid until the ReattachOk carrying this candidate is confirmed sent. If
+    // the send fails, we re-orphan WITHOUT committing, so the client (which
+    // still holds the prior token) can retry indefinitely (D-10). Committing
+    // before the send — as the old code did — would, on send failure, leave the
+    // slot holding a token the client never received → permanently
+    // un-reattachable. MUST NOT be logged (D-07).
+    let new_token = slot.mint_token_candidate();
 
     if nosh_proto::write_message(
         &mut send,
@@ -642,9 +648,17 @@ async fn run_reattach_session(
     .await
     .is_err()
     {
+        // ReattachOk never reached the client: the client still holds the prior
+        // token. Do NOT commit the candidate — re-orphan with the token intact.
         re_orphan(&slot, &registry);
         return Ok(());
     }
+    // ReattachOk is on the wire (reliable stream); the client will adopt
+    // `new_token`. Commit it now so the slot and client agree on the live token.
+    // The client updates its stored token the instant it reads ReattachOk, so
+    // the rotation MUST be committed here — not deferred past replay, which
+    // could fail after the client has already adopted the new token.
+    slot.commit_token(new_token);
 
     // ── Step 3: Replay buffered output (D-09 no dup/gap within retained range) ─
     for (_seq, data) in &chunks {
