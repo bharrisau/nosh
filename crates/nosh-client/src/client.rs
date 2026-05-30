@@ -411,11 +411,12 @@ impl Drop for RawModeGuard {
             let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
             // Only restore if we have plausibly valid handles; ignore errors
             // regardless — best effort in Drop (T-09-02 mitigation).
-            // Note: HANDLE is isize; NULL is 0 (not is_null() — that's for pointers).
-            if stdin_handle != INVALID_HANDLE_VALUE && stdin_handle != 0 {
+            // Note: in windows-sys 0.59 HANDLE is `*mut c_void` (was `isize` in 0.52),
+            // so guard against NULL with is_null(), not `!= 0`.
+            if stdin_handle != INVALID_HANDLE_VALUE && !stdin_handle.is_null() {
                 let _ = unsafe { SetConsoleMode(stdin_handle, self.orig_stdin_mode) };
             }
-            if stdout_handle != INVALID_HANDLE_VALUE && stdout_handle != 0 {
+            if stdout_handle != INVALID_HANDLE_VALUE && !stdout_handle.is_null() {
                 let _ = unsafe { SetConsoleMode(stdout_handle, self.orig_stdout_mode) };
             }
         }
