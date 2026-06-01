@@ -69,7 +69,8 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   2. `encode_datagram` / `decode_datagram` round-trip correctly — a decoded value is identical to the original for all valid inputs
   3. Encoded payload is provably capped below `max_datagram_size() - 100` bytes in the size-cap unit test — a full 80x24 repaint does not exceed the limit
   4. The wire format decision for large repaints (partial update / skip-frame / reliable-stream fallback) is documented in a code comment at the encode callsite
-**Plans**: TBD
+**Plans**: 1 plan
+- [ ] 11-01-PLAN.md — datagram.rs wire format: StateDiff/DiffRun/CellStyle types, total cursor-priority encode_datagram + decode_datagram, provable size cap, round-trip + hardening tests
 
 ### Phase 12: Server Terminal State Model
 **Goal**: The server maintains an authoritative terminal-state model, fed from the same PTY-output callsite as the SequencedOutputBuffer, unit-tested in isolation before any QUIC plumbing is touched
@@ -166,7 +167,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 8. Windows Client | — | Shipped | 2026-05-30 |
 | 9. Windows Client Polish & Hardening | — | Shipped | 2026-05-30 |
 | 10. PTY Reader Race Fix | 2/2 | Complete    | 2026-06-01 |
-| 11. Datagram Wire Protocol | 0/? | Not started | - |
+| 11. Datagram Wire Protocol | 0/1 | Planned | - |
 | 12. Server Terminal State Model | 0/? | Not started | - |
 | 13. Server Datagram Sender | 0/? | Not started | - |
 | 14. Client Predictor — Confirmed Rendering | 0/? | Not started | - |
