@@ -7,10 +7,12 @@
 //! (prost) later as a one-file change — see decision D-04.
 
 pub mod codec;
+pub mod datagram;
 pub mod messages;
 pub mod transport;
 
 pub use codec::{decode, encode, read_message, write_message, ProtoError};
+pub use datagram::{CellStyle, CursorPos, DiffRun, StateDiff, decode_datagram, encode_datagram};
 pub use messages::Message;
 pub use transport::transport_config;
 
