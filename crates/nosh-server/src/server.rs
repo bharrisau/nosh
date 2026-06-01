@@ -11,6 +11,7 @@
 //! (PTY stays open, no SIGHUP — Pitfall #7 / D-02) while an explicit
 //! `SessionClose` or normal shell exit tears down immediately (D-01).
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -161,6 +162,13 @@ pub async fn run_accept_loop(
 
 /// QUIC application close code for an orderly session end.
 const CLOSE_OK: u32 = 0;
+/// Bound on the per-epoch sent-snapshot store (CR-01 fix).
+///
+/// At most this many (epoch, snapshot) pairs are retained. When the store would
+/// exceed this cap the oldest entry is evicted. 16 is generous for any realistic
+/// RTT: even at 500ms RTT and 60Hz ticks, only ~30 epochs are in-flight at once,
+/// but acks arrive at the same rate as sends so the store stays shallow.
+const EPOCH_SNAPSHOT_CAP: usize = 16;
 /// QUIC application close code for a protocol violation (bad first frame).
 const CLOSE_PROTOCOL: u32 = 1;
 /// QUIC application close code for peer identity extraction failure (should
@@ -229,12 +237,20 @@ fn compute_diff_runs(
             let fg = cell.fg;
             let bg = cell.bg;
             let mut chars = String::new();
-            // Extend run while style/fg/bg are consistent.
+            // Extend run while style/fg/bg are consistent AND the cell is
+            // actually changed vs. the baseline (WR-01 fix: stop at the first
+            // unchanged cell so gratuitous identical trailing cells do not
+            // consume datagram cap, which would amplify CR-02 deferral).
             while (col as usize) < current_row.len() {
                 let cc = col as usize;
                 let c2 = &current_row[cc];
                 if c2.style != style || c2.fg != fg || c2.bg != bg {
                     break; // style change: end run here
+                }
+                // Stop extending if this cell is unchanged vs. the baseline.
+                let base2 = baseline_row.get(cc);
+                if base2.map(|b| b == c2).unwrap_or(false) {
+                    break;
                 }
                 chars.push(c2.ch);
                 col += 1;
@@ -254,6 +270,10 @@ struct DiffTickResult {
     /// The snapshot that was diffed against (the *current* grid — becomes
     /// `last_sent_snapshot` after a successful send).
     sent_cells: Vec<Vec<Cell>>,
+    /// The epoch assigned to this datagram (used by the caller to store the
+    /// per-epoch sent snapshot for CR-01 fix: snapshot-at-send-time, not
+    /// snapshot-at-ack-receipt-time).
+    epoch: u64,
     /// Runs deferred from `encode_datagram` because they didn't fit in the cap;
     /// must be prepended to the next tick's run list (Anti-Pattern: deferred
     /// runs go FIRST to maintain cursor-proximate priority).
@@ -301,9 +321,11 @@ fn build_state_diff(
         return None;
     }
 
-    // Epoch management (Open Question 2): increment at tick time when the grid
-    // changed since the last *sent* snapshot (not per-chunk).
-    if cells != last_sent_snapshot {
+    // Epoch management (Open Question 2 / CR-02 fix): increment at tick time
+    // when the grid changed since the last *sent* snapshot (not per-chunk), OR
+    // when there are deferred runs waiting to be sent (so the client does not
+    // discard the new datagram as a duplicate of the previous epoch).
+    if cells != last_sent_snapshot || !pending_deferred.is_empty() {
         *current_epoch += 1;
     }
 
@@ -316,16 +338,21 @@ fn build_state_diff(
     all_runs.extend(fresh_runs);
 
     // Pitfall 3: cap the deferred queue to MAX_RUNS to prevent unbounded growth.
+    // WR-03 fix: truncate from the END (drop least-cursor-proximate runs) rather
+    // than from the front — draining from the front would discard the
+    // already-cursor-sorted deferred backlog (pending_deferred was sorted by the
+    // prior encode_datagram call) in favour of unsorted fresh_runs.
     if all_runs.len() > MAX_RUNS {
-        let drop = all_runs.len() - MAX_RUNS;
-        all_runs.drain(..drop);
+        all_runs.truncate(MAX_RUNS);
     }
 
-    let diff = StateDiff { epoch: *current_epoch, cols, rows, cursor, runs: all_runs };
+    let sent_epoch = *current_epoch;
+    let diff = StateDiff { epoch: sent_epoch, cols, rows, cursor, runs: all_runs };
     match encode_datagram(&diff, cap) {
         Ok((payload, deferred)) => Some(DiffTickResult {
             payload,
             sent_cells: cells,
+            epoch: sent_epoch,
             deferred,
         }),
         Err(_) => None, // encoding failed: skip this tick
@@ -561,6 +588,11 @@ async fn run_session(
     let mut last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
     let mut last_sent_snapshot: Vec<Vec<Cell>> = Vec::new();
     let mut pending_deferred: Vec<DiffRun> = Vec::new();
+    // CR-01 fix: bounded per-epoch sent-snapshot store.
+    // Maps epoch → the terminal grid at the time that epoch's datagram was SENT.
+    // On ack receipt we look up the snapshot for the acked epoch and use it as
+    // the new last_acked_snapshot (not the current grid, which may have advanced).
+    let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
     let session_end: SessionEnd = loop {
         tokio::select! {
@@ -628,6 +660,14 @@ async fn run_session(
                     deferred,
                     cap,
                 ) {
+                    // CR-01 fix: store the sent snapshot keyed by epoch BEFORE
+                    // calling send_datagram. On ack receipt we look up this
+                    // snapshot rather than snapshotting the current (potentially
+                    // advanced) grid.
+                    epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
+                    if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
+                        epoch_snapshots.pop_front();
+                    }
                     last_sent_snapshot = result.sent_cells;
                     pending_deferred = result.deferred;
                     if let Err(e) = conn.send_datagram(result.payload) {
@@ -649,11 +689,22 @@ async fn run_session(
                         match decode_epoch_ack(&bytes) {
                             Ok(acked) if acked > last_acked_epoch => {
                                 last_acked_epoch = acked;
-                                // Snapshot the current grid as the new acked baseline.
-                                // Brief lock — released before any .await (Pitfall 1).
-                                last_acked_snapshot = slot.with_terminal_state(|ts| {
-                                    ts.viewport_rows().map(|(_, row)| row.to_vec()).collect()
-                                });
+                                // CR-01 fix: use the snapshot that was captured at
+                                // epoch-sent time (not the current grid). Look up the
+                                // stored snapshot for `acked`; if not found (evicted
+                                // due to cap), keep the current baseline — the model
+                                // is self-correcting on the next ack cycle.
+                                if let Some(pos) = epoch_snapshots
+                                    .iter()
+                                    .position(|(e, _)| *e == acked)
+                                {
+                                    let (_, snap) = epoch_snapshots.remove(pos).unwrap();
+                                    last_acked_snapshot = snap;
+                                    // Evict all older entries (epochs < acked) — they
+                                    // will never be acked now.
+                                    epoch_snapshots.retain(|(e, _)| *e > acked);
+                                }
+                                // If not found in store, baseline stays as-is (self-correcting).
                             }
                             Ok(_) => {} // older/dup ack: ignore (never regress baseline)
                             Err(_) => {} // malformed: ignore (self-correcting, T-13-07)
@@ -878,7 +929,6 @@ async fn run_reattach_session(
     };
 
     let session_id = slot.session_id;
-    let identity_raw = *slot.identity.key32();
     let fingerprint = slot.identity.fingerprint();
 
     let span = tracing::info_span!(
@@ -1025,6 +1075,8 @@ async fn run_reattach_session(
     let mut last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
     let mut last_sent_snapshot: Vec<Vec<Cell>> = Vec::new();
     let mut pending_deferred: Vec<DiffRun> = Vec::new();
+    // CR-01 fix: bounded per-epoch sent-snapshot store (same as run_session).
+    let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
     let session_end: SessionEnd = loop {
         tokio::select! {
@@ -1066,6 +1118,11 @@ async fn run_reattach_session(
                     deferred,
                     cap,
                 ) {
+                    // CR-01 fix: store sent snapshot keyed by epoch (same as run_session).
+                    epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
+                    if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
+                        epoch_snapshots.pop_front();
+                    }
                     last_sent_snapshot = result.sent_cells;
                     pending_deferred = result.deferred;
                     if let Err(e) = conn.send_datagram(result.payload) {
@@ -1085,9 +1142,17 @@ async fn run_reattach_session(
                         match decode_epoch_ack(&bytes) {
                             Ok(acked) if acked > last_acked_epoch => {
                                 last_acked_epoch = acked;
-                                last_acked_snapshot = slot.with_terminal_state(|ts| {
-                                    ts.viewport_rows().map(|(_, row)| row.to_vec()).collect()
-                                });
+                                // CR-01 fix: use the snapshot captured at epoch-sent
+                                // time (same as run_session).
+                                if let Some(pos) = epoch_snapshots
+                                    .iter()
+                                    .position(|(e, _)| *e == acked)
+                                {
+                                    let (_, snap) = epoch_snapshots.remove(pos).unwrap();
+                                    last_acked_snapshot = snap;
+                                    epoch_snapshots.retain(|(e, _)| *e > acked);
+                                }
+                                // If not found in store, baseline stays as-is (self-correcting).
                             }
                             Ok(_) => {}
                             Err(_) => {}
@@ -1145,14 +1210,19 @@ async fn run_reattach_session(
             let _ = send.finish();
             let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
             conn.close(CLOSE_OK.into(), b"shell exited");
-            // Remove the slot (the original watcher may also do this; remove is idempotent).
-            registry.remove(&identity_raw, session_id);
+            // WR-02 fix: use remove_slot (Arc pointer identity) instead of
+            // registry.remove (session_id). remove_slot ensures we only remove
+            // THIS specific slot instance — a concurrent reattach that opened a
+            // new session under the same session_id would not be accidentally
+            // evicted. The original watcher will also call remove_slot; both are
+            // idempotent (retain returns false for the already-removed entry).
+            registry.remove_slot(&slot);
         }
         SessionEnd::ClientClosed => {
             tracing::info!("client closed reattach session");
             slot.sighup();
             conn.close(CLOSE_OK.into(), b"client closed");
-            registry.remove(&identity_raw, session_id);
+            registry.remove_slot(&slot);
         }
         SessionEnd::TransportLost => {
             tracing::info!("transport lost during reattach; re-orphaning");
