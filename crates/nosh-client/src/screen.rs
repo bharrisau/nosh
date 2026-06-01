@@ -1,0 +1,716 @@
+//! `ClientScreen` — confirmed framebuffer compositor (Mosh Display model).
+//!
+//! Implements D-14-01, D-14-01a, D-14-04, D-14-05.
+//!
+//! # Architecture
+//!
+//! The screen maintains two grids:
+//! - **confirmed**: cells last applied from datagram `StateDiff` messages (the
+//!   server-authoritative state).
+//! - **physical**: what ANSI escape sequences have actually been emitted to the
+//!   terminal (the last-rendered state).
+//!
+//! `render_to_stdout` composes `desired = confirmed ⊕ overlays`, diffs against
+//! `physical`, and emits only the minimal ANSI needed to advance `physical` to
+//! `desired`. This is the ONLY function that may write display output — per
+//! CLAUDE.md "single screen-composition path, never direct stdout once predictor
+//! exists".
+//!
+//! # Security
+//!
+//! - T-14-01: OOB row/col guards in `apply` (continue/break on range checks).
+//! - T-14-03: Monotonic epoch guard — stale/replayed diffs are silently discarded.
+//! - Only `Cell.ch` (a single Unicode scalar validated by the server's TerminalState)
+//!   reaches stdout. No raw server byte stream passes through.
+
+use std::io::Write;
+
+use crossterm::cursor::MoveTo;
+use crossterm::QueueableCommand;
+use nosh_proto::datagram::{CellStyle, CursorPos, StateDiff};
+
+// ── Cell ──────────────────────────────────────────────────────────────────────
+
+/// A single terminal cell in the client's framebuffer.
+///
+/// Field-for-field mirror of `nosh_server::terminal::Cell` (D-14-04). Declared
+/// locally so production code does NOT import `nosh_server` (which is a
+/// `[dev-dependency]` only).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Cell {
+    /// Unicode scalar value. `' '` = blank/empty.
+    pub ch: char,
+    /// SGR attributes packed as bitflags (same type as `DiffRun.style`).
+    pub style: CellStyle,
+    /// ANSI 256-color foreground. `None` = terminal default.
+    pub fg: Option<u8>,
+    /// ANSI 256-color background. `None` = terminal default.
+    pub bg: Option<u8>,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Cell {
+            ch: ' ',
+            style: CellStyle(CellStyle::NONE),
+            fg: None,
+            bg: None,
+        }
+    }
+}
+
+// ── Overlay trait ─────────────────────────────────────────────────────────────
+
+/// A screen overlay layer applied on top of the confirmed grid in `compose_desired`.
+///
+/// Phase 14: only `ConnectionLossOverlay` exists and it is a no-op.
+/// Phase 15 will slot the speculative-echo overlay here.
+/// Phase 16 will activate the loss-banner overlay here.
+pub trait Overlay {
+    /// Return `Some(cell)` to override the confirmed cell at `(row, col)`, or
+    /// `None` to pass the confirmed cell through unchanged.
+    fn cell_at(&self, row: u16, col: u16) -> Option<Cell>;
+}
+
+/// No-op connection-loss overlay stub (D-14-01a, Phase 14).
+///
+/// Phase 16 activates this: when no datagram arrives for >5 s, overlays a
+/// one-line banner at the bottom of the screen.
+pub struct ConnectionLossOverlay;
+
+impl Overlay for ConnectionLossOverlay {
+    fn cell_at(&self, _row: u16, _col: u16) -> Option<Cell> {
+        None // no-op this phase
+    }
+}
+
+// ── ClientScreen ──────────────────────────────────────────────────────────────
+
+/// Confirmed framebuffer compositor for the `nosh` client.
+///
+/// Holds two grids (`confirmed` and `physical`) and emits minimal ANSI diffs
+/// via `render_to_stdout`. See module-level doc for the full model.
+pub struct ClientScreen {
+    cols: u16,
+    rows: u16,
+    /// Cells last applied from datagram `StateDiff` messages (server-authoritative).
+    confirmed: Vec<Vec<Cell>>,
+    /// Cursor position from the last applied `StateDiff`.
+    confirmed_cursor: CursorPos,
+    /// Cells that have been emitted to the terminal (last-rendered state).
+    physical: Vec<Vec<Cell>>,
+    /// Tracked physical cursor position (last `MoveTo` emitted).
+    physical_cursor: CursorPos,
+    /// Monotonic epoch for staleness/replay detection (D-14-05).
+    /// Initialised to 0; server epochs start at 1, so the first diff always applies.
+    last_applied_epoch: u64,
+    /// Overlay stack (D-14-01a). Phase 14: one `ConnectionLossOverlay` no-op.
+    overlays: Vec<Box<dyn Overlay>>,
+}
+
+impl ClientScreen {
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    /// Create a new `ClientScreen` with the given terminal dimensions.
+    ///
+    /// Both `confirmed` and `physical` grids are initialised to default cells.
+    /// The `ConnectionLossOverlay` no-op stub is pre-loaded into the overlay
+    /// stack so Phase 16 can activate it without restructuring.
+    pub fn new(cols: u16, rows: u16) -> Self {
+        ClientScreen {
+            cols,
+            rows,
+            confirmed: Self::make_grid(cols, rows),
+            confirmed_cursor: CursorPos { row: 0, col: 0 },
+            physical: Self::make_grid(cols, rows),
+            physical_cursor: CursorPos { row: 0, col: 0 },
+            last_applied_epoch: 0, // server starts at 1 → first diff always applies (Pitfall 6)
+            overlays: vec![Box::new(ConnectionLossOverlay)],
+        }
+    }
+
+    /// Build a blank grid of `rows` × `cols` default cells.
+    fn make_grid(cols: u16, rows: u16) -> Vec<Vec<Cell>> {
+        (0..rows as usize)
+            .map(|_| vec![Cell::default(); cols as usize])
+            .collect()
+    }
+
+    // ── Apply ─────────────────────────────────────────────────────────────────
+
+    /// Apply a `StateDiff` to the confirmed grid.
+    ///
+    /// D-14-05 monotonic guard: diffs with an epoch ≤ `last_applied_epoch` are
+    /// silently discarded (stale / duplicate / replayed — T-14-03).
+    ///
+    /// If the diff's `cols`/`rows` differ from the current dimensions,
+    /// `resize` is called first (physical resets to blank → forces full repaint).
+    ///
+    /// # Security (T-14-01 — V5 input validation)
+    ///
+    /// - `run.row >= rows`: the entire run is skipped (`continue`).
+    /// - `col >= row_width`: writing stops at the row boundary (`break`).
+    ///
+    /// No panic, no out-of-bounds write.
+    pub fn apply(&mut self, diff: &StateDiff) {
+        // D-14-05: monotonic staleness check — discard stale or duplicate diffs.
+        if diff.epoch <= self.last_applied_epoch {
+            return;
+        }
+
+        // Resize if terminal dimensions changed.
+        if diff.cols != self.cols || diff.rows != self.rows {
+            self.resize(diff.cols, diff.rows);
+        }
+
+        // Apply each DiffRun to the confirmed grid.
+        for run in &diff.runs {
+            let row = run.row as usize;
+            if row >= self.confirmed.len() {
+                continue; // OOB row guard (T-14-01 / SECURITY V5)
+            }
+            let row_cells = &mut self.confirmed[row];
+            let start = run.start_col as usize;
+            for (col, ch) in (start..).zip(run.chars.chars()) {
+                if col >= row_cells.len() {
+                    break; // OOB col guard (T-14-01 / SECURITY V5)
+                }
+                row_cells[col] = Cell {
+                    ch,
+                    style: run.style,
+                    fg: run.fg,
+                    bg: run.bg,
+                };
+            }
+        }
+
+        self.confirmed_cursor = diff.cursor;
+        self.last_applied_epoch = diff.epoch;
+    }
+
+    // ── Resize ────────────────────────────────────────────────────────────────
+
+    /// Resize both grids to the new dimensions.
+    ///
+    /// - `confirmed`: rows and columns are truncated or extended with default cells.
+    /// - `physical`: **reset to blank** (NOT copied from confirmed) — Pitfall 2.
+    ///   The next `render_to_stdout` will perform a full repaint.
+    /// - Cursors are clamped to the new bounds.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        // Resize confirmed: adjust each row's column count.
+        let new_cols = cols as usize;
+        for row in &mut self.confirmed {
+            if row.len() > new_cols {
+                row.truncate(new_cols);
+            } else {
+                row.resize(new_cols, Cell::default());
+            }
+        }
+
+        // Grow or shrink confirmed rows.
+        let cur_rows = self.confirmed.len();
+        let new_rows = rows as usize;
+        if cur_rows > new_rows {
+            self.confirmed.truncate(new_rows);
+        } else {
+            for _ in cur_rows..new_rows {
+                self.confirmed.push(vec![Cell::default(); new_cols]);
+            }
+        }
+
+        // Physical MUST reset to blank (NOT copied) — Pitfall 2.
+        // After a resize the terminal is blank; resetting physical forces a full
+        // repaint on the next render_to_stdout call.
+        self.physical = Self::make_grid(cols, rows);
+
+        self.cols = cols;
+        self.rows = rows;
+
+        // Clamp cursors to new bounds.
+        self.confirmed_cursor.row = self.confirmed_cursor.row.min(rows.saturating_sub(1));
+        self.confirmed_cursor.col = self.confirmed_cursor.col.min(cols.saturating_sub(1));
+        self.physical_cursor = CursorPos { row: 0, col: 0 };
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────────
+
+    /// Compose the desired grid: `confirmed ⊕ overlays`.
+    ///
+    /// This is the **single composition seam** (D-14-01a). Phase 14 overlays are
+    /// all no-ops so `desired == confirmed`, but the loop MUST remain so Phase 15
+    /// (speculative overlay) and Phase 16 (loss banner) can slot in without
+    /// restructuring.
+    fn compose_desired(&self) -> Vec<Vec<Cell>> {
+        let mut desired = self.confirmed.clone();
+        for overlay in &self.overlays {
+            for (r, row_cells) in desired.iter_mut().enumerate() {
+                for (c, cell_slot) in row_cells.iter_mut().enumerate() {
+                    if let Some(cell) = overlay.cell_at(r as u16, c as u16) {
+                        *cell_slot = cell;
+                    }
+                }
+            }
+        }
+        desired
+    }
+
+    /// Diff `desired` against `physical` and emit minimal ANSI to `out`.
+    ///
+    /// This is the **only** function in `nosh-client` that writes display output
+    /// (CLAUDE.md single-path invariant). After writing, `physical` is updated to
+    /// `desired` so the next call emits nothing if nothing changed (idempotency).
+    ///
+    /// # I/O
+    ///
+    /// `out` is `&mut impl std::io::Write` — NOT `tokio::io::AsyncWrite` (Pitfall 1).
+    /// The caller buffers into `Vec<u8>` and flushes to tokio stdout with
+    /// `write_all` after this function returns.
+    ///
+    /// # Cursor
+    ///
+    /// `MoveTo(col, row)` — crossterm uses **(col, row)** order with 0-based
+    /// coordinates (Pitfall 7). A final `MoveTo` is always emitted to position the
+    /// cursor at `confirmed_cursor`.
+    pub fn render_to_stdout<W: Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        let desired = self.compose_desired();
+        let desired_cursor = self.confirmed_cursor;
+
+        let rows = desired.len().min(self.physical.len());
+        let cols = if rows > 0 {
+            desired[0].len().min(self.physical[0].len())
+        } else {
+            0
+        };
+
+        let mut last_row: Option<u16> = None;
+        let mut last_col: Option<u16> = None;
+        let mut last_sgr: Option<(CellStyle, Option<u8>, Option<u8>)> = None;
+
+        for (r, (des_row, phys_row)) in desired.iter().zip(self.physical.iter()).enumerate().take(rows) {
+            let row = r as u16;
+            for (c, (want, have)) in des_row.iter().zip(phys_row.iter()).enumerate().take(cols) {
+                let col = c as u16;
+                if want == have {
+                    continue; // idempotent: skip unchanged cells (Pitfall 5)
+                }
+
+                // Move cursor only when not already positioned at (row, col).
+                if last_row != Some(row) || last_col != Some(col) {
+                    // Pitfall 7: MoveTo(col, row) — first arg is COLUMN, second is ROW.
+                    out.queue(MoveTo(col, row))?;
+                    last_row = Some(row);
+                    last_col = Some(col);
+                }
+
+                // Emit SGR only when attributes differ from the previous cell.
+                let want_sgr = (want.style, want.fg, want.bg);
+                if last_sgr != Some(want_sgr) {
+                    emit_sgr(out, want.style, want.fg, want.bg)?;
+                    last_sgr = Some(want_sgr);
+                }
+
+                // Write the character (single Unicode scalar).
+                let mut buf = [0u8; 4];
+                let s = want.ch.encode_utf8(&mut buf);
+                out.write_all(s.as_bytes())?;
+
+                // Advance tracked column position.
+                last_col = Some(last_col.unwrap_or(col) + 1);
+            }
+        }
+
+        // Always emit a final cursor-position MoveTo.
+        out.queue(MoveTo(desired_cursor.col, desired_cursor.row))?;
+        out.flush()?;
+
+        // Commit: set physical = desired.
+        for (des_row, phys_row) in desired.iter().zip(self.physical.iter_mut()) {
+            for (des_cell, phys_cell) in des_row.iter().zip(phys_row.iter_mut()) {
+                *phys_cell = des_cell.clone();
+            }
+        }
+        self.physical_cursor = desired_cursor;
+
+        Ok(())
+    }
+
+    /// Reset `physical` to all-default cells so the next `render_to_stdout` is a
+    /// full repaint.
+    ///
+    /// Called by the reattach path (Plan 02) after reconnecting, to compensate for
+    /// terminal state that may have changed during the connection drop (scrolling,
+    /// resize, etc.) — Open Question 3 in RESEARCH.md.
+    pub fn reset_physical(&mut self) {
+        self.physical = Self::make_grid(self.cols, self.rows);
+        self.physical_cursor = CursorPos { row: 0, col: 0 };
+    }
+
+    // ── Read API ──────────────────────────────────────────────────────────────
+
+    /// Read a cell from the confirmed grid.
+    ///
+    /// Returns a shared default `Cell` for out-of-bounds coordinates (never panics).
+    /// Uses `OnceLock` per the IN-02 precedent (`terminal.rs` `cell()` method).
+    pub fn confirmed_cell(&self, row: u16, col: u16) -> &Cell {
+        static DEFAULT_CELL: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
+        let default = DEFAULT_CELL.get_or_init(Cell::default);
+        self.confirmed
+            .get(row as usize)
+            .and_then(|r| r.get(col as usize))
+            .unwrap_or(default)
+    }
+
+    /// Return the epoch of the last successfully applied `StateDiff`.
+    pub fn last_applied_epoch(&self) -> u64 {
+        self.last_applied_epoch
+    }
+
+    /// Return the current terminal dimensions as `(cols, rows)`.
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+}
+
+// ── SGR emission ──────────────────────────────────────────────────────────────
+
+/// Emit an ANSI SGR escape sequence resetting all attributes then re-applying
+/// the given style, fg, and bg.
+///
+/// Format: `\x1b[0[;1][;3][;4][;7][;38;5;N][;48;5;N]m`
+///
+/// Always starts with SGR 0 (reset) so that attributes from a previous cell
+/// that are not present in `style` are cleared.
+fn emit_sgr<W: Write>(
+    out: &mut W,
+    style: CellStyle,
+    fg: Option<u8>,
+    bg: Option<u8>,
+) -> std::io::Result<()> {
+    let mut params = String::from("0");
+    if style.0 & CellStyle::BOLD != 0 {
+        params.push_str(";1");
+    }
+    if style.0 & CellStyle::ITALIC != 0 {
+        params.push_str(";3");
+    }
+    if style.0 & CellStyle::UNDERLINE != 0 {
+        params.push_str(";4");
+    }
+    if style.0 & CellStyle::REVERSE != 0 {
+        params.push_str(";7");
+    }
+    if let Some(n) = fg {
+        params.push_str(&format!(";38;5;{n}"));
+    }
+    if let Some(n) = bg {
+        params.push_str(&format!(";48;5;{n}"));
+    }
+    write!(out, "\x1b[{params}m")
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use nosh_proto::datagram::{CellStyle, CursorPos, DiffRun, StateDiff};
+
+    use super::*;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn make_diff(epoch: u64, chars: &str) -> StateDiff {
+        StateDiff {
+            epoch,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: chars.to_string(),
+            }],
+        }
+    }
+
+    // ── Task 1: model / apply / resize / bounds / overlay tests ──────────────
+
+    #[test]
+    fn apply_fresh_writes_chars_to_confirmed_grid() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff = make_diff(1, "hello");
+
+        screen.apply(&diff);
+
+        assert_eq!(screen.confirmed_cell(0, 0).ch, 'h');
+        assert_eq!(screen.confirmed_cell(0, 1).ch, 'e');
+        assert_eq!(screen.confirmed_cell(0, 2).ch, 'l');
+        assert_eq!(screen.confirmed_cell(0, 3).ch, 'l');
+        assert_eq!(screen.confirmed_cell(0, 4).ch, 'o');
+        assert_eq!(screen.last_applied_epoch(), 1);
+    }
+
+    #[test]
+    fn apply_monotonic_same_epoch_is_noop() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff1 = make_diff(1, "hello");
+        screen.apply(&diff1);
+
+        // Apply a different diff with the SAME epoch — must be ignored.
+        let diff_same = StateDiff {
+            epoch: 1, // same epoch
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 5 },
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: "XXXXX".to_string(),
+            }],
+        };
+        screen.apply(&diff_same);
+
+        // Confirmed grid must still have the first apply's content.
+        assert_eq!(screen.confirmed_cell(0, 0).ch, 'h');
+        assert_eq!(screen.last_applied_epoch(), 1);
+    }
+
+    #[test]
+    fn apply_monotonic_lower_epoch_is_noop() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff2 = make_diff(2, "world");
+        screen.apply(&diff2);
+
+        let diff1 = make_diff(1, "hello"); // older epoch
+        screen.apply(&diff1);
+
+        // Confirmed grid must still have epoch=2's content.
+        assert_eq!(screen.confirmed_cell(0, 0).ch, 'w');
+        assert_eq!(screen.last_applied_epoch(), 2);
+    }
+
+    #[test]
+    fn apply_resize_changes_dims_and_resets_physical() {
+        let mut screen = ClientScreen::new(80, 24);
+
+        // First apply some content.
+        screen.apply(&make_diff(1, "hello"));
+        assert_eq!(screen.size(), (80, 24));
+
+        // Now apply a diff with different dimensions.
+        let diff_resized = StateDiff {
+            epoch: 2,
+            cols: 40,
+            rows: 10,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![],
+        };
+        screen.apply(&diff_resized);
+
+        assert_eq!(screen.size(), (40, 10));
+        // Physical should be reset to blank (all default cells).
+        // Direct check: physical was rebuilt to 10 rows × 40 cols.
+        assert_eq!(screen.confirmed.len(), 10);
+        assert_eq!(screen.confirmed[0].len(), 40);
+        assert_eq!(screen.physical.len(), 10);
+        assert_eq!(screen.physical[0].len(), 40);
+    }
+
+    #[test]
+    fn apply_oob_row_is_skipped_no_panic() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![
+                DiffRun {
+                    row: 999, // WAY out of bounds
+                    start_col: 0,
+                    style: CellStyle(CellStyle::NONE),
+                    fg: None,
+                    bg: None,
+                    chars: "boom".to_string(),
+                },
+                DiffRun {
+                    row: 0, // valid run after the OOB one
+                    start_col: 0,
+                    style: CellStyle(CellStyle::NONE),
+                    fg: None,
+                    bg: None,
+                    chars: "ok".to_string(),
+                },
+            ],
+        };
+        // Must not panic.
+        screen.apply(&diff);
+        // The valid run must still have been applied.
+        assert_eq!(screen.confirmed_cell(0, 0).ch, 'o');
+        assert_eq!(screen.confirmed_cell(0, 1).ch, 'k');
+    }
+
+    #[test]
+    fn apply_oob_col_chars_clamped_no_panic() {
+        let mut screen = ClientScreen::new(5, 3); // tiny grid: 5 cols, 3 rows
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 5,
+            rows: 3,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 3, // starts at col 3 (valid), but 8 chars → would overflow
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: "ABCDEFGH".to_string(), // only A,B can fit (cols 3,4)
+            }],
+        };
+        // Must not panic.
+        screen.apply(&diff);
+        // Cols 3 and 4 should be written; col 5+ clamped.
+        assert_eq!(screen.confirmed_cell(0, 3).ch, 'A');
+        assert_eq!(screen.confirmed_cell(0, 4).ch, 'B');
+        // Out-of-bounds access returns default (space).
+        assert_eq!(screen.confirmed_cell(0, 5).ch, ' ');
+    }
+
+    #[test]
+    fn confirmed_cell_oob_returns_default_no_panic() {
+        let screen = ClientScreen::new(80, 24);
+        // Row out of bounds.
+        assert_eq!(screen.confirmed_cell(100, 0).ch, ' ');
+        // Col out of bounds.
+        assert_eq!(screen.confirmed_cell(0, 200).ch, ' ');
+        // Both out of bounds.
+        assert_eq!(screen.confirmed_cell(999, 999).ch, ' ');
+    }
+
+    #[test]
+    fn connection_loss_overlay_is_noop() {
+        let overlay = ConnectionLossOverlay;
+        // Must return None for all coordinates.
+        assert!(overlay.cell_at(0, 0).is_none());
+        assert!(overlay.cell_at(23, 79).is_none());
+        assert!(overlay.cell_at(999, 999).is_none());
+    }
+
+    // ── Task 2: render / idempotency / SGR / reset_physical tests ────────────
+
+    #[test]
+    fn render_after_apply_emits_nonempty_ansi_with_chars() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff = make_diff(1, "hello");
+        screen.apply(&diff);
+
+        let mut buf = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf).unwrap();
+
+        let output = String::from_utf8_lossy(&buf);
+        assert!(!buf.is_empty(), "first render must emit ANSI");
+        // Must contain the literal chars.
+        assert!(output.contains('h'), "output must contain 'h'");
+        assert!(output.contains('e'), "output must contain 'e'");
+        assert!(output.contains('l'), "output must contain 'l'");
+        assert!(output.contains('o'), "output must contain 'o'");
+        // Must contain at least one MoveTo (CSI sequence starting with \x1b[).
+        assert!(buf.contains(&0x1b), "output must contain ESC");
+    }
+
+    #[test]
+    fn duplicate_datagram_produces_minimal_ansi() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff = make_diff(1, "hello");
+
+        // First apply + render.
+        screen.apply(&diff);
+        let mut buf1 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf1).unwrap();
+        assert!(!buf1.is_empty(), "first render must emit ANSI");
+
+        // Second apply with same epoch → stale, discarded.
+        screen.apply(&diff); // epoch 1 <= 1 → no-op
+        let mut buf2 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf2).unwrap();
+
+        // Second render must be strictly shorter (only final cursor MoveTo).
+        assert!(
+            buf2.len() < buf1.len(),
+            "duplicate datagram must produce minimal ANSI (only cursor position, no cell writes); \
+             buf1.len()={}, buf2.len()={}",
+            buf1.len(),
+            buf2.len()
+        );
+    }
+
+    #[test]
+    fn emit_sgr_bold_fg_produces_correct_sequence() {
+        let mut buf = Vec::<u8>::new();
+        emit_sgr(
+            &mut buf,
+            CellStyle(CellStyle::BOLD),
+            Some(1), // red
+            None,
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\x1b[0;1;38;5;1m");
+    }
+
+    #[test]
+    fn emit_sgr_all_attributes() {
+        let mut buf = Vec::<u8>::new();
+        emit_sgr(
+            &mut buf,
+            CellStyle(CellStyle::BOLD | CellStyle::ITALIC | CellStyle::UNDERLINE | CellStyle::REVERSE),
+            Some(5),
+            Some(10),
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\x1b[0;1;3;4;7;38;5;5;48;5;10m");
+    }
+
+    #[test]
+    fn emit_sgr_none_attrs_produces_reset_only() {
+        let mut buf = Vec::<u8>::new();
+        emit_sgr(&mut buf, CellStyle(CellStyle::NONE), None, None).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\x1b[0m");
+    }
+
+    #[test]
+    fn reset_physical_forces_full_repaint() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff = make_diff(1, "hello");
+        screen.apply(&diff);
+
+        // First render: updates physical.
+        let mut buf1 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf1).unwrap();
+
+        // Second render with no changes: should be minimal (just cursor MoveTo).
+        let mut buf2 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf2).unwrap();
+        assert!(buf2.len() < buf1.len(), "second render should be minimal");
+
+        // reset_physical: next render must be a full repaint (same as first render).
+        screen.reset_physical();
+        let mut buf3 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf3).unwrap();
+        // After reset, render should again emit cell content.
+        assert!(
+            buf3.len() >= buf1.len(),
+            "after reset_physical, render must be a full repaint; \
+             buf1.len()={}, buf3.len()={}",
+            buf1.len(),
+            buf3.len()
+        );
+    }
+}

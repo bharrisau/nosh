@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod platform;
+pub mod screen; // NEW: ClientScreen, Overlay, ConnectionLossOverlay
 
 pub use client::{
     build_client_config, concurrent_roundtrip, connect, datagram_roundtrip, make_endpoint,
