@@ -941,6 +941,14 @@ async fn run_reattach_session(
         truncated,
         "replay complete"
     );
+    // D-13-03: ResumeComplete gate — declared TRUE after the replay loop.
+    // Any early-return inside the replay loop (re_orphan + return) prevents the
+    // select! loop from ever starting, so the replay is always fully complete
+    // before the diff_interval arm can fire. Plain bool suffices — no channel or
+    // atomic needed (Pattern 4: same async task, sequential code flow, Pitfall 5).
+    // T-13-04: datagrams cannot leak a partial-replay grid because the select!
+    // loop does not start until resume_complete is set here.
+    let resume_complete = true;
 
     // ── Step 4: Reclaim PTY reader/writer ────────────────────────────────────
     // Reader: clone a new reader from the master (drain any bytes that
@@ -1006,6 +1014,18 @@ async fn run_reattach_session(
     // poll the output channel EOF as the shell-exit signal).
     // The output pump closes when the PTY EOF is hit (shell exited or closed).
 
+    // SYNC-03: 16 ms diff-interval ticker for coalesced StateDiff datagram emission.
+    // Identical initialization to run_session; ResumeComplete was set above.
+    let mut diff_interval = tokio::time::interval(Duration::from_millis(16));
+    diff_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Per-connection datagram state (Open Question 3: task-local, resets on reattach).
+    // D-13-01b: empty baseline → first post-resume diff is naturally the full screen.
+    let mut current_epoch: u64 = 0;
+    let mut last_acked_epoch: u64 = 0;
+    let mut last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
+    let mut last_sent_snapshot: Vec<Vec<Cell>> = Vec::new();
+    let mut pending_deferred: Vec<DiffRun> = Vec::new();
+
     let session_end: SessionEnd = loop {
         tokio::select! {
             chunk = out_rx.recv() => {
@@ -1024,6 +1044,56 @@ async fn run_reattach_session(
                         // original wait_task watcher; we close with code 0 (approximate).
                         break SessionEnd::ShellExited(0);
                     }
+                }
+            }
+            // SYNC-03: diff-interval tick — same arm as run_session.
+            // D-13-03: gated by resume_complete (false until replay loop above completes).
+            _ = diff_interval.tick() => {
+                if !resume_complete {
+                    continue;
+                }
+                let cap = match conn.max_datagram_size() {
+                    Some(c) if c >= MIN_CAP => c,
+                    _ => continue,
+                };
+                let deferred = std::mem::take(&mut pending_deferred);
+                if let Some(result) = build_state_diff(
+                    &slot,
+                    &mut current_epoch,
+                    last_acked_epoch,
+                    &last_acked_snapshot,
+                    &last_sent_snapshot,
+                    deferred,
+                    cap,
+                ) {
+                    last_sent_snapshot = result.sent_cells;
+                    pending_deferred = result.deferred;
+                    if let Err(e) = conn.send_datagram(result.payload) {
+                        use quinn::SendDatagramError::*;
+                        match e {
+                            TooLarge => {}
+                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
+                            ConnectionLost(_) => break SessionEnd::TransportLost,
+                        }
+                    }
+                }
+            }
+            // SYNC-03: epoch-ack arm — same as run_session.
+            datagram = conn.read_datagram() => {
+                match datagram {
+                    Ok(bytes) => {
+                        match decode_epoch_ack(&bytes) {
+                            Ok(acked) if acked > last_acked_epoch => {
+                                last_acked_epoch = acked;
+                                last_acked_snapshot = slot.with_terminal_state(|ts| {
+                                    ts.viewport_rows().map(|(_, row)| row.to_vec()).collect()
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
+                    }
+                    Err(_) => break SessionEnd::TransportLost,
                 }
             }
             msg = nosh_proto::read_message(&mut recv) => {
