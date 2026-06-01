@@ -470,12 +470,23 @@ impl vte::Perform for TerminalState {
             // Cursor down — count defaults to 1
             'B' => {
                 let n = Self::cursor_count(params);
-                self.cursor.row = (self.cursor.row + n).min(self.rows.saturating_sub(1));
+                // SECURITY: use saturating_add to prevent u16 overflow before the
+                // .min() clamp. `n` is untrusted (vte caps CSI params at u16::MAX =
+                // 65535); if the cursor is at a nonzero row, plain `+` overflows →
+                // debug panic (DoS) or silent wraparound (release, wrong position).
+                // saturating_add(n) always returns a value ≥ cursor.row, so the
+                // subsequent .min() clamp produces the correct in-bounds result.
+                self.cursor.row = self.cursor.row
+                    .saturating_add(n)
+                    .min(self.rows.saturating_sub(1));
             }
             // Cursor right — count defaults to 1
             'C' => {
                 let n = Self::cursor_count(params);
-                self.cursor.col = (self.cursor.col + n).min(self.cols.saturating_sub(1));
+                // SECURITY: same saturating_add defence as CSI B above.
+                self.cursor.col = self.cursor.col
+                    .saturating_add(n)
+                    .min(self.cols.saturating_sub(1));
             }
             // Cursor left — count defaults to 1
             'D' => {
@@ -1160,6 +1171,70 @@ mod tests {
         let cell = state.cell(100, 100);
         assert_eq!(cell.ch, ' ');
         assert_eq!(cell.fg, None);
+    }
+
+    // ── CR-01 regression: CSI B/C overflow from nonzero cursor ──────────────
+
+    /// CR-01 regression: `CSI 65535 B` from a nonzero row must clamp, not panic.
+    ///
+    /// Before the fix, `self.cursor.row + n` with `cursor.row = 23` and `n = 65535`
+    /// overflowed u16 → debug panic ("attempt to add with overflow") — a DoS on
+    /// adversarial PTY output. In release it wrapped silently to a wrong position.
+    /// After the fix, `saturating_add` always yields a value ≥ cursor.row, and the
+    /// subsequent `.min(rows - 1)` clamps it to the last valid row.
+    #[test]
+    fn adversarial_csi_b_max_count_from_nonzero_row_clamps_no_panic() {
+        let mut state = ts(80, 24);
+        // Move to bottom-right so cursor.row is nonzero (row = 23, col = 79).
+        state.advance(b"\x1b[24;80H"); // CSI 24;80H (1-based → row=23, col=79)
+        assert_eq!(state.cursor(), CursorPos { row: 23, col: 79 });
+        // CSI 65535 B: max-count cursor-down from nonzero row.
+        // Before fix: 23 + 65535 = 65558 overflows u16 → panic in debug.
+        // After fix: saturating_add → 65535, then .min(23) → 23 (clamped).
+        state.advance(b"\x1b[65535B");
+        assert_eq!(
+            state.cursor().row, 23,
+            "CSI 65535 B from row 23 must clamp to last row (23), not panic"
+        );
+        assert!(state.cursor().row < 24, "row must remain in bounds");
+    }
+
+    /// CR-01 regression: `CSI 65535 C` from a nonzero col must clamp, not panic.
+    #[test]
+    fn adversarial_csi_c_max_count_from_nonzero_col_clamps_no_panic() {
+        let mut state = ts(80, 24);
+        // Move to bottom-right so cursor.col is nonzero (row = 23, col = 79).
+        state.advance(b"\x1b[24;80H"); // CSI 24;80H (1-based → row=23, col=79)
+        assert_eq!(state.cursor(), CursorPos { row: 23, col: 79 });
+        // CSI 65535 C: max-count cursor-right from nonzero col.
+        // Before fix: 79 + 65535 = 65614 overflows u16 → panic in debug.
+        // After fix: saturating_add → 65535, then .min(79) → 79 (clamped).
+        state.advance(b"\x1b[65535C");
+        assert_eq!(
+            state.cursor().col, 79,
+            "CSI 65535 C from col 79 must clamp to last col (79), not panic"
+        );
+        assert!(state.cursor().col < 80, "col must remain in bounds");
+    }
+
+    /// CR-01 regression: combined — move to nonzero position then apply huge B+C.
+    ///
+    /// This is the exact probe sequence from the adversarial verifier that exposed
+    /// the original overflow bug: `CSI 24;80H` (move to bottom-right) followed by
+    /// `CSI 65535B` and `CSI 65535C`. Both must clamp without panic.
+    #[test]
+    fn adversarial_huge_repeat_from_nonzero_position_clamps() {
+        let mut state = ts(80, 24);
+        // Move to a nonzero position first.
+        state.advance(b"\x1b[24;80H");
+        // Both operations must be panic-free and clamp correctly.
+        state.advance(b"\x1b[65535B");
+        state.advance(b"\x1b[65535C");
+        assert!(state.cursor().row < 24, "row must be in bounds after huge CSI B");
+        assert!(state.cursor().col < 80, "col must be in bounds after huge CSI C");
+        // Verify the cursor is at the grid boundary (not wrapped to a wrong position).
+        assert_eq!(state.cursor().row, 23, "row must clamp to max row");
+        assert_eq!(state.cursor().col, 79, "col must clamp to max col");
     }
 
     // ── Erase in line ────────────────────────────────────────────────────────
