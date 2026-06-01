@@ -665,7 +665,8 @@ async fn run_pump(
                         // if it arrives here it's unexpected — ignore.
                     }
                     Ok(_) => {} // ignore other control frames
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::warn!("reliable stream error, triggering reconnect: {e}");
                         return Ok(PumpOutcome::TransportDrop);
                     }
                 }
@@ -706,8 +707,9 @@ async fn run_pump(
                         // Non-StateDiff datagrams (unknown tag): decode_datagram returns Err
                         // → silently discarded (T-14-05 resilience; T-14-08 injection block).
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Transport drop on datagram channel — mirror reliable-stream behavior.
+                        tracing::warn!("datagram channel error, triggering reconnect: {e}");
                         return Ok(PumpOutcome::TransportDrop);
                     }
                 }
