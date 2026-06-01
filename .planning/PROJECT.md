@@ -32,7 +32,9 @@ Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+P
 
 **Phase 10 complete (2026-06-01):** PTY reader-zombie race resolved. Both `server.rs` output-pump sites converted to `crate::pty_io::start_interruptible_reader`; both `TransportLost` arms now await reader exit before `registry.orphan()`. `cargo test` green (25/25).
 
-**Current milestone:** v1.2 (M4) — **in progress.** Phase 10 (daily-driver hardening #1) done. Next: Phase 11 (datagram wire protocol) — datagram state sync foundation.
+**Phase 11 complete (2026-06-01):** Datagram wire-protocol module delivered. `nosh-proto/src/datagram.rs` — `StateDiff` sparse-diff type, total `encode_datagram` (cursor-priority fill, STRICT payload < cap, continue-past-rejection), hardened `decode_datagram` (TAG_STATE_DIFF, MAX_RUNS guard, never panics on malformed input), 16 inline tests (22 total passing). SYNC-01 satisfied.
+
+**Current milestone:** v1.2 (M4) — **in progress.** Phase 11 (datagram wire protocol) done. Next: Phase 12 (server terminal state model) — vte::Perform TerminalState.
 
 ## Requirements
 
@@ -58,6 +60,10 @@ Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+P
 - ✓ 1-RTT cold reattach: sequence-numbered resume, two-factor (TLS re-run + identity-scoped token selector, no oracle), byte-exact replay — v1.1 (IDENT-02, ROAM-02)
 - ✓ Connection migration: IP/path change continues the same QUIC connection (no re-handshake), validated headless + real network-change live check from the Windows client — v1.1 (ROAM-01)
 - ✓ Native Windows client → Linux server: cross-compiles (no WSL), on-disk Ed25519 signing, raw VT I/O + resize, TERM/locale; P9 hardening (VT console-input, `~.` escape, authorized_keys warn+skip, connect timeout, migration logging) — v1.1 (WIN-01..04)
+
+<!-- v1.2 (M4) Phase 11 — validated 2026-06-01 -->
+
+- ✓ Sparse size-bounded datagram wire format in `nosh-proto`: `StateDiff` (changed cells, monotonic epoch, dims+cursor), total `encode_datagram` (cursor-priority fill, STRICT cap), hardened `decode_datagram` (never panics, MAX_RUNS guard), round-trip + size-cap tests — v1.2 Phase 11 (SYNC-01). Validated in Phase 11: 2026-06-01.
 
 ### Active
 
@@ -128,4 +134,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-01 after v1.2 (M4 Predictive Echo + Daily-Driver Readiness) scoped — predictive echo headline, daily-driver hardening, QoL UX, security design pass*
+*Last updated: 2026-06-01 after Phase 11 complete — datagram wire format (SYNC-01) delivered; Phase 12 next (server terminal state model)*
