@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: planning
-stopped_at: Phase 15 context gathered
-last_updated: "2026-06-01T23:36:16.620Z"
-last_activity: 2026-06-01 -- Phase 15 planning complete
+stopped_at: Phase 15 plan 03 complete
+last_updated: "2026-06-02T00:00:00.000Z"
+last_activity: 2026-06-02 -- Phase 15 all 3 plans complete (D-15-04 adversarial tests passing)
 progress:
   total_phases: 9
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 14
-  completed_plans: 13
-  percent: 56
+  completed_plans: 14
+  percent: 67
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-01)
 
 ## Current Position
 
-Phase: 16
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-06-01 -- Phase 15 planning complete
+Phase: 15 (complete) / 16 (next)
+Plan: Phase 15 all 3 plans complete
+Status: Phase 15 done — Phase 16 ready to plan
+Last activity: 2026-06-02 -- Phase 15 plan 03 complete (D-15-04 adversarial validation matrix)
 
 ```
 Progress: [█████████░] 86%
@@ -68,6 +68,8 @@ Progress: [█████████░] 86%
 
 *Updated after each plan completion*
 | Phase 15 P01 | 45 | 2 tasks | 3 files |
+| Phase 15 P02 | 30 | 2 tasks | 2 files |
+| Phase 15 P03 | 45 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -95,6 +97,7 @@ Recent decisions affecting current work:
 - v1.2 roadmap: Noecho-suppression is a security requirement of prediction — engine must track server's confirmed echo state and suppress prediction during `stty -echo` prompts; validated with `read -s` test
 - v1.2 roadmap: Phase 17 (Windows-host validation) must execute from a physical Windows PC — halt Linux execution, run from Windows machine like v1.1 Phase 9; HARDEN-02/03 stay in Phase 16 (authorable from Linux)
 - v1.2 roadmap: 0-RTT cold reattach still deliberately deferred — 1-RTT already ships, replay-safety burden not justified
+- [Phase 15-03]: EpochReset/BulkSuppressed call reset() not become_tentative() — clears all pending predictions so no stale speculative state remains visible after Ctrl-C/ESC/cursor-addressing
 - [Phase ?]: emit_diff factored as shared private method
 - [Phase ?]: Predictor held in run_pump not overlays Vec
 - [Phase ?]: D-17-02a latency hook uses HashMap in run_pump
@@ -111,7 +114,7 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-- Phase 15 (Speculative Overlay): highest-complexity area of M4; epoch-reset correctness and noecho-suppression are security requirements that cannot be retrofitted; adversarial tests (vim, `read -s`, CJK) are required before the phase is marked done
+- Phase 15 (Speculative Overlay): RESOLVED — adversarial tests (vim, `read -s`, CJK) all pass; noecho security gate proven adversarially against live PTY in Always mode
 - Phase 17 (Windows validation): requires a physical Windows host; cannot be executed from CI or Linux cross-compile
 - Phase 11 (wire format): sparse-diff encoding strategy for large repaints is an open design decision that blocks all prediction work; must be resolved as Phase 11's first task
 
