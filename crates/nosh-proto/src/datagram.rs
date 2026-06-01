@@ -412,7 +412,10 @@ fn fit_chars_in_bytes(s: &str, max_bytes: usize) -> usize {
 }
 
 /// Return the byte offset at which the `n`-th Unicode scalar value begins in `s`.
-/// Panics if `n > s.chars().count()` (callers must ensure `n` is in bounds).
+///
+/// Returns `s.len()` if `n >= s.chars().count()` (the end-of-string sentinel,
+/// yielding an empty split tail). Never panics. Callers that pass a count from
+/// [`fit_chars_in_bytes`] need not worry about out-of-bounds.
 fn char_byte_offset(s: &str, n: usize) -> usize {
     s.char_indices()
         .nth(n)
