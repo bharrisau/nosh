@@ -26,12 +26,13 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
 use nosh_client::client::{self, ClientIdentity, ReattachOutcome};
 use nosh_client::platform;
+use nosh_client::predictor::{PredictDisplayMode, PredictionOverlay};
 use nosh_proto::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -314,6 +315,14 @@ struct Args {
     /// Default 10 seconds.
     #[arg(long, default_value_t = 10)]
     connect_timeout: u64,
+
+    /// Speculative-echo prediction mode (PREDICT-05, D-15-02).
+    ///
+    /// adaptive (default): show predictions only on high-latency links (>~30ms RTT);
+    /// invisible on loopback. always: show predictions regardless of RTT (useful for
+    /// testing). never: disable predictions entirely.
+    #[arg(long, default_value = "adaptive")]
+    predict: PredictDisplayMode,
 }
 
 fn default_known_hosts() -> anyhow::Result<PathBuf> {
@@ -479,6 +488,7 @@ async fn main() -> anyhow::Result<()> {
                 &mut highest_applied,
                 &mut resize,
                 &mut token,
+                args.predict,
             )
             .await;
             reattach_result.unwrap_or(PumpOutcome::TransportDrop)
@@ -492,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
                 &mut highest_applied,
                 &mut resize,
                 &mut token,
+                args.predict,
             )
             .await;
             fresh_result.unwrap_or(PumpOutcome::TransportDrop)
@@ -532,6 +543,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Run a fresh session (first connect or reconnect without a token).
 /// Updates `highest_applied` and `token` in-place.
+#[allow(clippy::too_many_arguments)]
 async fn fresh_session(
     conn: &quinn::Connection,
     term: String,
@@ -540,6 +552,7 @@ async fn fresh_session(
     highest_applied: &mut u64,
     resize: &mut platform::ResizeWatcher,
     token_out: &mut Option<[u8; 16]>,
+    predict_mode: PredictDisplayMode,
 ) -> anyhow::Result<PumpOutcome> {
     let (mut send, mut recv, tok) =
         client::open_session_with_token(conn, term, cols, rows, client::collect_client_env())
@@ -548,7 +561,7 @@ async fn fresh_session(
     // Fresh session starts at seq 0.
     *highest_applied = 0;
 
-    run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, 0).await
+    run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, 0, predict_mode).await
 }
 
 /// Run a reattach session. Updates `highest_applied` and `token_out` in-place.
@@ -562,6 +575,7 @@ async fn reattach_session(
     highest_applied: &mut u64,
     resize: &mut platform::ResizeWatcher,
     token_out: &mut Option<[u8; 16]>,
+    predict_mode: PredictDisplayMode,
 ) -> anyhow::Result<PumpOutcome> {
     let (mut send, mut recv) = conn.open_bi().await.context("open bi for reattach")?;
     client::send_reattach(&mut send, token, last_acked_seq).await?;
@@ -597,14 +611,14 @@ async fn reattach_session(
             // baseline to exactly what the server is sending.
             *highest_applied = replaying_from_seq;
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, *highest_applied).await
+            run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, *highest_applied, predict_mode).await
         }
     }
 }
 
 /// Core pump loop: render output, forward input, debounce resize, send periodic
 /// Ack. Returns the pump outcome.
-#[allow(clippy::too_many_arguments)] // 8 args are load-bearing: conn + streams + state + watcher + baseline
+#[allow(clippy::too_many_arguments)] // 9 args are load-bearing: conn + streams + state + watcher + baseline + predict_mode
 async fn run_pump(
     conn: &quinn::Connection,
     cols: u16,
@@ -614,6 +628,7 @@ async fn run_pump(
     highest_applied: &mut u64,
     resize: &mut platform::ResizeWatcher,
     _seq_baseline: u64,
+    predict_mode: PredictDisplayMode,
 ) -> anyhow::Result<PumpOutcome> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -633,6 +648,16 @@ async fn run_pump(
     // symmetric). Calling reset_physical() explicitly is only needed if the
     // screen is ever hoisted above run_pump scope; do NOT hoist it.
     let mut screen = nosh_client::screen::ClientScreen::new(cols, rows);
+    // Speculative-echo overlay (Phase 15, PREDICT-02/04/05).
+    // Mutably owned here so both stdin arm (on_input) and datagram arm (cull)
+    // can drive it, and render_with_predictor receives it by shared ref.
+    let mut predictor = PredictionOverlay::new(predict_mode, cols, rows);
+    // Latency instrumentation (D-17-02a): map from prediction_epoch → enqueue Instant.
+    // Used to measure predicted-keystroke-time vs confirming-datagram-time for
+    // Phase 17 Windows predictive echo validation. Logged at debug level under
+    // target "nosh::predict" — no character content is emitted (T-15-08).
+    let mut predict_enqueue_times: std::collections::HashMap<u64, Instant> =
+        std::collections::HashMap::new();
     let exit_code;
 
     loop {
@@ -672,8 +697,8 @@ async fn run_pump(
                     }
                 }
             }
-            // Datagram arm: receive StateDiff, apply to ClientScreen, render display,
-            // emit datagram epoch-ack (D-14-02, D-14-03a).
+            // Datagram arm: receive StateDiff, apply to ClientScreen, cull predictions,
+            // render display, emit datagram epoch-ack (D-14-02, D-14-03a).
             // This is the SOLE display path (CLAUDE.md single screen-composition invariant).
             datagram = conn.read_datagram() => {
                 match datagram {
@@ -682,11 +707,37 @@ async fn run_pump(
                             // T-14-06: monotonic epoch gate — stale/replayed diffs discarded.
                             if diff.epoch > screen.last_applied_epoch() {
                                 screen.apply(&diff);
-                                // Pitfall 1: render_to_stdout requires std::io::Write (NOT
+                                // Cull predictions against the new confirmed state and quinn RTT
+                                // (D-17-02a: latency instrumentation hook — see below).
+                                let rtt_ms = conn.rtt().as_millis() as u64;
+                                let epoch_before_cull = predictor.confirmed_epoch();
+                                predictor.cull(&screen, diff.epoch, rtt_ms);
+                                // D-17-02a latency instrumentation: when cull advances confirmed_epoch,
+                                // one or more predictions were confirmed. Look up the enqueue time
+                                // for any epoch that was just confirmed and log the latency.
+                                // No character content is logged — only timing + epoch (T-15-08).
+                                // Phase 17 (Windows validation) will use this to verify prediction
+                                // latency on high-RTT links (D-17-02a deferred dependency).
+                                let epoch_after_cull = predictor.confirmed_epoch();
+                                if epoch_after_cull > epoch_before_cull {
+                                    if let Some(enqueued_at) = predict_enqueue_times.remove(&epoch_after_cull) {
+                                        let latency_ms = enqueued_at.elapsed().as_millis() as u64;
+                                        tracing::debug!(
+                                            target: "nosh::predict",
+                                            event = "confirm",
+                                            epoch = epoch_after_cull,
+                                            latency_ms,
+                                            "prediction confirmed"
+                                        );
+                                    }
+                                    // Prune stale enqueue entries (epochs that were reset/culled).
+                                    predict_enqueue_times.retain(|&k, _| k > epoch_after_cull);
+                                }
+                                // Pitfall 1: render_with_predictor requires std::io::Write (NOT
                                 // tokio::io::AsyncWrite). Buffer to Vec<u8>, then async flush.
                                 let mut buf: Vec<u8> = Vec::new();
-                                screen.render_to_stdout(&mut buf).unwrap_or_else(|e| {
-                                    tracing::warn!("render_to_stdout error: {e}");
+                                screen.render_with_predictor(&mut buf, &predictor).unwrap_or_else(|e| {
+                                    tracing::warn!("render_with_predictor error: {e}");
                                 });
                                 if !buf.is_empty() {
                                     if let Err(e) = stdout.write_all(&buf).await {
@@ -727,10 +778,45 @@ async fn run_pump(
                             // ~. escape: quit locally without forwarding.
                             return Ok(PumpOutcome::UserQuit);
                         }
-                        if !result.bytes_to_forward.is_empty()
-                            && client::send_input(send, &result.bytes_to_forward).await.is_err()
-                        {
-                            return Ok(PumpOutcome::TransportDrop);
+                        if !result.bytes_to_forward.is_empty() {
+                            // Phase 15: hook predictor AFTER escape machine, BEFORE send_input
+                            // (T-15-06: predictor receives a borrow and cannot alter the forwarded
+                            // slice — byte-identical keystrokes still flow to server via send_input).
+                            predictor.on_input(&result.bytes_to_forward, &screen);
+
+                            // D-17-02a latency instrumentation: record enqueue time for the
+                            // current prediction epoch so the datagram arm can measure confirmation
+                            // latency when this epoch is confirmed. Only timing data logged (T-15-08).
+                            let epoch_required = predictor.prediction_epoch();
+                            predict_enqueue_times.entry(epoch_required).or_insert_with(Instant::now);
+                            tracing::debug!(
+                                target: "nosh::predict",
+                                event = "predict",
+                                epoch_required,
+                                "keystroke predicted"
+                            );
+
+                            // Re-render speculatively so the prediction echo appears immediately.
+                            // All display goes through ClientScreen::render_with_predictor
+                            // (T-15-07: single display path, no second stdout writer).
+                            let mut buf: Vec<u8> = Vec::new();
+                            screen.render_with_predictor(&mut buf, &predictor).unwrap_or_else(|e| {
+                                tracing::warn!("render_with_predictor error: {e}");
+                            });
+                            if !buf.is_empty() {
+                                if let Err(e) = stdout.write_all(&buf).await {
+                                    tracing::warn!("stdout write_all failed: {e} — forcing full repaint");
+                                    screen.reset_physical();
+                                } else if let Err(e) = stdout.flush().await {
+                                    tracing::warn!("stdout flush failed: {e} — forcing full repaint");
+                                    screen.reset_physical();
+                                }
+                            }
+
+                            // Forward keystroke bytes UNCHANGED to the server (T-15-06).
+                            if client::send_input(send, &result.bytes_to_forward).await.is_err() {
+                                return Ok(PumpOutcome::TransportDrop);
+                            }
                         }
                     }
                     Err(_) => return Ok(PumpOutcome::UserQuit),
