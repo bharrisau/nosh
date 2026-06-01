@@ -39,7 +39,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 - [x] **Phase 11: Datagram Wire Protocol** — StateDiff sparse-diff wire format in nosh-proto; postcard encode/decode; size-cap tests (completed 2026-06-01)
 - [x] **Phase 12: Server Terminal State Model** — TerminalState vte::Perform impl in nosh-server; unit-tested against known VT sequences (completed 2026-06-01)
 - [x] **Phase 13: Server Datagram Sender** — Wires TerminalState into run_session select! loop; coalesced diffs over QUIC datagrams; ResumeComplete gate (completed 2026-06-01)
-- [ ] **Phase 14: Client Predictor — Confirmed Rendering** — ClientScreen renders confirmed terminal state from datagrams; ConnectionLossOverlay stub; all display through single render path
+- [x] **Phase 14: Client Predictor — Confirmed Rendering** — ClientScreen renders confirmed terminal state from datagrams; ConnectionLossOverlay stub; all display through single render path (completed 2026-06-01)
 - [ ] **Phase 15: Client Predictor — Speculative Overlay** — Full SSP-style prediction engine: epoch tracking, conservative fallback, underline rendering, adaptive RTT mode, wide-char handling
 - [ ] **Phase 16: QoL Feature Pack + Windows CI Gate** — Connection-loss banner, OSC 52 clipboard, terminal title, --predict flags; Windows CI job runs + WSAEMSGSIZE suppressed
 - [ ] **Phase 17: Windows-Host Predictive Echo Validation** — Predictive echo confirmed on native Windows client; live validation sign-off (run on Windows host)
@@ -111,7 +111,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 **Plans**: 3 plans
 - [x] 14-01-PLAN.md — ClientScreen compositor: local Cell + Overlay/ConnectionLossOverlay stub, monotonic apply (D-14-05), dual-grid resize, minimal-ANSI render_to_stdout (Wave 1)
 - [x] 14-02-PLAN.md — Wire into run_pump: conn.read_datagram() arm (apply→render→epoch-ack), PtyData display removal keeping highest_applied, reset on reattach (Wave 2)
-- [ ] 14-03-PLAN.md — End-to-end tests: grid-comparison vs server TerminalState + live datagram render integration test (Wave 3)
+- [x] 14-03-PLAN.md — End-to-end tests: grid-comparison vs server TerminalState + live datagram render integration test (Wave 3)
 
 ### Phase 15: Client Predictor — Speculative Overlay
 **Goal**: The client speculatively echoes locally-typed input ahead of server confirmation — printable characters, backspace, left/right cursor motion — with conservative fallback and adaptive RTT-based activation, never rendering worse than no prediction
@@ -177,7 +177,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 11. Datagram Wire Protocol | 1/1 | Complete    | 2026-06-01 |
 | 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
 | 13. Server Datagram Sender | 3/3 | Complete    | 2026-06-01 |
-| 14. Client Predictor — Confirmed Rendering | 2/3 | In Progress|  |
+| 14. Client Predictor — Confirmed Rendering | 3/3 | Complete   | 2026-06-01 |
 | 15. Client Predictor — Speculative Overlay | 0/? | Not started | - |
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | Not started | - |
 | 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
