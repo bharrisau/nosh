@@ -97,10 +97,22 @@ pub struct DiffRun {
     pub start_col: u16,
     /// SGR attributes for all cells in this run (packed bitflags).
     pub style: CellStyle,
-    /// ANSI 256-color foreground index (`0` = default terminal color).
-    pub fg: u8,
-    /// ANSI 256-color background index (`0` = default terminal color).
-    pub bg: u8,
+    /// ANSI 256-color foreground color.
+    ///
+    /// `None` = use the terminal's default foreground color (not the same as
+    /// palette index 0, which is black). `Some(n)` = palette index `n` (0–255).
+    ///
+    /// `Option<u8>` distinguishes "default" from "palette index 0 (black)":
+    /// with a plain `u8`, `fg=0` would be ambiguous between the two.
+    pub fg: Option<u8>,
+    /// ANSI 256-color background color.
+    ///
+    /// `None` = use the terminal's default background color (not the same as
+    /// palette index 0, which is black). `Some(n)` = palette index `n` (0–255).
+    ///
+    /// `Option<u8>` distinguishes "default" from "palette index 0 (black)":
+    /// with a plain `u8`, `bg=0` would be ambiguous between the two.
+    pub bg: Option<u8>,
     /// UTF-8 text for all cells in the run. The number of Unicode scalar values
     /// (`chars().count()`) equals the column count of the run for single-width
     /// characters. Wide character handling is deferred to Phase 15.
@@ -424,8 +436,8 @@ mod tests {
             row: 0,
             start_col: 0,
             style: CellStyle(CellStyle::NONE),
-            fg: 0,
-            bg: 0,
+            fg: None,
+            bg: None,
             chars: "a".repeat(80),
         };
         // Wrap in a StateDiff to measure via the same serializer path.
@@ -493,8 +505,8 @@ mod tests {
                 row: 5,
                 start_col: 10,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: "hello".to_string(),
             }],
         );
@@ -509,8 +521,8 @@ mod tests {
                 row: 0,
                 start_col: 0,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: "a".repeat(80),
             }],
         );
@@ -526,8 +538,8 @@ mod tests {
                 row: 3,
                 start_col: 0,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: "héllo wörld 你好".to_string(),
             }],
         );
@@ -542,8 +554,8 @@ mod tests {
                 row: 12,
                 start_col: 40,
                 style: CellStyle(CellStyle::BOLD | CellStyle::UNDERLINE),
-                fg: 2,
-                bg: 3,
+                fg: Some(2),
+                bg: Some(3),
                 chars: "styled".to_string(),
             }],
         );
@@ -583,7 +595,7 @@ mod tests {
         let diff = make_diff(1, vec![DiffRun {
             row: 0, start_col: 0,
             style: CellStyle(CellStyle::NONE),
-            fg: 0, bg: 0,
+            fg: None, bg: None,
             chars: "test".to_string(),
         }]);
         let full = tag_encode(&diff);
@@ -619,8 +631,8 @@ mod tests {
                 row: i % 24,
                 start_col: 0,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: String::new(), // empty chars to keep payload small
             })
             .collect();
@@ -651,8 +663,8 @@ mod tests {
                 row,
                 start_col: 0,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: "a".repeat(80),
             })
             .collect();
@@ -684,8 +696,8 @@ mod tests {
                 row,
                 start_col: 0,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: "x".repeat(80),
             })
             .collect();
@@ -740,8 +752,8 @@ mod tests {
             row: 0,
             start_col: 0,
             style: CellStyle(CellStyle::NONE),
-            fg: 0,
-            bg: 0,
+            fg: None,
+            bg: None,
             chars: "a".repeat(80),
         };
         // 23 single-char runs on rows 1–23 (measured header+run=13 bytes each).
@@ -750,8 +762,8 @@ mod tests {
                 row,
                 start_col: 0,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: "x".to_string(),
             })
             .collect();
@@ -823,8 +835,8 @@ mod tests {
                 row: 12,
                 start_col: 40,
                 style: CellStyle(CellStyle::NONE),
-                fg: 0,
-                bg: 0,
+                fg: None,
+                bg: None,
                 chars: "x".to_string(),
             }],
         };
@@ -854,8 +866,8 @@ mod tests {
                 row: 12,
                 start_col: 40,
                 style: CellStyle(CellStyle::BOLD | CellStyle::UNDERLINE),
-                fg: 2,
-                bg: 0,
+                fg: Some(2),
+                bg: None,
                 chars: "hello".to_string(),
             }],
         };
