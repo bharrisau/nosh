@@ -410,8 +410,10 @@ async fn run_session(
             chunk = out_rx.recv() => {
                 match chunk {
                     Some(data) => {
-                        // Feed into the sequenced output buffer (D-10) before sending.
-                        slot.push_output(&data);
+                        // Feed into the sequenced output buffer (D-10) AND the terminal
+                        // state model (SYNC-02) before sending. Seq is assigned first
+                        // (replay integrity), then TerminalState::advance is called.
+                        slot.push_output_and_parse(&data);
                         if nosh_proto::write_message(&mut send, &Message::PtyData { data })
                             .await
                             .is_err()
@@ -501,7 +503,7 @@ async fn run_session(
             loop {
                 match tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await {
                     Ok(Some(data)) => {
-                        slot.push_output(&data);
+                        slot.push_output_and_parse(&data);
                         let _ =
                             nosh_proto::write_message(&mut send, &Message::PtyData { data }).await;
                     }
@@ -790,7 +792,7 @@ async fn run_reattach_session(
             chunk = out_rx.recv() => {
                 match chunk {
                     Some(data) => {
-                        slot.push_output(&data);
+                        slot.push_output_and_parse(&data);
                         if nosh_proto::write_message(&mut send, &Message::PtyData { data })
                             .await
                             .is_err()

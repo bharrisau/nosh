@@ -24,6 +24,7 @@ use bytes::Bytes;
 use uuid::Uuid;
 
 use crate::session::Session;
+use crate::terminal::TerminalState;
 use nosh_auth::NoshPublicKey;
 
 // ─── SequencedOutputBuffer (D-10 / D-11) ────────────────────────────────────
@@ -237,6 +238,10 @@ pub struct SessionSlot {
     pub session_id: Uuid,
     pub(crate) session: Mutex<Session>,
     output_buf: Mutex<SequencedOutputBuffer>,
+    /// Server-side authoritative terminal state (SYNC-02).
+    /// Lock order: always acquire `output_buf` lock before `terminal_state` lock.
+    /// Never hold either lock across `.await` (Anti-Pattern #2).
+    terminal_state: Mutex<TerminalState>,
     state: Mutex<SlotState>,
     last_active: Mutex<Instant>,
     /// Single-use CSPRNG reattach token (D-05). Rotated on every successful
@@ -254,6 +259,8 @@ impl SessionSlot {
     /// Initializes the reattach token to a fresh CSPRNG uuid v4 (D-05).
     /// The PTY writer is stored as `None` initially; the caller (server) stores
     /// it via `pty_writer` after taking it from the session.
+    /// The terminal state is initialized at 80×24 (conventional default); the
+    /// resize path corrects dimensions when the client reports its actual size.
     pub fn new(session: Session) -> Arc<SessionSlot> {
         let identity = session.identity.clone();
         let session_id = session.session_id;
@@ -262,6 +269,7 @@ impl SessionSlot {
             session_id,
             session: Mutex::new(session),
             output_buf: Mutex::new(SequencedOutputBuffer::default()),
+            terminal_state: Mutex::new(TerminalState::new(80, 24)),
             state: Mutex::new(SlotState::Active),
             last_active: Mutex::new(Instant::now()),
             token: Mutex::new(Uuid::new_v4().into_bytes()),
@@ -345,6 +353,25 @@ impl SessionSlot {
         self.output_buf.lock().unwrap().push(chunk)
     }
 
+    /// Feed PTY output into BOTH the sequenced replay buffer AND the terminal state model.
+    /// Returns the assigned sequence number from the replay buffer (identical to what
+    /// `push_output` would have returned for the same chunk sequence — SYNC-02).
+    ///
+    /// # Lock order
+    ///
+    /// Acquires `output_buf` lock FIRST (seq assignment, replay path — never fails),
+    /// then acquires `terminal_state` lock (advance — no error path; CSI/OSC parse
+    /// errors are silently ignored). This ordering is critical for replay integrity:
+    /// `SequencedOutputBuffer::push` MUST run before `TerminalState::advance` so that
+    /// a hypothetical panic in `advance` (impossible today but guarded anyway) can
+    /// never skip seq assignment. Both locks are held only for brief field mutations —
+    /// NEVER across `.await` (Anti-Pattern #2, D-12-05 / Pitfall 8).
+    pub fn push_output_and_parse(&self, chunk: &[u8]) -> u64 {
+        let seq = self.output_buf.lock().unwrap().push(chunk);
+        self.terminal_state.lock().unwrap().advance(chunk);
+        seq
+    }
+
     // ── Phase 6: token management ────────────────────────────────────────────
 
     /// Return the current reattach token (copy).
@@ -405,9 +432,18 @@ impl SessionSlot {
         self.output_buf.lock().unwrap().trim_acked(acked_seq);
     }
 
-    /// Resize the PTY (delegates to `Session::resize`).
+    /// Resize the PTY and update the terminal state model dimensions (D-12-03: no reflow).
+    ///
+    /// Calls `Session::resize` (sends SIGWINCH to the shell) and also resizes the
+    /// `TerminalState` grid to track the new dimensions. Returns the `Session::resize`
+    /// result as the primary outcome; the terminal state resize is infallible.
+    ///
+    /// Lock discipline: acquires `session` lock then `terminal_state` lock sequentially
+    /// (never held simultaneously). Neither lock is held across `.await` (Anti-Pattern #2).
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
-        self.session.lock().unwrap().resize(cols, rows)
+        let result = self.session.lock().unwrap().resize(cols, rows);
+        self.terminal_state.lock().unwrap().resize(cols, rows);
+        result
     }
 
     /// Non-blocking check whether the shell child has exited. Returns the
@@ -1581,6 +1617,142 @@ mod tests {
         );
 
         // Cleanup.
+        slot.sighup();
+    }
+
+    // ── Phase 12: push_output_and_parse regression tests ─────────────────────
+
+    /// Replay-integrity regression test (SYNC-02 / Pitfall 8).
+    ///
+    /// Proves that `push_output_and_parse` is byte-identical to `push_output` for
+    /// the `SequencedOutputBuffer` path — seq numbers, replay_from results, and
+    /// trim_acked behavior are all identical. This guards the cold-reattach path:
+    /// converting the three server.rs callsites from `push_output` to
+    /// `push_output_and_parse` must not change replay semantics.
+    ///
+    /// The test operates at the `SequencedOutputBuffer` level directly (no real
+    /// PTY/Session needed) to keep it fast and dependency-free. A paired
+    /// `TerminalState` is advanced in the same order as `push_output_and_parse`
+    /// would do, verifying that both buffers receive the data.
+    #[test]
+    fn push_output_and_parse_seq_replay_trim_byte_identical_to_push_output() {
+        use crate::terminal::TerminalState;
+
+        // Build a "control" run using push_output (the old primitive).
+        let mut control_buf = SequencedOutputBuffer::new(64 * 1024);
+        let chunks: &[&[u8]] = &[b"hello", b"\x1b[1mworld\x1b[0m", b"\r\nfoo"];
+        let mut control_seqs = Vec::new();
+        for chunk in chunks {
+            control_seqs.push(control_buf.push(chunk));
+        }
+        // Get replay_from(0) and trim_acked result from the control run.
+        let (control_replay, control_replay_from, control_truncated) = control_buf.replay_from(0);
+        control_buf.trim_acked(2);
+        let (control_after_trim, _, _) = control_buf.replay_from(0);
+
+        // Build a "test" run using the push_output_and_parse ordering manually
+        // (push buf first, then advance terminal — same as push_output_and_parse).
+        let mut test_buf = SequencedOutputBuffer::new(64 * 1024);
+        let mut test_ts = TerminalState::new(80, 24);
+        let mut test_seqs = Vec::new();
+        for chunk in chunks {
+            let seq = test_buf.push(chunk);
+            test_ts.advance(chunk);
+            test_seqs.push(seq);
+        }
+        let (test_replay, test_replay_from, test_truncated) = test_buf.replay_from(0);
+        test_buf.trim_acked(2);
+        let (test_after_trim, _, _) = test_buf.replay_from(0);
+
+        // (a) Seq numbers must be identical.
+        assert_eq!(
+            control_seqs, test_seqs,
+            "seq numbers from push_output_and_parse must be identical to push_output"
+        );
+
+        // (b) replay_from must be identical.
+        assert_eq!(
+            control_replay_from, test_replay_from,
+            "replay_from_seq must be identical"
+        );
+        assert_eq!(
+            control_truncated, test_truncated,
+            "truncated_below_request must be identical"
+        );
+        let control_replay_seqs: Vec<u64> = control_replay.iter().map(|(s, _)| *s).collect();
+        let test_replay_seqs: Vec<u64> = test_replay.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            control_replay_seqs, test_replay_seqs,
+            "replay_from chunk seqs must be identical"
+        );
+        let control_replay_data: Vec<&[u8]> = control_replay.iter().map(|(_, d)| d.as_ref()).collect();
+        let test_replay_data: Vec<&[u8]> = test_replay.iter().map(|(_, d)| d.as_ref()).collect();
+        assert_eq!(
+            control_replay_data, test_replay_data,
+            "replay_from chunk data must be byte-identical"
+        );
+
+        // (c) trim_acked results must be identical.
+        let control_after_seqs: Vec<u64> = control_after_trim.iter().map(|(s, _)| *s).collect();
+        let test_after_seqs: Vec<u64> = test_after_trim.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            control_after_seqs, test_after_seqs,
+            "trim_acked must produce identical remaining chunk seqs"
+        );
+
+        // (d) TerminalState must have observed the chunks (both buffers genuinely fed).
+        // After pushing "hello\x1b[1mworld\x1b[0m\r\nfoo", the terminal should have
+        // text at the expected positions.
+        let h_cell = test_ts.cell(0, 0);
+        assert_eq!(h_cell.ch, 'h', "terminal must have advanced: cell(0,0) should be 'h'");
+        // "foo" is on row 1 (after \r\n)
+        let f_cell = test_ts.cell(1, 0);
+        assert_eq!(f_cell.ch, 'f', "terminal must have advanced: cell(1,0) should be 'f'");
+    }
+
+    /// Slot-level test: `push_output_and_parse` on a real `SessionSlot` feeds
+    /// both the `SequencedOutputBuffer` AND the `TerminalState`.
+    ///
+    /// Requires /bin/sh (guarded). Verifies the integration path through SessionSlot.
+    #[test]
+    fn slot_push_output_and_parse_feeds_both_buffers() {
+        if !have_sh() {
+            eprintln!("skipping slot_push_output_and_parse_feeds_both_buffers: /bin/sh unavailable");
+            return;
+        }
+
+        let sess = open_sh_session(test_key(0xD0));
+        let slot = SessionSlot::new(sess);
+
+        // Push text that the TerminalState will parse.
+        let seq0 = slot.push_output_and_parse(b"hello");
+        let seq1 = slot.push_output_and_parse(b" world");
+
+        // (a) Seq numbers must be 0 and 1 (SequencedOutputBuffer unchanged).
+        assert_eq!(seq0, 0, "first push_output_and_parse must return seq 0");
+        assert_eq!(seq1, 1, "second push_output_and_parse must return seq 1");
+
+        // (b) replay_from(0) must return both chunks (replay path unaffected).
+        let (chunks, replay_from_seq, truncated) = slot.replay_from(0);
+        assert_eq!(chunks.len(), 2, "replay_from(0) must return both chunks");
+        assert_eq!(replay_from_seq, 0);
+        assert!(!truncated);
+        assert_eq!(chunks[0].1.as_ref(), b"hello");
+        assert_eq!(chunks[1].1.as_ref(), b" world");
+
+        // (c) trim_acked must work (trim seq 0, keep seq 1).
+        slot.trim_acked(1);
+        let (after_trim, _, _) = slot.replay_from(0);
+        assert_eq!(after_trim.len(), 1, "after trim_acked(1), only seq 1 remains");
+        assert_eq!(after_trim[0].0, 1);
+
+        // (d) TerminalState must have observed the bytes.
+        // Lock the terminal_state field and inspect it.
+        let ts = slot.terminal_state.lock().unwrap();
+        let cell_h = ts.cell(0, 0);
+        assert_eq!(cell_h.ch, 'h', "terminal must have advanced: cell(0,0)='h'");
+        drop(ts);
+
         slot.sighup();
     }
 }
