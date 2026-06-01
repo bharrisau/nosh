@@ -13,7 +13,7 @@ The build order is dependency-strict (all four research files converge on it): t
 
 Clear the carried tech debt so nosh is dependable enough to daily-drive. The PTY reader race fix is a prerequisite for everything else — orphaned sessions under M4 load would otherwise leak blocking threads.
 
-- [ ] **HARDEN-01**: Orphaned/cleaned-up sessions cleanly terminate their PTY reader — a blocked `read()` is interruptible (self-pipe / `nix::poll` over `[PTY fd, shutdown pipe]`), so `abort()` actually stops the reader and the server's blocking-thread count stays bounded under repeated session orphan/drop
+- [x] **HARDEN-01**: Orphaned/cleaned-up sessions cleanly terminate their PTY reader — a blocked `read()` is interruptible (self-pipe / `nix::poll` over `[PTY fd, shutdown pipe]`), so `abort()` actually stops the reader and the server's blocking-thread count stays bounded under repeated session orphan/drop
 - [ ] **HARDEN-02**: The Windows cross-compile CI gate actually runs — a git remote is configured and a `windows-latest` job builds `nosh-client` for `x86_64-pc-windows-msvc` on every push (no false-green)
 - [ ] **HARDEN-03**: The `WSAEMSGSIZE` quinn_udp warning on Windows is resolved or deliberately suppressed (e.g. `quinn_udp=error` tracing filter), with the rationale recorded and the upstream issue referenced
 
@@ -88,7 +88,7 @@ Explicitly excluded for v1.2. Documented to prevent scope creep.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HARDEN-01 | Phase 10 | Pending |
+| HARDEN-01 | Phase 10 | Complete |
 | HARDEN-02 | Phase 16 | Pending |
 | HARDEN-03 | Phase 16 | Pending |
 | SYNC-01 | Phase 11 | Pending |

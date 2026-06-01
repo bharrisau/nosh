@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
-status: executing
-stopped_at: Phase 10 planned (2 plans, plan-checker passed)
-last_updated: "2026-06-01T08:23:47.904Z"
+status: ready_to_plan
+stopped_at: Phase 10 complete (2/2) — ready to discuss Phase 11
+last_updated: 2026-06-01T08:37:07.346Z
 last_activity: 2026-06-01 -- Phase 10 execution started
 progress:
   total_phases: 9
   completed_phases: 0
   total_plans: 2
-  completed_plans: 0
+  completed_plans: 2
   percent: 0
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-01)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 10 — pty-reader-race-fix
+**Current focus:** Phase 11 — datagram wire protocol
 
 ## Current Position
 
-Phase: 10 (pty-reader-race-fix) — EXECUTING
-Plan: 1 of 2
-Status: Executing Phase 10
-Last activity: 2026-06-01 -- Phase 10 execution started
+Phase: 11
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-06-01
 
 ```
 Progress: [░░░░░░░░░░░░░░░░░░░░] 0/9 phases (0%)
@@ -55,6 +55,7 @@ Progress: [░░░░░░░░░░░░░░░░░░░░] 0/9 pha
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | - | - |
 | 17. Windows-Host Predictive Echo Validation | 0/? | - | - |
 | 18. Security Design Pass | 0/? | - | - |
+| 10 | 2 | - | - |
 
 **Recent Trend:**
 
