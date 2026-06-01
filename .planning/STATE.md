@@ -4,13 +4,13 @@ milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: planning
 stopped_at: Phase 15 context gathered
-last_updated: "2026-06-01T23:24:50.398Z"
+last_updated: "2026-06-01T23:36:16.620Z"
 last_activity: 2026-06-01 -- Phase 15 planning complete
 progress:
   total_phases: 9
   completed_phases: 5
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
   percent: 56
 ---
 
@@ -95,6 +95,9 @@ Recent decisions affecting current work:
 - v1.2 roadmap: Noecho-suppression is a security requirement of prediction — engine must track server's confirmed echo state and suppress prediction during `stty -echo` prompts; validated with `read -s` test
 - v1.2 roadmap: Phase 17 (Windows-host validation) must execute from a physical Windows PC — halt Linux execution, run from Windows machine like v1.1 Phase 9; HARDEN-02/03 stay in Phase 16 (authorable from Linux)
 - v1.2 roadmap: 0-RTT cold reattach still deliberately deferred — 1-RTT already ships, replay-safety burden not justified
+- [Phase ?]: emit_diff factored as shared private method
+- [Phase ?]: Predictor held in run_pump not overlays Vec
+- [Phase ?]: D-17-02a latency hook uses HashMap in run_pump
 
 ### Pending Todos
 
@@ -134,7 +137,7 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-01T23:24:50.370Z
+Last session: 2026-06-01T23:36:00.304Z
 Stopped at: Phase 15 context gathered
 Resume file: .planning/phases/15-client-predictor-speculative-overlay/15-CONTEXT.md
 

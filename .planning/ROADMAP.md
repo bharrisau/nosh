@@ -155,7 +155,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 15-02-PLAN.md — Integration: render cursor-override, compositor wiring, --predict flag, run_pump stdin/datagram hooks, Phase-17 latency instrumentation (PREDICT-02/04/05)
+- [x] 15-02-PLAN.md — Integration: render cursor-override, compositor wiring, --predict flag, run_pump stdin/datagram hooks, Phase-17 latency instrumentation (PREDICT-02/04/05)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -222,7 +222,7 @@ Plans:
 | 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
 | 13. Server Datagram Sender | 3/3 | Complete    | 2026-06-01 |
 | 14. Client Predictor — Confirmed Rendering | 3/3 | Complete    | 2026-06-01 |
-| 15. Client Predictor — Speculative Overlay | 1/3 | In Progress|  |
+| 15. Client Predictor — Speculative Overlay | 2/3 | In Progress|  |
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | Not started | - |
 | 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
 | 18. Security Design Pass | 0/? | Not started | - |
