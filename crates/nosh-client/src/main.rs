@@ -52,9 +52,11 @@ const BACKOFF_MAX: Duration = Duration::from_secs(10);
 //
 // This implements the OpenSSH client escape mechanism. It sits BETWEEN the
 // local stdin read and `client::send_input`, so it is fed ONLY local keystrokes.
-// Server-sourced `PtyData` bytes go directly to stdout and NEVER pass through
-// here (T-09-01 threat model: a malicious server cannot inject `~.` to force
-// a local disconnect).
+// Server-sourced `PtyData` bytes NO LONGER go directly to stdout (D-14-02);
+// display flows exclusively through ClientScreen::render_to_stdout via the
+// datagram arm. PtyData is received on the reliable stream only to advance
+// highest_applied (cold-reattach ack, D-14-03). The escape machine is fed
+// ONLY local keystrokes (T-09-01: a malicious server cannot inject `~.`).
 //
 // State machine:
 //   - LineStart: at the beginning of the stream, or just after forwarding a '\n'
@@ -645,11 +647,13 @@ async fn run_pump(
             msg = nosh_proto::read_message(recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
-                        // Server output goes directly to stdout — it does NOT pass
-                        // through the EscapeState machine (T-09-01 security property).
-                        stdout.write_all(&data).await?;
-                        stdout.flush().await?;
-                        // Count each PtyData chunk as one applied sequence unit.
+                        // D-14-02: display comes exclusively from datagrams via
+                        // ClientScreen.render_to_stdout — do NOT write PtyData to stdout.
+                        // D-14-03: advance the reattach counter so the cold-reattach
+                        // Ack{seq} mechanism on the reliable stream is unaffected.
+                        // The reliable-stream Ack{seq} is DISTINCT from the datagram
+                        // epoch-ack (D-14-03a / Pitfall 3).
+                        let _ = data; // content discarded for display (no scrollback this milestone)
                         *highest_applied = highest_applied.saturating_add(1);
                     }
                     Ok(Message::SessionClose { exit_code: code, .. }) => {
@@ -662,6 +666,43 @@ async fn run_pump(
                     }
                     Ok(_) => {} // ignore other control frames
                     Err(_) => {
+                        return Ok(PumpOutcome::TransportDrop);
+                    }
+                }
+            }
+            // Datagram arm: receive StateDiff, apply to ClientScreen, render display,
+            // emit datagram epoch-ack (D-14-02, D-14-03a).
+            // This is the SOLE display path (CLAUDE.md single screen-composition invariant).
+            datagram = conn.read_datagram() => {
+                match datagram {
+                    Ok(bytes) => {
+                        if let Ok(diff) = nosh_proto::datagram::decode_datagram(&bytes) {
+                            // T-14-06: monotonic epoch gate — stale/replayed diffs discarded.
+                            if diff.epoch > screen.last_applied_epoch() {
+                                screen.apply(&diff);
+                                // Pitfall 1: render_to_stdout requires std::io::Write (NOT
+                                // tokio::io::AsyncWrite). Buffer to Vec<u8>, then async flush.
+                                let mut buf: Vec<u8> = Vec::new();
+                                screen.render_to_stdout(&mut buf).unwrap_or_else(|e| {
+                                    tracing::warn!("render_to_stdout error: {e}");
+                                });
+                                if !buf.is_empty() {
+                                    let _ = stdout.write_all(&buf).await;
+                                    let _ = stdout.flush().await;
+                                }
+                                // D-14-03a: emit epoch-ack as DATAGRAM on the datagram channel
+                                // (TAG_CLIENT_EPOCH 0x02), DISTINCT from reliable-stream Ack{seq}
+                                // (Pitfall 3). Best-effort; ignore error (RESEARCH A6 / T-14-DoS).
+                                let ack_payload = nosh_proto::datagram::encode_epoch_ack(diff.epoch);
+                                let _ = conn.send_datagram(ack_payload);
+                            }
+                            // Stale epoch silently discarded (Pitfall 6).
+                        }
+                        // Non-StateDiff datagrams (unknown tag): decode_datagram returns Err
+                        // → silently discarded (T-14-05 resilience; T-14-08 injection block).
+                    }
+                    Err(_) => {
+                        // Transport drop on datagram channel — mirror reliable-stream behavior.
                         return Ok(PumpOutcome::TransportDrop);
                     }
                 }
