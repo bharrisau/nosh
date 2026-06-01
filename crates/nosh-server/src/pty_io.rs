@@ -156,7 +156,8 @@ fn unix_reader_loop(
         let mut fds = [master_pfd, pipe_pfd];
 
         match poll(&mut fds, PollTimeout::NONE) {
-            Err(_) => break,  // EINTR or other poll error → exit
+            Err(nix::errno::Errno::EINTR) => continue, // signal interrupted poll(); retry
+            Err(_) => break,  // genuine poll error (EBADF, EFAULT, ENOMEM) → exit
             Ok(0) => continue, // spurious wakeup (impossible with NONE, but safe to skip)
             Ok(_) => {}
         }
