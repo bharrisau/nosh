@@ -124,7 +124,11 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   3. Zero predicted characters are displayed during a `read -s` noecho prompt — the engine tracks the server's confirmed echo state and suppresses prediction when the server is not echoing
   4. Unconfirmed predictions are visually distinguished (underline) only above an RTT threshold; `--predict always|adaptive|never` overrides the adaptive default; on a loopback connection with adaptive mode, prediction underlines are invisible
   5. The cursor advances by the correct column count for CJK wide characters (validated with `你好`); ambiguous-width and ZWJ/emoji inputs trigger epoch reset rather than corrupt column tracking
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 15-01-PLAN.md — Predictor engine core: Validity/PendingPrediction state machine, byte classifier, on_input/cull, RTT hysteresis, unicode-width (PREDICT-02/03/04/06)
+- [ ] 15-02-PLAN.md — Integration: render cursor-override, compositor wiring, --predict flag, run_pump stdin/datagram hooks, Phase-17 latency instrumentation (PREDICT-02/04/05)
+- [ ] 15-03-PLAN.md — D-15-04 adversarial test suite: vim/CJK/less/paste/Ctrl-C/simulated-loss/Home-End + live read -s noecho security gate (PREDICT-02..06)
 
 ### Phase 16: QoL Feature Pack + Windows CI Gate
 **Goal**: Day-to-day ergonomics land (connection-loss banner, OSC 52 clipboard passthrough, terminal title propagation, predict-mode flag) and the Windows CI gate actually runs on every push
