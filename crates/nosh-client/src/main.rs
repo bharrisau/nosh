@@ -687,8 +687,13 @@ async fn run_pump(
                                     tracing::warn!("render_to_stdout error: {e}");
                                 });
                                 if !buf.is_empty() {
-                                    let _ = stdout.write_all(&buf).await;
-                                    let _ = stdout.flush().await;
+                                    if let Err(e) = stdout.write_all(&buf).await {
+                                        tracing::warn!("stdout write_all failed: {e} — forcing full repaint");
+                                        screen.reset_physical();
+                                    } else if let Err(e) = stdout.flush().await {
+                                        tracing::warn!("stdout flush failed: {e} — forcing full repaint");
+                                        screen.reset_physical();
+                                    }
                                 }
                                 // D-14-03a: emit epoch-ack as DATAGRAM on the datagram channel
                                 // (TAG_CLIENT_EPOCH 0x02), DISTINCT from reliable-stream Ack{seq}
