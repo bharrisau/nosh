@@ -19,7 +19,8 @@ use crate::codec::ProtoError;
 // ── Tag byte discriminant (Pattern 3 — extensible) ───────────────────────────
 /// Tag byte for a [`StateDiff`] datagram payload (server → client).
 const TAG_STATE_DIFF: u8 = 0x01;
-// const TAG_CLIENT_EPOCH: u8 = 0x02; // reserved for Phase 13 (ClientEpoch, client → server)
+/// Tag byte for a [`ClientEpoch`] datagram payload (client → server).
+const TAG_CLIENT_EPOCH: u8 = 0x02;
 
 /// Maximum accepted run count in a decoded [`StateDiff`]. Guards against a
 /// malformed packet forcing a multi-megabyte allocation (T-11-02 DoS guard).
@@ -136,6 +137,58 @@ impl CellStyle {
     /// Reverse video (swap fg/bg).
     pub const REVERSE: u8 = 0x08;
     // Bits 0x10, 0x20, 0x40, 0x80: reserved for future SGR attributes.
+}
+
+/// A client→server epoch acknowledgement sent as a QUIC datagram (D-13-01/D-13-01a).
+///
+/// After the client applies a [`StateDiff`] with a given `epoch`, it sends this
+/// message to inform the server of its confirmed display state. The server uses this
+/// to advance the baseline for subsequent diffs — only cells that changed since the
+/// acked epoch are re-transmitted.
+///
+/// `Copy` is intentional: this is a single `u64` field with no heap allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientEpoch {
+    /// The last epoch the client has applied to its display.
+    pub epoch: u64,
+}
+
+/// Encode a `ClientEpoch` as a tagged datagram payload (infallible).
+///
+/// The returned [`Bytes`] begins with `TAG_CLIENT_EPOCH` (0x02) followed by a
+/// postcard-serialized `u64`. Serialization of a single `u64` under postcard
+/// cannot fail (no heap allocation limit, no variant tagging — just a varint).
+pub fn encode_epoch_ack(epoch: u64) -> Bytes {
+    let body = postcard::to_allocvec(&ClientEpoch { epoch })
+        .expect("postcard serialization of ClientEpoch (u64) cannot fail");
+    let mut payload = Vec::with_capacity(1 + body.len());
+    payload.push(TAG_CLIENT_EPOCH);
+    payload.extend_from_slice(&body);
+    Bytes::from(payload)
+}
+
+/// Decode an epoch-ack datagram payload into the acknowledged epoch value.
+///
+/// Returns `Err` for any tag other than `TAG_CLIENT_EPOCH` (0x02), including
+/// `TAG_STATE_DIFF` (0x01) — a misrouted [`StateDiff`] is never read as an epoch-ack.
+///
+/// # Errors
+///
+/// Returns [`ProtoError`] (never panics) on:
+/// * Empty input — no tag byte present.
+/// * Wrong tag byte — any value other than `TAG_CLIENT_EPOCH` (0x02), including
+///   `TAG_STATE_DIFF` (0x01). This is the security-relevant guard (T-13-01): an
+///   attacker cannot re-use a StateDiff payload as an epoch-ack.
+/// * Truncated or corrupt postcard body — `postcard::from_bytes` returns `Err`.
+pub fn decode_epoch_ack(bytes: &[u8]) -> Result<u64, ProtoError> {
+    let (tag, body) = bytes
+        .split_first()
+        .ok_or(ProtoError::Postcard(postcard::Error::DeserializeUnexpectedEnd))?;
+    if *tag != TAG_CLIENT_EPOCH {
+        return Err(ProtoError::Postcard(postcard::Error::DeserializeBadEncoding));
+    }
+    let ce: ClientEpoch = postcard::from_bytes(body).map_err(ProtoError::Postcard)?;
+    Ok(ce.epoch)
 }
 
 // ── Encode / Decode ───────────────────────────────────────────────────────────
@@ -375,9 +428,9 @@ pub fn encode_datagram(
 /// * Run vector exceeding [`MAX_RUNS`] — guards against a malformed packet
 ///   forcing a large allocation (T-11-02 DoS guard).
 pub fn decode_datagram(bytes: &[u8]) -> Result<StateDiff, ProtoError> {
-    let (tag, body) = bytes.split_first().ok_or_else(|| {
-        ProtoError::Postcard(postcard::Error::DeserializeUnexpectedEnd)
-    })?;
+    let (tag, body) = bytes
+        .split_first()
+        .ok_or(ProtoError::Postcard(postcard::Error::DeserializeUnexpectedEnd))?;
     if *tag != TAG_STATE_DIFF {
         return Err(ProtoError::Postcard(
             postcard::Error::DeserializeBadEncoding,
@@ -878,5 +931,75 @@ mod tests {
         assert!(deferred.is_empty());
         let decoded = decode_datagram(&encoded).expect("decode_datagram");
         assert_eq!(diff, decoded);
+    }
+
+    // ── Task 1 (Phase 13): epoch-ack wire format tests ────────────────────────
+
+    /// encode_epoch_ack then decode_epoch_ack round-trips for epoch=1.
+    #[test]
+    fn epoch_ack_roundtrip() {
+        let payload = encode_epoch_ack(1);
+        let epoch = decode_epoch_ack(&payload).expect("decode_epoch_ack must succeed for epoch=1");
+        assert_eq!(epoch, 1, "epoch round-trip failed");
+    }
+
+    /// encode_epoch_ack / decode_epoch_ack round-trips for edge-case epochs: 0 and u64::MAX.
+    #[test]
+    fn epoch_ack_roundtrip_extremes() {
+        for &n in &[0u64, u64::MAX] {
+            let payload = encode_epoch_ack(n);
+            let epoch = decode_epoch_ack(&payload)
+                .unwrap_or_else(|_| panic!("decode_epoch_ack must succeed for epoch={n}"));
+            assert_eq!(epoch, n, "epoch round-trip failed for n={n}");
+        }
+    }
+
+    /// decode_epoch_ack must return Err when the first byte is TAG_STATE_DIFF (0x01).
+    /// This is the security-relevant guard: a misrouted StateDiff must NOT be read as an epoch-ack.
+    #[test]
+    fn decode_epoch_ack_rejects_state_diff_tag() {
+        // Build a valid-looking payload with the StateDiff tag (0x01).
+        let diff = make_diff(42, vec![]);
+        let state_diff_payload = tag_encode(&diff);
+        // First byte is 0x01 — decode_epoch_ack must reject it.
+        let result = decode_epoch_ack(&state_diff_payload);
+        assert!(
+            result.is_err(),
+            "decode_epoch_ack must reject TAG_STATE_DIFF (0x01) tag — got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    /// decode_epoch_ack on an empty slice must return Err (no panic / no index-out-of-bounds).
+    #[test]
+    fn decode_epoch_ack_rejects_empty() {
+        let result = decode_epoch_ack(&[]);
+        assert!(result.is_err(), "decode_epoch_ack must return Err on empty slice");
+    }
+
+    /// decode_epoch_ack on a payload with the correct tag 0x02 but a truncated/garbage
+    /// body must return Err (no panic).
+    #[test]
+    fn decode_epoch_ack_rejects_bad_body() {
+        // Correct tag byte but a 10-byte-all-0x80 body — postcard reads these as
+        // continuation bits with no final byte, so it returns DeserializeUnexpectedEnd.
+        let bad_payload = [0x02u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+        let result = decode_epoch_ack(&bad_payload);
+        assert!(result.is_err(), "decode_epoch_ack must return Err on truncated/garbage body");
+
+        // Correct tag but empty body (tag-only).
+        let tag_only = [0x02u8];
+        let result2 = decode_epoch_ack(&tag_only);
+        assert!(result2.is_err(), "decode_epoch_ack must return Err on tag-only (no body) payload");
+    }
+
+    /// The first byte of encode_epoch_ack(N) must be exactly 0x02 (TAG_CLIENT_EPOCH).
+    #[test]
+    fn encode_epoch_ack_first_byte_is_tag() {
+        let payload = encode_epoch_ack(42);
+        assert_eq!(
+            payload[0], 0x02,
+            "first byte of encode_epoch_ack output must be TAG_CLIENT_EPOCH (0x02)"
+        );
     }
 }
