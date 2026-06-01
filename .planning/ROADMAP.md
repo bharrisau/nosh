@@ -3,7 +3,7 @@
 ## Milestones
 
 - ✅ **v1.0 M0–M2 Architecture-Validation Spike** — Phases 1-3 (shipped 2026-05-29)
-- ✅ **v1.1 M3 Roaming + Windows Client** — Phases 4-9 (shipped 2026-05-30)
+- 📋 **v1.1 M3 Roaming + Windows Client** — Phases 4-9 (shipped 2026-05-30)
 - 📋 **v1.2 M4 Predictive Echo + Daily-Driver Readiness** — Phases 10-18 (in progress)
 
 ## Phases
@@ -62,7 +62,6 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 ### Phase 11: Datagram Wire Protocol
 **Goal**: A sparse, size-bounded terminal-diff wire format exists in nosh-proto — the shared interface that every subsequent server and client component builds on
 **Depends on**: Phase 10
-**Requirements**: SYNC-01
 **Research flag**: Needs per-phase research — sparse-diff encoding strategy for large repaints within QUIC datagram MTU is an open design decision (options: cursor-priority partial update, skip-frame, reliable-stream fallback for full-screen repaints). Must be resolved before implementation begins.
 **Success Criteria** (what must be TRUE):
   1. A `StateDiff` type in `nosh-proto/src/datagram.rs` carries changed cells only (sparse), a monotonic `epoch: u64`, terminal dimensions, and cursor position
@@ -95,7 +94,10 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   2. An integration test connects a test client and server, types characters, and asserts that `conn.read_datagram()` on the client receives non-empty `StateDiff` frames
   3. Datagrams are suppressed until a `ResumeComplete` signal is sent after cold-reattach replay completes — a reattach session does not send datagrams during the replay window
   4. `run_reattach_session` also has the datagram sender arm with the same `ResumeComplete` gate
-**Plans**: TBD
+**Plans**: 3 plans
+- [ ] 13-01-PLAN.md — Foundation (Wave 1): nosh-proto epoch-ack wire format (TAG_CLIENT_EPOCH/ClientEpoch/encode/decode) + SessionSlot with_terminal_state delegate
+- [ ] 13-02-PLAN.md — Server sender (Wave 2): diff_interval + epoch-ack select! arms in run_session and run_reattach_session; acked-epoch diff; ResumeComplete gate; additive PtyData
+- [ ] 13-03-PLAN.md — Integration test (Wave 3): tests/sync.rs — datagram arrival, full acked-epoch loop, ResumeComplete-gated resume flow
 
 ### Phase 14: Client Predictor — Confirmed Rendering
 **Goal**: The client renders the confirmed terminal screen from received state-sync datagrams through a single screen-composition path — the datagram display path is proven end-to-end before speculative overlay is added
@@ -171,7 +173,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 10. PTY Reader Race Fix | 2/2 | Complete    | 2026-06-01 |
 | 11. Datagram Wire Protocol | 1/1 | Complete    | 2026-06-01 |
 | 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
-| 13. Server Datagram Sender | 0/? | Not started | - |
+| 13. Server Datagram Sender | 0/3 | Planned     | - |
 | 14. Client Predictor — Confirmed Rendering | 0/? | Not started | - |
 | 15. Client Predictor — Speculative Overlay | 0/? | Not started | - |
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | Not started | - |
