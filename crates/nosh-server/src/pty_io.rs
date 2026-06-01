@@ -253,7 +253,7 @@ mod tests {
             let write_fd = handle.shutdown_tx;
             tokio::spawn(async move {
                 // Signal shutdown, then await the reader thread.
-                let _ = nix::unistd::write(write_fd.as_raw_fd(), b"x");
+                let _ = nix::unistd::write(&write_fd, b"x");
                 let _ = join.await;
                 counter.fetch_add(1, Ordering::Release);
             });
