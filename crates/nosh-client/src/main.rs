@@ -604,6 +604,7 @@ async fn reattach_session(
 
 /// Core pump loop: render output, forward input, debounce resize, send periodic
 /// Ack. Returns the pump outcome.
+#[allow(clippy::too_many_arguments)] // 8 args are load-bearing: conn + streams + state + watcher + baseline
 async fn run_pump(
     conn: &quinn::Connection,
     cols: u16,
