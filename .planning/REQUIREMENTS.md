@@ -29,7 +29,7 @@ The loss-tolerant server→client display path that predictive echo is built on.
 
 The headline differentiator — full Mosh/SSP-style speculative echo. Conservative-by-design: it must never render worse than no prediction.
 
-- [ ] **PREDICT-01**: The client renders the confirmed terminal screen from received state-sync datagrams (display routed through a single screen-composition path, never direct `stdout` writes once the predictor exists), matching raw PTY output
+- [x] **PREDICT-01**: The client renders the confirmed terminal screen from received state-sync datagrams (display routed through a single screen-composition path, never direct `stdout` writes once the predictor exists), matching raw PTY output
 - [ ] **PREDICT-02**: The client speculatively echoes locally-typed input — printable characters, backspace, and left/right cursor motion — ahead of server confirmation, with per-prediction confirmation tracking against the confirmed screen
 - [ ] **PREDICT-03**: Prediction is conservative by design — any cursor-addressing / control sequence (CSI cursor move, erase, alternate-screen) or non-printing control key resets the prediction epoch; no prediction is displayed on a fresh row or before the server confirms the first character of an epoch (validated adversarially: a `vim` insert produces zero corrupt cells)
 - [ ] **PREDICT-04**: Prediction is suppressed during non-echoing input (`stty -echo` / `read -s` password prompts) — the engine tracks the server's confirmed echo state and never speculatively renders an unechoed character (validated with a `read -s` test; this is a security requirement of the feature)
@@ -94,7 +94,7 @@ Explicitly excluded for v1.2. Documented to prevent scope creep.
 | SYNC-01 | Phase 11 | Complete |
 | SYNC-02 | Phase 12 | Complete |
 | SYNC-03 | Phase 13 | Complete |
-| PREDICT-01 | Phase 14 | Pending |
+| PREDICT-01 | Phase 14 | Complete |
 | PREDICT-02 | Phase 15 | Pending |
 | PREDICT-03 | Phase 15 | Pending |
 | PREDICT-04 | Phase 15 | Pending |
