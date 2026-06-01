@@ -546,7 +546,7 @@ async fn fresh_session(
     // Fresh session starts at seq 0.
     *highest_applied = 0;
 
-    run_pump(&mut send, &mut recv, highest_applied, resize, 0).await
+    run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, 0).await
 }
 
 /// Run a reattach session. Updates `highest_applied` and `token_out` in-place.
@@ -594,7 +594,8 @@ async fn reattach_session(
             // `replaying_from_seq == lowest_retained_seq` so this resyncs the
             // baseline to exactly what the server is sending.
             *highest_applied = replaying_from_seq;
-            run_pump(&mut send, &mut recv, highest_applied, resize, *highest_applied).await
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, *highest_applied).await
         }
     }
 }
@@ -602,6 +603,9 @@ async fn reattach_session(
 /// Core pump loop: render output, forward input, debounce resize, send periodic
 /// Ack. Returns the pump outcome.
 async fn run_pump(
+    conn: &quinn::Connection,
+    cols: u16,
+    rows: u16,
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
     highest_applied: &mut u64,
@@ -618,8 +622,14 @@ async fn run_pump(
     let mut last_acked = *highest_applied;
     // Escape state machine: persisted across reads so line-start state is
     // maintained correctly. Fed ONLY local stdin bytes — server PtyData output
-    // goes directly to stdout and NEVER enters this machine (T-09-01).
+    // NEVER enters this machine (T-09-01).
     let mut escape = EscapeState::new();
+    // ClientScreen compositor: the SOLE display path (D-14-02 / CLAUDE.md).
+    // Constructing a fresh screen per run_pump invocation means physical grid
+    // always starts blank — this IS the reattach full-repaint reset (D-13-01b
+    // symmetric). Calling reset_physical() explicitly is only needed if the
+    // screen is ever hoisted above run_pump scope; do NOT hoist it.
+    let mut screen = nosh_client::screen::ClientScreen::new(cols, rows);
     let exit_code;
 
     loop {
