@@ -38,7 +38,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 - [x] **Phase 10: PTY Reader Race Fix** — Replace spawn_blocking PTY read loop with nix::poll self-pipe; bounded blocking-thread count (completed 2026-06-01)
 - [x] **Phase 11: Datagram Wire Protocol** — StateDiff sparse-diff wire format in nosh-proto; postcard encode/decode; size-cap tests (completed 2026-06-01)
 - [x] **Phase 12: Server Terminal State Model** — TerminalState vte::Perform impl in nosh-server; unit-tested against known VT sequences (completed 2026-06-01)
-- [ ] **Phase 13: Server Datagram Sender** — Wires TerminalState into run_session select! loop; coalesced diffs over QUIC datagrams; ResumeComplete gate
+- [x] **Phase 13: Server Datagram Sender** — Wires TerminalState into run_session select! loop; coalesced diffs over QUIC datagrams; ResumeComplete gate (completed 2026-06-01)
 - [ ] **Phase 14: Client Predictor — Confirmed Rendering** — ClientScreen renders confirmed terminal state from datagrams; ConnectionLossOverlay stub; all display through single render path
 - [ ] **Phase 15: Client Predictor — Speculative Overlay** — Full SSP-style prediction engine: epoch tracking, conservative fallback, underline rendering, adaptive RTT mode, wide-char handling
 - [ ] **Phase 16: QoL Feature Pack + Windows CI Gate** — Connection-loss banner, OSC 52 clipboard, terminal title, --predict flags; Windows CI job runs + WSAEMSGSIZE suppressed
@@ -97,7 +97,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 **Plans**: 3 plans
 - [x] 13-01-PLAN.md — Foundation (Wave 1): nosh-proto epoch-ack wire format (TAG_CLIENT_EPOCH/ClientEpoch/encode/decode) + SessionSlot with_terminal_state delegate
 - [x] 13-02-PLAN.md — Server sender (Wave 2): diff_interval + epoch-ack select! arms in run_session and run_reattach_session; acked-epoch diff; ResumeComplete gate; additive PtyData
-- [ ] 13-03-PLAN.md — Integration test (Wave 3): tests/sync.rs — datagram arrival, full acked-epoch loop, ResumeComplete-gated resume flow
+- [x] 13-03-PLAN.md — Integration test (Wave 3): tests/sync.rs — datagram arrival, full acked-epoch loop, ResumeComplete-gated resume flow
 
 ### Phase 14: Client Predictor — Confirmed Rendering
 **Goal**: The client renders the confirmed terminal screen from received state-sync datagrams through a single screen-composition path — the datagram display path is proven end-to-end before speculative overlay is added
@@ -173,7 +173,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 10. PTY Reader Race Fix | 2/2 | Complete    | 2026-06-01 |
 | 11. Datagram Wire Protocol | 1/1 | Complete    | 2026-06-01 |
 | 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
-| 13. Server Datagram Sender | 2/3 | In Progress|  |
+| 13. Server Datagram Sender | 3/3 | Complete   | 2026-06-01 |
 | 14. Client Predictor — Confirmed Rendering | 0/? | Not started | - |
 | 15. Client Predictor — Speculative Overlay | 0/? | Not started | - |
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | Not started | - |
