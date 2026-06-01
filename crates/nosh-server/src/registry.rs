@@ -368,7 +368,17 @@ impl SessionSlot {
     /// NEVER across `.await` (Anti-Pattern #2, D-12-05 / Pitfall 8).
     pub fn push_output_and_parse(&self, chunk: &[u8]) -> u64 {
         let seq = self.output_buf.lock().unwrap().push(chunk);
-        self.terminal_state.lock().unwrap().advance(chunk);
+        // WR-01: use unwrap_or_else(|e| e.into_inner()) instead of unwrap() so that
+        // a Mutex poison caused by an unexpected panic inside advance() does not
+        // permanently disable the session. The poisoned guard still holds the
+        // TerminalState; we recover it and continue. If the state is partially
+        // corrupted the next advance() call will overwrite/repair it incrementally.
+        // Note: CR-01 removes the only known panic source (u16 overflow), so this
+        // is belt-and-suspenders hardening for any future unexpected panic.
+        self.terminal_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .advance(chunk);
         seq
     }
 
@@ -458,7 +468,11 @@ impl SessionSlot {
         let cols = cols.min(MAX_COLS);
         let rows = rows.min(MAX_ROWS);
         let result = self.session.lock().unwrap().resize(cols, rows);
-        self.terminal_state.lock().unwrap().resize(cols, rows);
+        // WR-01: recover from Mutex poison (same rationale as push_output_and_parse).
+        self.terminal_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resize(cols, rows);
         result
     }
 
