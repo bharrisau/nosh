@@ -34,7 +34,9 @@ Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+P
 
 **Phase 11 complete (2026-06-01):** Datagram wire-protocol module delivered. `nosh-proto/src/datagram.rs` — `StateDiff` sparse-diff type, total `encode_datagram` (cursor-priority fill, STRICT payload < cap, continue-past-rejection), hardened `decode_datagram` (TAG_STATE_DIFF, MAX_RUNS guard, never panics on malformed input), 16 inline tests (22 total passing). SYNC-01 satisfied.
 
-**Current milestone:** v1.2 (M4) — **in progress.** Phase 11 (datagram wire protocol) done. Next: Phase 12 (server terminal state model) — vte::Perform TerminalState.
+**Phase 12 complete (2026-06-01):** Server terminal state model delivered. `crates/nosh-server/src/terminal.rs` — `TerminalState` implementing `vte::Perform` with viewport grid, bounded scrollback (SCROLLBACK_LINE_CAP=10_000), DEC private modes (?25/?1049/?2004/?1), OSC 0/2 title, OSC 52 clipboard detection (D-12-04), and full SGR mapping. `Cell.fg/bg` are `Option<u8>` matching `DiffRun` for zero-conversion Phase 13 extraction. `SessionSlot::push_output_and_parse` feeds both `SequencedOutputBuffer` and `TerminalState`; 3 server.rs callsites converted; 67 lib tests pass. SYNC-02 satisfied.
+
+**Current milestone:** v1.2 (M4) — **in progress.** Phase 12 (server terminal state model) done. Next: Phase 13 (server-datagram-sender) — StateDiff extraction + datagram send loop.
 
 ## Requirements
 
