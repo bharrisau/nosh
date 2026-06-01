@@ -4,7 +4,19 @@
 
 `nosh` is a roaming-tolerant remote shell built on QUIC — a successor to Mosh and Eternal Terminal that reuses the user's existing SSH keys for mutual authentication and runs over a single UDP/443 port (indistinguishable from HTTP/3 on the wire). It's for developers who SSH from laptops and phones across flaky, NAT'd, or firewalled networks and want sessions that survive IP changes without re-authenticating.
 
-The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux). The current milestone (v1.1, M3) builds the first headline differentiator on that foundation: roaming.
+The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux), and v1.1 (M3) added roaming + a native Windows client. The current milestone (v1.2, M4) builds the headline UX differentiator on that foundation — predictive local echo — and hardens nosh into a daily-drivable tool.
+
+## Current Milestone: v1.2 M4 Predictive Echo + Daily-Driver Readiness
+
+**Goal:** Deliver the predictive-echo differentiator (datagram state sync + full SSP-style local echo) and harden nosh into a tool the maintainer can daily-drive from the Windows client, with a security design review.
+
+**Target features:**
+- Predictive local echo — datagram state sync carrying terminal diffs + full Mosh/SSP-style speculative local echo (confirmation tracking, dim/underline "unconfirmed" rendering, prediction epochs, conservative fallback)
+- Daily-driver hardening — fix the latent PTY reader-zombie race; wire a git remote + make the Windows cross-compile CI gate actually run; resolve the `WSAEMSGSIZE` quinn_udp warning
+- Quality-of-life UX — connection-loss notifications (reconnecting notice + abort instructions) + a research-selected set of the highest-value QoL wins
+- Security design pass — thorough threat-model review of the design as built, written up as a security design doc
+
+**Key context:** tmux integration excluded (researching general QoL wins instead); install/packaging UX not scoped (cargo-from-source acceptable — the bar is stability + UX, not distribution); full SSP-style prediction is the brief's hardest UX problem (INIT.md §10), budget accordingly.
 
 ## Core Value
 
@@ -18,7 +30,7 @@ Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+P
 
 **Carried tech debt (weigh at M4 start):** PTY reader-zombie race (Phase 6, latent — `spawn_blocking`+`abort()` can't interrupt a blocked `read()`; worth a `/gsd:debug` pass before relying on reattach under load); Windows cross-compile CI gate exists but has never run (no git remote configured — wire one); `WSAEMSGSIZE` quinn_udp warning on Windows (deferred; connection works).
 
-**Next milestone:** v1.2 (M4) not yet scoped — `/gsd:new-milestone`. The brief's next differentiator is **predictive local echo** (datagram state sync); see INIT.md §10.
+**Next milestone:** v1.2 (M4) — **scoped, defining requirements.** Predictive local echo (full SSP-style, datagram state sync) is the headline; bundled with daily-driver hardening (clears the carried tech debt above), QoL UX (connection-loss notifications + research-selected wins), and a security design pass. See INIT.md §10.
 
 ## Requirements
 
@@ -47,16 +59,18 @@ Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+P
 
 ### Active
 
-<!-- v1.2 (M4) not yet scoped. Run /gsd:new-milestone to define requirements. -->
+<!-- v1.2 (M4) scope — being decomposed into REQUIREMENTS.md / ROADMAP.md. -->
 
-- (to be defined at M4 — likely predictive local echo / datagram state sync per INIT.md §10)
+- Predictive local echo: datagram state sync carrying terminal diffs + full SSP-style speculative local echo (confirmation tracking, unconfirmed rendering, prediction epochs, conservative fallback)
+- Daily-driver hardening: fix PTY reader-zombie race; wire git remote + run Windows cross-compile CI; resolve `WSAEMSGSIZE` warning
+- QoL UX: connection-loss notifications (reconnecting + abort instructions) + research-selected QoL wins
+- Security design pass: threat-model review + security design doc
 
 ### Out of Scope
 
 <!-- Deferred to future milestones (M3–M7) or excluded outright. Each has a reason. -->
 
-- Predictive local echo (datagram state sync) — M4; hardest UX problem, only worth building once the transport+session foundation is proven
-- Native scrollback sync, channel multiplexing, port forwarding, agent forwarding, OSC 52, file transfer — M5
+- Native scrollback sync, channel multiplexing, port forwarding, agent forwarding, file transfer — M5 (note: OSC 52 clipboard and lightweight scrollback are candidates for v1.2's research-selected QoL set; the full M5 versions stay deferred)
 - Native Windows *server* (ConPTY) — M6; v1.1 brings only the Windows *client* (→ Linux server)
 - Windows ssh-agent / Pageant integration — deferred; the v1.1 Windows client signs from an on-disk key file as a bounded, temporary exception
 - 0-RTT cold reattach — still deferred; v1.1 cold reattach is 1-RTT (see Key Decisions)
@@ -112,4 +126,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-30 after v1.1 (M3 Roaming + Windows Client) shipped — roaming + persistence + native Windows client validated end-to-end*
+*Last updated: 2026-06-01 after v1.2 (M4 Predictive Echo + Daily-Driver Readiness) scoped — predictive echo headline, daily-driver hardening, QoL UX, security design pass*
