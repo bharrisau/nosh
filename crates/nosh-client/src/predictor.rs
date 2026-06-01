@@ -347,13 +347,8 @@ impl PredictionOverlay {
                     Validity::IncorrectOrExpired => {
                         if self.is_tentative(pred) {
                             // Tentative mismatch: prune only this epoch's predictions.
-                            let epoch_to_kill = pred.tentative_until_epoch;
-                            // We'll handle this after the loop to avoid borrow issues.
-                            // Mark for special handling.
+                            // Mark for removal; kill_epoch handled after loop.
                             to_remove.push(i);
-                            // Kill all predictions from this epoch.
-                            // After collecting, we'll call kill_epoch.
-                            let _ = epoch_to_kill; // will be handled below
                         } else {
                             // Non-tentative mismatch: full reset (Pitfall 1).
                             self.reset();
@@ -367,7 +362,7 @@ impl PredictionOverlay {
             }
         }
 
-        // Collect epochs to kill for tentative mismatches.
+        // Collect epochs to kill for tentative mismatches before modifying pending.
         let mut epochs_to_kill: Vec<u64> = Vec::new();
         for (i, pred) in self.pending.iter().enumerate() {
             if pred.epoch_required <= new_epoch && to_remove.contains(&i) && self.is_tentative(pred) {
@@ -379,24 +374,26 @@ impl PredictionOverlay {
             }
         }
 
-        // Remove confirmed/credited predictions in reverse order.
-        // For tentative mismatches, also kill their epochs.
+        // Kill tentative-mismatch epochs (prunes related predictions).
         for epoch in epochs_to_kill {
             self.kill_epoch(epoch);
         }
 
-        // Remove in reverse index order to preserve indices.
+        // Remove confirmed/credited predictions in reverse index order.
         to_remove.sort_unstable();
         to_remove.dedup();
         for &i in to_remove.iter().rev() {
-            self.pending.remove(i);
+            // Guard: index may have shifted after kill_epoch removed some entries.
+            if i < self.pending.len() {
+                self.pending.remove(i);
+            }
         }
     }
 
     // ── Display gate ──────────────────────────────────────────────────────────
 
     /// Whether predictions should be displayed given current display mode and RTT.
-    fn should_display(&self) -> bool {
+    pub fn should_display(&self) -> bool {
         match self.display_mode {
             PredictDisplayMode::Always => true,
             PredictDisplayMode::Never => false,
@@ -408,7 +405,7 @@ impl PredictionOverlay {
     ///
     /// Translated from Mosh `terminaloverlay.h:68`:
     /// `bool tentative(uint64_t confirmed_epoch) const { return tentative_until_epoch > confirmed_epoch; }`
-    fn is_tentative(&self, pred: &PendingPrediction) -> bool {
+    pub fn is_tentative(&self, pred: &PendingPrediction) -> bool {
         pred.tentative_until_epoch > self.confirmed_epoch
     }
 
@@ -421,7 +418,7 @@ impl PredictionOverlay {
     /// confirms one prediction from the new epoch.
     ///
     /// Translated from Mosh `terminaloverlay.cc PredictionEngine::become_tentative()`.
-    fn become_tentative(&mut self) {
+    pub fn become_tentative(&mut self) {
         self.prediction_epoch += 1;
     }
 
@@ -437,7 +434,7 @@ impl PredictionOverlay {
     ///
     /// Used for tentative-mismatch cleanup (pruning a specific epoch's predictions).
     /// Translated from Mosh `PredictionEngine::kill_epoch()`.
-    fn kill_epoch(&mut self, epoch: u64) {
+    pub fn kill_epoch(&mut self, epoch: u64) {
         self.pending.retain(|p| p.tentative_until_epoch != epoch);
     }
 
@@ -451,7 +448,7 @@ impl PredictionOverlay {
     /// - `flagging`: activates above HIGH, deactivates below LOW (no prediction guard).
     ///
     /// Translated from Mosh `terminaloverlay.cc cull()` hysteresis block.
-    fn update_rtt_thresholds(&mut self, rtt_ms: u64) {
+    pub fn update_rtt_thresholds(&mut self, rtt_ms: u64) {
         if rtt_ms > SRTT_TRIGGER_HIGH_MS {
             self.srtt_trigger = true;
         } else if self.srtt_trigger && rtt_ms <= SRTT_TRIGGER_LOW_MS && self.pending.is_empty() {
@@ -913,12 +910,8 @@ mod tests {
 
     #[test]
     fn classify_ambiguous_width_epoch_reset() {
-        // U+00B7 MIDDLE DOT — ambiguous width (Some(1) in non-CJK but checking
-        // for width_cjk=2 chars). Use U+2550 BOX DRAWINGS DOUBLE HORIZONTAL
-        // which has ambiguous width in some contexts — falls to EpochReset
-        // because width() returns Some(1) which IS predicted. Let's use a char
-        // that width() returns Some(0) or None instead.
-        // U+FE0F VARIATION SELECTOR-16 (emoji variant) — width Some(0) → reset.
+        // U+FE0F VARIATION SELECTOR-16 (emoji variant) — width Some(0) → epoch reset.
+        // This represents "ambiguous" sequence-modifying characters that must not be predicted.
         let vs16 = '\u{FE0F}';
         let mut buf = [0u8; 4];
         let s = vs16.encode_utf8(&mut buf);
@@ -926,15 +919,14 @@ mod tests {
         assert_eq!(
             action,
             InputAction::EpochReset,
-            "variation selector (width Some(0)) must yield EpochReset"
+            "variation selector / emoji modifier (width Some(0)) must yield EpochReset"
         );
     }
 
     #[test]
     fn classify_no_width_cjk_used() {
         // Verify our classify_printable uses width() not width_cjk() by checking
-        // a char that differs between the two: U+00B7 MIDDLE DOT.
-        // width() → Some(1) (narrow), width_cjk() → Some(1) also, so this is fine.
+        // that CJK chars are handled correctly with the non-CJK-context width function.
         // The important policy: we never call width_cjk.
         // This test documents that classify_printable predicts U+4E2D (中, CJK) correctly.
         let zhong = '中';
@@ -1013,16 +1005,8 @@ mod tests {
     fn fresh_prediction_is_tentative_and_cell_at_returns_none() {
         // PREDICT-03: first char of a new epoch is tentative → cell_at returns None.
         let screen = make_screen(80, 24);
-        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
-        overlay.on_input(b"a", &screen);
-        // confirmed_epoch = 0, prediction_epoch = 0.
-        // tentative_until_epoch = 0, which is NOT > confirmed_epoch (0).
-        // So actually NOT tentative yet — let's trigger tentative by doing become_tentative first.
-        // Per the model: on_input enqueues with tentative_until_epoch = current prediction_epoch.
-        // If prediction_epoch == confirmed_epoch, the prediction IS visible.
-        // For "fresh row" suppression (PREDICT-03): become_tentative first, then type.
+        // Simulate become_tentative to put us in a new epoch before typing.
         let mut overlay2 = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
-        // Simulate become_tentative to put us in a new epoch.
         overlay2.become_tentative(); // prediction_epoch = 1
         overlay2.on_input(b"a", &screen);
         // prediction's tentative_until_epoch = 1 > confirmed_epoch (0) → tentative.
@@ -1131,10 +1115,9 @@ mod tests {
         let pred = &overlay.pending[0];
         assert_eq!(pred.epoch_required, 1, "epoch_required must be 1");
 
-        // Datagram epoch 1 is dropped. Epoch 3 arrives confirming 'a'.
-        let diff1 = make_diff_with_char(1, 0, 0, 'a'); // applied to screen
+        // Datagram epoch 1 is dropped. Apply epoch 1 and 3 to screen but only cull with 3.
+        let diff1 = make_diff_with_char(1, 0, 0, 'a');
         screen.apply(&diff1);
-        // But we won't call cull with epoch 1 (simulating loss). Instead jump to 3.
         let diff3 = make_diff_with_char(3, 0, 0, 'a');
         screen.apply(&diff3);
         overlay.cull(&screen, 3, 50); // epoch 3 >= epoch_required 1 → confirmed
@@ -1166,12 +1149,11 @@ mod tests {
         // Cell at (0,0) remains ' ' (space) — NOT 'a'.
         let diff = make_diff_empty(1);
         screen.apply(&diff);
-        // cull: epoch_required (1) <= new_epoch (1); confirmed_cell is ' ' ≠ 'a'
+        // cull: epoch_required (1) <= new_epoch (1); confirmed_cell is ' ' != 'a'
         // → IncorrectOrExpired on tentative prediction → kill_epoch(1) → pending cleared.
         overlay.cull(&screen, 1, 5);
 
-        // After cull, new predictions would still be tentative.
-        // Type another 'a' — this time in a new epoch from reset.
+        // After cull, type another char in new prediction state.
         overlay.on_input(b"b", &screen);
 
         // Server still doesn't echo.
@@ -1322,13 +1304,10 @@ mod tests {
 
     #[test]
     fn cell_at_returns_underline_when_flagging() {
-        let mut screen = make_screen(80, 24);
+        let screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
         overlay.on_input(b"a", &screen);
 
-        // Force flagging true and RTT-confirm.
-        let diff = make_diff_with_char(1, 0, 0, 'a');
-        screen.apply(&diff);
         // Manually set flagging.
         overlay.flagging = true;
         // The prediction's tentative_until_epoch = 0 = confirmed_epoch (0), not tentative.

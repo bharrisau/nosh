@@ -30,11 +30,11 @@ The loss-tolerant server→client display path that predictive echo is built on.
 The headline differentiator — full Mosh/SSP-style speculative echo. Conservative-by-design: it must never render worse than no prediction.
 
 - [x] **PREDICT-01**: The client renders the confirmed terminal screen from received state-sync datagrams (display routed through a single screen-composition path, never direct `stdout` writes once the predictor exists), matching raw PTY output
-- [ ] **PREDICT-02**: The client speculatively echoes locally-typed input — printable characters, backspace, and left/right cursor motion — ahead of server confirmation, with per-prediction confirmation tracking against the confirmed screen
-- [ ] **PREDICT-03**: Prediction is conservative by design — any cursor-addressing / control sequence (CSI cursor move, erase, alternate-screen) or non-printing control key resets the prediction epoch; no prediction is displayed on a fresh row or before the server confirms the first character of an epoch (validated adversarially: a `vim` insert produces zero corrupt cells)
-- [ ] **PREDICT-04**: Prediction is suppressed during non-echoing input (`stty -echo` / `read -s` password prompts) — the engine tracks the server's confirmed echo state and never speculatively renders an unechoed character (validated with a `read -s` test; this is a security requirement of the feature)
+- [x] **PREDICT-02**: The client speculatively echoes locally-typed input — printable characters, backspace, and left/right cursor motion — ahead of server confirmation, with per-prediction confirmation tracking against the confirmed screen
+- [x] **PREDICT-03**: Prediction is conservative by design — any cursor-addressing / control sequence (CSI cursor move, erase, alternate-screen) or non-printing control key resets the prediction epoch; no prediction is displayed on a fresh row or before the server confirms the first character of an epoch (validated adversarially: a `vim` insert produces zero corrupt cells)
+- [x] **PREDICT-04**: Prediction is suppressed during non-echoing input (`stty -echo` / `read -s` password prompts) — the engine tracks the server's confirmed echo state and never speculatively renders an unechoed character (validated with a `read -s` test; this is a security requirement of the feature)
 - [ ] **PREDICT-05**: Unconfirmed predictions are visually distinguished (underline) only above an RTT threshold; an adaptive default engages prediction on high-latency links and stays invisible on fast ones, with a `--predict always|adaptive|never` override
-- [ ] **PREDICT-06**: Predicted echo advances the cursor correctly for wide / multi-column characters (CJK), with an explicit conservative policy (epoch reset) for ambiguous-width and ZWJ/emoji input
+- [x] **PREDICT-06**: Predicted echo advances the cursor correctly for wide / multi-column characters (CJK), with an explicit conservative policy (epoch reset) for ambiguous-width and ZWJ/emoji input
 - [ ] **PREDICT-07**: Predictive echo works on the native Windows client (engine shared with Linux, raw VT rendering), confirmed by a live Windows-host validation run (auth + predicted echo + roaming over a real network change), signed off like the v1.1 Windows test
 
 ### Quality of Life
@@ -95,11 +95,11 @@ Explicitly excluded for v1.2. Documented to prevent scope creep.
 | SYNC-02 | Phase 12 | Complete |
 | SYNC-03 | Phase 13 | Complete |
 | PREDICT-01 | Phase 14 | Complete |
-| PREDICT-02 | Phase 15 | Pending |
-| PREDICT-03 | Phase 15 | Pending |
-| PREDICT-04 | Phase 15 | Pending |
+| PREDICT-02 | Phase 15 | Complete |
+| PREDICT-03 | Phase 15 | Complete |
+| PREDICT-04 | Phase 15 | Complete |
 | PREDICT-05 | Phase 15 | Pending |
-| PREDICT-06 | Phase 15 | Pending |
+| PREDICT-06 | Phase 15 | Complete |
 | PREDICT-07 | Phase 17 | Pending |
 | QOL-01 | Phase 16 | Pending |
 | QOL-02 | Phase 16 | Pending |
