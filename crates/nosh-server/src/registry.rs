@@ -476,6 +476,31 @@ impl SessionSlot {
         result
     }
 
+    /// Read-only access to the terminal state via a closure.
+    ///
+    /// Locks `terminal_state`, passes a shared reference to `f`, and returns
+    /// `f`'s return value. The lock is held only for the duration of `f`.
+    ///
+    /// # Invariant
+    ///
+    /// The caller MUST NOT perform any `.await` inside `f` (Anti-Pattern #2:
+    /// never hold the `terminal_state` lock across an await point). Snapshot
+    /// the needed cells/cursor/size into owned values and return them. This is
+    /// the only permitted read path into the terminal grid — the `terminal_state`
+    /// field is private; this delegate is the single access point.
+    ///
+    /// Uses the established poison-recovery pattern (`unwrap_or_else(|e| e.into_inner())`):
+    /// if a prior panic corrupted the Mutex, the guard is recovered and the closure
+    /// is invoked on the (possibly partially corrupted) state — the same recovery
+    /// rationale as `push_output_and_parse` (WR-01).
+    pub fn with_terminal_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&TerminalState) -> R,
+    {
+        let ts = self.terminal_state.lock().unwrap_or_else(|e| e.into_inner());
+        f(&ts)
+    }
+
     /// Non-blocking check whether the shell child has exited. Returns the
     /// exit code if it has, `None` if it is still running.
     ///
@@ -1782,6 +1807,52 @@ mod tests {
         let cell_h = ts.cell(0, 0);
         assert_eq!(cell_h.ch, 'h', "terminal must have advanced: cell(0,0)='h'");
         drop(ts);
+
+        slot.sighup();
+    }
+
+    // ── Phase 13 Task 2: with_terminal_state delegate ────────────────────────
+
+    /// Verifies that `with_terminal_state` passes a live `&TerminalState` to the
+    /// closure, the closure can snapshot owned values (size + cursor) without any
+    /// lock remaining held after the call, and the returned data is consistent with
+    /// the text pushed via `push_output_and_parse`.
+    ///
+    /// Requires /bin/sh for the PTY (guarded). The test does NOT await inside the
+    /// closure — it returns owned `(u16, u16, CursorPos)` values immediately.
+    #[test]
+    fn with_terminal_state_returns_snapshot_from_closure() {
+        if !have_sh() {
+            eprintln!("skipping with_terminal_state_returns_snapshot_from_closure: /bin/sh unavailable");
+            return;
+        }
+
+        use nosh_proto::CursorPos;
+
+        let sess = open_sh_session(test_key(0xF0));
+        let slot = SessionSlot::new(sess);
+
+        // Feed a short string so the terminal advances past column 0.
+        slot.push_output_and_parse(b"hi");
+
+        // Use with_terminal_state to snapshot size + cursor (no .await inside).
+        let (cols, rows, cursor) = slot.with_terminal_state(|ts| {
+            let (cols, rows) = ts.size();
+            let cursor: CursorPos = ts.cursor();
+            (cols, rows, cursor)
+        });
+
+        // Default size must be 80x24 (SessionSlot::new initialises to 80×24).
+        assert_eq!(cols, 80, "default cols must be 80");
+        assert_eq!(rows, 24, "default rows must be 24");
+
+        // After pushing "hi" (2 chars), the cursor column must be > 0.
+        // (Exact position depends on echo/line-discipline state; we only need > 0.)
+        assert!(
+            cursor.col > 0,
+            "cursor column must be > 0 after pushing 'hi', got col={}",
+            cursor.col
+        );
 
         slot.sighup();
     }
