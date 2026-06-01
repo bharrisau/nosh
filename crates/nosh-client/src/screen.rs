@@ -29,6 +29,15 @@ use crossterm::cursor::MoveTo;
 use crossterm::QueueableCommand;
 use nosh_proto::datagram::{CellStyle, CursorPos, StateDiff};
 
+/// Maximum allowed terminal width — any larger value in a `StateDiff` is
+/// rejected before `resize()` is called. Keeps the two-grid allocation at
+/// `≤ 512 × 256 × 12 × 2 ≈ 3 MB` and closes the T-14-02 OOM-crash vector
+/// (a compromised server sending `cols=65535, rows=65535` would otherwise
+/// attempt a ~103 GB allocation).
+const MAX_TERMINAL_COLS: u16 = 512;
+/// Maximum allowed terminal height (see `MAX_TERMINAL_COLS`).
+const MAX_TERMINAL_ROWS: u16 = 256;
+
 // ── Cell ──────────────────────────────────────────────────────────────────────
 
 /// A single terminal cell in the client's framebuffer.
@@ -155,6 +164,25 @@ impl ClientScreen {
     pub fn apply(&mut self, diff: &StateDiff) {
         // D-14-05: monotonic staleness check — discard stale or duplicate diffs.
         if diff.epoch <= self.last_applied_epoch {
+            return;
+        }
+
+        // T-14-02: reject implausible terminal dimensions BEFORE resize() allocates
+        // two grids proportional to cols × rows. A compromised server sending
+        // cols=65535, rows=65535 would otherwise attempt a ~103 GB allocation.
+        // Zero dimensions are also rejected (make_grid with rows=0 or cols=0
+        // produces a degenerate grid that could cause subtle render issues).
+        if diff.cols == 0
+            || diff.rows == 0
+            || diff.cols > MAX_TERMINAL_COLS
+            || diff.rows > MAX_TERMINAL_ROWS
+        {
+            tracing::warn!(
+                epoch = diff.epoch,
+                cols = diff.cols,
+                rows = diff.rows,
+                "StateDiff dimensions out of range — discarding (T-14-02)"
+            );
             return;
         }
 
@@ -590,6 +618,96 @@ mod tests {
         assert_eq!(screen.confirmed_cell(0, 200).ch, ' ');
         // Both out of bounds.
         assert_eq!(screen.confirmed_cell(999, 999).ch, ' ');
+    }
+
+    // ── CR-01: dimension bounds guard (T-14-02 OOM guard) ────────────────────
+
+    #[test]
+    fn apply_oversized_cols_is_rejected_grid_unchanged() {
+        let mut screen = ClientScreen::new(80, 24);
+        // Apply a legitimate diff first to set confirmed state.
+        screen.apply(&make_diff(1, "hello"));
+        let epoch_before = screen.last_applied_epoch();
+        let size_before = screen.size();
+
+        // An oversized diff (cols exceeds MAX_TERMINAL_COLS).
+        let oversized = StateDiff {
+            epoch: 2,
+            cols: MAX_TERMINAL_COLS + 1,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![],
+        };
+        // Must not panic; must be silently discarded.
+        screen.apply(&oversized);
+
+        // Grid and epoch must be unchanged (diff was discarded).
+        assert_eq!(screen.last_applied_epoch(), epoch_before, "epoch must not advance");
+        assert_eq!(screen.size(), size_before, "dimensions must not change");
+        assert_eq!(screen.confirmed_cell(0, 0).ch, 'h', "confirmed cell must be unchanged");
+    }
+
+    #[test]
+    fn apply_oversized_rows_is_rejected_grid_unchanged() {
+        let mut screen = ClientScreen::new(80, 24);
+        screen.apply(&make_diff(1, "world"));
+        let epoch_before = screen.last_applied_epoch();
+
+        let oversized = StateDiff {
+            epoch: 2,
+            cols: 80,
+            rows: MAX_TERMINAL_ROWS + 1,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![],
+        };
+        screen.apply(&oversized);
+
+        assert_eq!(screen.last_applied_epoch(), epoch_before, "epoch must not advance");
+        assert_eq!(screen.size(), (80, 24), "dimensions must not change");
+    }
+
+    #[test]
+    fn apply_zero_cols_is_rejected_no_panic() {
+        let mut screen = ClientScreen::new(80, 24);
+        let zero_cols = StateDiff {
+            epoch: 1,
+            cols: 0,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![],
+        };
+        screen.apply(&zero_cols);
+        assert_eq!(screen.last_applied_epoch(), 0, "epoch must not advance on zero cols");
+    }
+
+    #[test]
+    fn apply_zero_rows_is_rejected_no_panic() {
+        let mut screen = ClientScreen::new(80, 24);
+        let zero_rows = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 0,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![],
+        };
+        screen.apply(&zero_rows);
+        assert_eq!(screen.last_applied_epoch(), 0, "epoch must not advance on zero rows");
+    }
+
+    #[test]
+    fn apply_max_allowed_dimensions_is_accepted() {
+        // Exactly at the cap: must succeed without panic.
+        let mut screen = ClientScreen::new(80, 24);
+        let at_cap = StateDiff {
+            epoch: 1,
+            cols: MAX_TERMINAL_COLS,
+            rows: MAX_TERMINAL_ROWS,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![],
+        };
+        screen.apply(&at_cap);
+        assert_eq!(screen.last_applied_epoch(), 1, "diff at cap must be accepted");
+        assert_eq!(screen.size(), (MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS));
     }
 
     #[test]
