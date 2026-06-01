@@ -729,15 +729,23 @@ impl TerminalState {
                 100..=107 => self.sgr.bg = Some((code - 100 + 8) as u8),
                 // 256-color / 24-bit foreground: `38 ; 5 ; n` (Pitfall 6)
                 38 => {
-                    // Grab the next param — should be `5` (256-color) or `2` (24-bit, not in scope)
+                    // Grab the next param — should be `5` (256-color) or `2` (24-bit)
                     if let Some(next) = iter.next() {
                         if next[0] == 5 {
                             // 256-color: grab the color index
                             if let Some(color_param) = iter.next() {
                                 self.sgr.fg = Some(color_param[0] as u8);
                             }
+                        } else if next[0] == 2 {
+                            // 24-bit / truecolor (r;g;b): scope-fenced — not applied,
+                            // but MUST drain the three r/g/b params so they are not
+                            // misinterpreted as independent SGR codes (e.g., r=0 would
+                            // trigger SGR 0 / reset if not consumed).
+                            let _ = iter.next(); // r
+                            let _ = iter.next(); // g
+                            let _ = iter.next(); // b
                         }
-                        // SGR 38;2;r;g;b (24-bit) is scope-fenced — consume but ignore
+                        // Other subtypes are scope-fenced; no drain needed.
                     }
                 }
                 // 256-color / 24-bit background: `48 ; 5 ; n` (Pitfall 6)
@@ -747,6 +755,11 @@ impl TerminalState {
                             if let Some(color_param) = iter.next() {
                                 self.sgr.bg = Some(color_param[0] as u8);
                             }
+                        } else if next[0] == 2 {
+                            // 24-bit background: drain r;g;b to prevent misinterpretation.
+                            let _ = iter.next(); // r
+                            let _ = iter.next(); // g
+                            let _ = iter.next(); // b
                         }
                     }
                 }
@@ -1213,5 +1226,42 @@ mod tests {
     fn scrollback_line_cap_constant_is_present_and_correct() {
         // Just verifies the constant is accessible and has the expected value.
         assert_eq!(SCROLLBACK_LINE_CAP, 10_000);
+    }
+
+    // ── Truecolor SGR drain (code-review fix IN-02) ───────────────────────────
+
+    #[test]
+    fn sgr_truecolor_38_2_rgb_does_not_misinterpret_rgb_as_sgr_codes() {
+        // SGR 38;2;0;0;0 (truecolor black fg) must NOT trigger SGR 0 (reset) for
+        // each of the r/g/b components. Without the drain fix, r=0 would fire
+        // SGR 0 (reset all), then g=0 (reset again), then b=0 (reset again).
+        // After the fix, the r/g/b params are drained and the preceding attributes
+        // (e.g. BOLD) survive.
+        let mut state = ts(80, 24);
+        // Set BOLD, then emit truecolor fg — BOLD must survive the truecolor sequence.
+        state.advance(b"\x1b[1m"); // SGR 1: BOLD
+        state.advance(b"\x1b[38;2;0;0;0m"); // SGR 38;2;0;0;0 (truecolor black fg)
+        state.advance(b"A");
+        let cell = state.cell(0, 0);
+        assert_eq!(
+            cell.style.0 & CellStyle::BOLD,
+            CellStyle::BOLD,
+            "BOLD must survive after SGR 38;2;0;0;0 (truecolor fg drain must not fire SGR 0)"
+        );
+    }
+
+    #[test]
+    fn sgr_truecolor_48_2_rgb_does_not_misinterpret_rgb_as_sgr_codes() {
+        // Same test for bg truecolor: SGR 48;2;0;0;0 must not fire SGR 0 via r/g/b.
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b[1m"); // BOLD
+        state.advance(b"\x1b[48;2;0;0;0m"); // truecolor bg
+        state.advance(b"B");
+        let cell = state.cell(0, 0);
+        assert_eq!(
+            cell.style.0 & CellStyle::BOLD,
+            CellStyle::BOLD,
+            "BOLD must survive after SGR 48;2;0;0;0 (truecolor bg drain must not fire SGR 0)"
+        );
     }
 }
