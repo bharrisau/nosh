@@ -330,7 +330,10 @@ pub fn encode_datagram(
     let body = postcard::to_allocvec(&final_diff).map_err(ProtoError::Postcard)?;
 
     // Strict invariant: body must be < body_cap so payload < cap.
-    debug_assert!(
+    // Hard assert (not debug_assert) — after CR-01 guarantees cap >= MIN_CAP,
+    // this can only fire due to an implementation bug in the fill loop, not a
+    // caller error. A hard assert makes such bugs visible in release builds too.
+    assert!(
         body.len() < body_cap,
         "encode_datagram fill-loop invariant violated: body {} >= body_cap {}",
         body.len(),
