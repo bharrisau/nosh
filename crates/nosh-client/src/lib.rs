@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod platform;
+pub mod predictor; // NEW: PredictionOverlay, PendingPrediction, Validity, InputAction
 pub mod screen; // NEW: ClientScreen, Overlay, ConnectionLossOverlay
 
 pub use client::{
