@@ -96,7 +96,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   4. `run_reattach_session` also has the datagram sender arm with the same `ResumeComplete` gate
 **Plans**: 3 plans
 - [x] 13-01-PLAN.md — Foundation (Wave 1): nosh-proto epoch-ack wire format (TAG_CLIENT_EPOCH/ClientEpoch/encode/decode) + SessionSlot with_terminal_state delegate
-- [ ] 13-02-PLAN.md — Server sender (Wave 2): diff_interval + epoch-ack select! arms in run_session and run_reattach_session; acked-epoch diff; ResumeComplete gate; additive PtyData
+- [x] 13-02-PLAN.md — Server sender (Wave 2): diff_interval + epoch-ack select! arms in run_session and run_reattach_session; acked-epoch diff; ResumeComplete gate; additive PtyData
 - [ ] 13-03-PLAN.md — Integration test (Wave 3): tests/sync.rs — datagram arrival, full acked-epoch loop, ResumeComplete-gated resume flow
 
 ### Phase 14: Client Predictor — Confirmed Rendering
@@ -173,7 +173,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 10. PTY Reader Race Fix | 2/2 | Complete    | 2026-06-01 |
 | 11. Datagram Wire Protocol | 1/1 | Complete    | 2026-06-01 |
 | 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
-| 13. Server Datagram Sender | 1/3 | In Progress|  |
+| 13. Server Datagram Sender | 2/3 | In Progress|  |
 | 14. Client Predictor — Confirmed Rendering | 0/? | Not started | - |
 | 15. Client Predictor — Speculative Overlay | 0/? | Not started | - |
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | Not started | - |
