@@ -106,8 +106,13 @@ pub fn start_interruptible_reader(
     // Create the self-pipe: read_fd goes to the blocking thread, write_fd stays
     // in the handle. Both are `OwnedFd` — single owner each side, drop-closes
     // automatically, no manual `libc::close` (T-10-01 / Pitfall 4).
+    // O_CLOEXEC is set atomically at pipe creation so any future exec() in the
+    // server process cannot inherit these fds (WR-02). Without CLOEXEC an
+    // inherited write-end would prevent POLLHUP from firing (the kernel sees the
+    // fd as still open) and a leaked read-end could steal the shutdown byte.
     let (read_fd, write_fd): (OwnedFd, OwnedFd) =
-        nix::unistd::pipe().context("create shutdown self-pipe")?;
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .context("create shutdown self-pipe")?;
 
     let pipe_raw = read_fd.as_raw_fd();
 
