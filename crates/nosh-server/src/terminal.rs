@@ -1339,4 +1339,92 @@ mod tests {
             "BOLD must survive after SGR 48;2;0;0;0 (truecolor bg drain must not fire SGR 0)"
         );
     }
+
+    // ── CR-03 regression: bounded OSC buffer via vte default-features=false ──
+
+    /// CR-03 regression: feeding a large OSC sequence must not panic or OOM.
+    ///
+    /// With vte's "std" feature enabled (the previous configuration), `action_osc_put`
+    /// has no `is_full()` guard and accumulates OSC bytes in an unbounded `Vec<u8>`.
+    /// A single huge OSC sequence exhausts memory before `osc_dispatch` is called.
+    ///
+    /// With `default-features = false`, vte uses `ArrayVec<u8, 1024>` and silently
+    /// drops bytes beyond 1024. This test verifies:
+    /// 1. Feeding a multi-MB OSC sequence does not panic or OOM.
+    /// 2. The title is either not set (truncated/dropped) or correctly bounded.
+    /// 3. Normal-sized OSC sequences still work after a large one.
+    #[test]
+    fn adversarial_large_osc_title_is_bounded_no_panic() {
+        let mut state = ts(80, 24);
+
+        // Build a large OSC 2 title sequence: "\x1b]2;" + 10 MB of 'A' + "\x07"
+        // With std: vte would accumulate 10 MB in osc_raw → OOM.
+        // With no_std (default-features=false): vte caps at 1024 bytes, truncates silently.
+        let large_payload = vec![b'A'; 64 * 1024]; // 64 KiB is enough to test truncation
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"\x1b]2;");
+        seq.extend_from_slice(&large_payload);
+        seq.extend_from_slice(b"\x07"); // BEL terminator
+
+        // Must not panic or OOM.
+        state.advance(&seq);
+
+        // The title must either be None (if truncation caused malformed UTF-8 or
+        // the sequence was rejected) or a string bounded by vte's 1024-byte OSC cap.
+        // It must NOT hold the full 64 KiB payload.
+        if let Some(title) = state.title() {
+            assert!(
+                title.len() <= 1024,
+                "title must be bounded by vte's 1024-byte OSC cap, got {} bytes",
+                title.len()
+            );
+        }
+        // No assertion on whether title is Some or None — vte may truncate the
+        // OSC params or reject the sequence; either is correct.
+
+        // Normal-sized OSC sequences must still work after the large one.
+        state.advance(b"\x1b]2;Normal Title\x07");
+        assert_eq!(
+            state.title(),
+            Some("Normal Title"),
+            "normal OSC title must work after a large truncated one"
+        );
+    }
+
+    /// CR-03 regression: feeding a large OSC 52 sequence must not OOM.
+    ///
+    /// Without the fix, a large base64 clipboard payload would accumulate in
+    /// vte's unbounded osc_raw buffer. With the fix (no_std), vte caps at 1024
+    /// bytes, and osc52_pending either holds a truncated/empty payload or is None.
+    #[test]
+    fn adversarial_large_osc52_is_bounded_no_panic() {
+        let mut state = ts(80, 24);
+
+        // Build a large OSC 52 sequence: "\x1b]52;c;" + 64 KiB of base64 data + "\x07"
+        let large_b64 = vec![b'A'; 64 * 1024]; // simulated base64 payload
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"\x1b]52;c;");
+        seq.extend_from_slice(&large_b64);
+        seq.extend_from_slice(b"\x07");
+
+        // Must not panic or OOM.
+        state.advance(&seq);
+
+        // osc52_pending must either be None or hold a bounded (≤ vte 1024-byte cap) payload.
+        if let Some((sel, data)) = state.osc52_pending() {
+            assert!(
+                data.len() <= 1024,
+                "osc52_pending data must be bounded by vte's OSC cap, got {} bytes",
+                data.len()
+            );
+            let _ = sel; // selection bytes are small
+        }
+
+        // Normal OSC 52 must still work.
+        state.advance(b"\x1b]52;c;SGVsbG8=\x07"); // "Hello" in base64
+        let pending = state.osc52_pending();
+        assert!(pending.is_some(), "normal OSC 52 must still be detected after large one");
+        let (_, data) = pending.unwrap();
+        assert_eq!(data, b"SGVsbG8=");
+    }
 }

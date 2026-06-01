@@ -29,4 +29,24 @@ dirs = "5"
 portable-pty = "0.9"
 uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.29", default-features = false, features = ["signal", "user", "poll", "fs"] }
-vte = "0.15"
+# CR-03: Disable vte's "std" feature to restore the bounded ArrayVec<u8, 1024> OSC
+# buffer instead of the default unbounded Vec<u8>. With "std" enabled, vte's
+# action_osc_put() has no is_full() guard, so a single huge OSC sequence (e.g.
+# OSC 52 with a multi-MB clipboard payload) accumulates unbounded memory before
+# osc_dispatch() is called — a server-side OOM DoS vector.
+#
+# With default-features = false, vte uses ArrayVec<u8, 1024> and silently drops
+# bytes beyond 1024. The Perform trait, Parser struct, and all other public APIs
+# are still available; only the OSC accumulation buffer changes.
+#
+# PHASE 16 CONSIDERATION: The 1024-byte OSC cap limits OSC 52 clipboard payload
+# size. Phase 16 plans to forward OSC 52 "no MTU limit". A large clipboard write
+# that exceeds 1024 bytes (including OSC framing) will be silently truncated by
+# vte before osc_dispatch() is called, so osc52_pending will hold a truncated or
+# missing payload. Phase 16 must handle this by either:
+#   (a) switching to a custom OSC accumulation path with a larger but bounded cap
+#       (e.g. 64 KiB, applied in osc_dispatch before storing), or
+#   (b) re-enabling "std" and applying a size cap in osc_dispatch (the fallback
+#       approach in CR-03) — which leaves vte's transient buffer as a residual risk.
+# See CR-03 fix notes in 12-REVIEW-FIX.md.
+vte = { version = "0.15", default-features = false }
