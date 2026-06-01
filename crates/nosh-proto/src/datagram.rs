@@ -275,9 +275,14 @@ pub fn encode_datagram(
                     };
                     // Deferred run's start_col advances by the number of
                     // Unicode scalar values (chars) in the prefix (Pitfall 5).
+                    // Use saturating_add to prevent u16 overflow: a run whose
+                    // start_col + prefix_chars would exceed u16::MAX (65535) is
+                    // a degenerate terminal state; saturating at u16::MAX is the
+                    // least-surprising fallback (the right portion is already
+                    // deferred, so the column position is at worst clamped).
                     let right_run = DiffRun {
                         row: run.row,
-                        start_col: run.start_col + prefix_chars as u16,
+                        start_col: run.start_col.saturating_add(prefix_chars as u16),
                         style: run.style,
                         fg: run.fg,
                         bg: run.bg,
