@@ -167,7 +167,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 8. Windows Client | — | Shipped | 2026-05-30 |
 | 9. Windows Client Polish & Hardening | — | Shipped | 2026-05-30 |
 | 10. PTY Reader Race Fix | 2/2 | Complete    | 2026-06-01 |
-| 11. Datagram Wire Protocol | 1/1 | Complete   | 2026-06-01 |
+| 11. Datagram Wire Protocol | 1/1 | Complete    | 2026-06-01 |
 | 12. Server Terminal State Model | 0/? | Not started | - |
 | 13. Server Datagram Sender | 0/? | Not started | - |
 | 14. Client Predictor — Confirmed Rendering | 0/? | Not started | - |

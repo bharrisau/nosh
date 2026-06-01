@@ -21,7 +21,7 @@ Clear the carried tech debt so nosh is dependable enough to daily-drive. The PTY
 
 The loss-tolerant server→client display path that predictive echo is built on. Runs *parallel* to the existing reliable-stream `PtyData` path — the `SequencedOutputBuffer` and cold-reattach replay are preserved unchanged.
 
-- [ ] **SYNC-01**: A sparse, size-bounded terminal-diff datagram wire format exists in `nosh-proto` (changed cells only, monotonic `epoch`, dimensions + cursor; payload capped below `max_datagram_size()`), with round-trip and size-cap unit tests; postcard/serde, no new serialization crate
+- [x] **SYNC-01**: A sparse, size-bounded terminal-diff datagram wire format exists in `nosh-proto` (changed cells only, monotonic `epoch`, dimensions + cursor; payload capped below `max_datagram_size()`), with round-trip and size-cap unit tests; postcard/serde, no new serialization crate
 - [ ] **SYNC-02**: The server maintains an authoritative terminal-state model (grid + cursor + echo state) fed from the same PTY-output call site as the `SequencedOutputBuffer`, unit-tested against known VT sequences
 - [ ] **SYNC-03**: The server emits coalesced state diffs over QUIC datagrams (one diff per ~16 ms tick, not per chunk) from the session pump; fresh datagrams are gated by a `ResumeComplete` signal so they never apply to a partial cold-reattach replay
 
@@ -91,7 +91,7 @@ Explicitly excluded for v1.2. Documented to prevent scope creep.
 | HARDEN-01 | Phase 10 | Complete |
 | HARDEN-02 | Phase 16 | Pending |
 | HARDEN-03 | Phase 16 | Pending |
-| SYNC-01 | Phase 11 | Pending |
+| SYNC-01 | Phase 11 | Complete |
 | SYNC-02 | Phase 12 | Pending |
 | SYNC-03 | Phase 13 | Pending |
 | PREDICT-01 | Phase 14 | Pending |
