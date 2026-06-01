@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
-status: planning
+status: executing
 stopped_at: Phase 10 planned (2 plans, plan-checker passed)
-last_updated: "2026-06-01T08:22:29.989Z"
-last_activity: 2026-06-01 — v1.2 roadmap created (Phases 10-18)
+last_updated: "2026-06-01T08:23:47.904Z"
+last_activity: 2026-06-01 -- Phase 10 execution started
 progress:
   total_phases: 9
   completed_phases: 0
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-01)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** v1.2 (M4 Predictive Echo + Daily-Driver Readiness) — roadmap defined, Phases 10-18. Start with `/gsd:plan-phase 10`.
+**Current focus:** Phase 10 — pty-reader-race-fix
 
 ## Current Position
 
-Phase: Not started (roadmap defined)
-Plan: —
-Status: Ready to plan Phase 10
-Last activity: 2026-06-01 — v1.2 roadmap created (Phases 10-18)
+Phase: 10 (pty-reader-race-fix) — EXECUTING
+Plan: 1 of 2
+Status: Executing Phase 10
+Last activity: 2026-06-01 -- Phase 10 execution started
 
 ```
 Progress: [░░░░░░░░░░░░░░░░░░░░] 0/9 phases (0%)

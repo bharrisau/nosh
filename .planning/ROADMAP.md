@@ -35,7 +35,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 
 ### v1.2 M4 Predictive Echo + Daily-Driver Readiness (Phases 10-18)
 
-- [ ] **Phase 10: PTY Reader Race Fix** — Replace spawn_blocking PTY read loop with nix::poll self-pipe; bounded blocking-thread count
+- [x] **Phase 10: PTY Reader Race Fix** — Replace spawn_blocking PTY read loop with nix::poll self-pipe; bounded blocking-thread count (completed 2026-06-01)
 - [ ] **Phase 11: Datagram Wire Protocol** — StateDiff sparse-diff wire format in nosh-proto; postcard encode/decode; size-cap tests
 - [ ] **Phase 12: Server Terminal State Model** — TerminalState vte::Perform impl in nosh-server; unit-tested against known VT sequences
 - [ ] **Phase 13: Server Datagram Sender** — Wires TerminalState into run_session select! loop; coalesced diffs over QUIC datagrams; ResumeComplete gate
@@ -56,8 +56,8 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   2. The server's blocking thread count (tokio blocking pool) stays bounded and does not grow after repeated session orphan cycles under load
   3. `cargo test` continues to pass with the new PTY reader implementation; no regressions in existing session tests
 **Plans**: 2 plans
-- [ ] 10-01-PLAN.md — Interruptible PTY reader foundation: pty_io trait boundary + Unix self-pipe/nix::poll impl, master_raw_fd accessors, nix poll feature
-- [ ] 10-02-PLAN.md — Wire interruptible reader into both pumps, await reader exit before orphan (D-03), remove abort() no-op, D-04 completion-barrier test
+- [x] 10-01-PLAN.md — Interruptible PTY reader foundation: pty_io trait boundary + Unix self-pipe/nix::poll impl, master_raw_fd accessors, nix poll feature
+- [x] 10-02-PLAN.md — Wire interruptible reader into both pumps, await reader exit before orphan (D-03), remove abort() no-op, D-04 completion-barrier test
 
 ### Phase 11: Datagram Wire Protocol
 **Goal**: A sparse, size-bounded terminal-diff wire format exists in nosh-proto — the shared interface that every subsequent server and client component builds on
@@ -165,7 +165,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 7. Connection Migration Validation | — | Shipped | 2026-05-30 |
 | 8. Windows Client | — | Shipped | 2026-05-30 |
 | 9. Windows Client Polish & Hardening | — | Shipped | 2026-05-30 |
-| 10. PTY Reader Race Fix | 0/2 | Not started | - |
+| 10. PTY Reader Race Fix | 2/2 | Complete   | 2026-06-01 |
 | 11. Datagram Wire Protocol | 0/? | Not started | - |
 | 12. Server Terminal State Model | 0/? | Not started | - |
 | 13. Server Datagram Sender | 0/? | Not started | - |
