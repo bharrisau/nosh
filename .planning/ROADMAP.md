@@ -82,7 +82,9 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   2. OSC 52 sequences are detectable at the `osc_dispatch` callsite — the server can identify clipboard-write sequences in PTY output
   3. `push_output_and_parse` on `SessionSlot` feeds both `SequencedOutputBuffer` (unchanged) and `TerminalState` — cold-reattach replay is not affected
   4. Unit tests pass for representative VT sequences: plain text, cursor motion (CSI A/B/C/D), erase-in-display, OSC 0/2 title, OSC 52 clipboard
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 12-01-PLAN.md — Build TerminalState (vte::Perform) with grid, cursor, bounded scrollback, echo-state, OSC handling; full isolation unit tests
+- [ ] 12-02-PLAN.md — Wire push_output_and_parse into SessionSlot + 3 server.rs callsites; resize hook; prove reattach replay byte-identical
 
 ### Phase 13: Server Datagram Sender
 **Goal**: The server emits coalesced terminal-state diffs over QUIC datagrams from the session pump, gated by a ResumeComplete signal so they never corrupt a partial cold-reattach replay
