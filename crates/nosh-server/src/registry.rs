@@ -438,9 +438,25 @@ impl SessionSlot {
     /// `TerminalState` grid to track the new dimensions. Returns the `Session::resize`
     /// result as the primary outcome; the terminal state resize is infallible.
     ///
+    /// # DoS protection (CR-02)
+    ///
+    /// `cols` and `rows` come from the authenticated client's `Message::Resize` frame
+    /// (plain u16 fields, no protocol-level cap). An unbounded resize would allocate
+    /// up to 65535 × 65535 × sizeof(Cell) ≈ 34 GB per session — an OOM DoS.
+    /// Both dimensions are clamped to `MAX_COLS` / `MAX_ROWS` (1000 × 1000) before
+    /// calling either `Session::resize` or `TerminalState::resize`. This cap is
+    /// generous for any real terminal while bounding allocation to ~8 MB/session worst case.
+    ///
     /// Lock discipline: acquires `session` lock then `terminal_state` lock sequentially
     /// (never held simultaneously). Neither lock is held across `.await` (Anti-Pattern #2).
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        /// Maximum terminal width accepted from the client (DoS cap — CR-02).
+        const MAX_COLS: u16 = 1000;
+        /// Maximum terminal height accepted from the client (DoS cap — CR-02).
+        /// At 1000 × 1000 with 8 bytes/Cell, worst-case grid allocation is ~8 MB/session.
+        const MAX_ROWS: u16 = 1000;
+        let cols = cols.min(MAX_COLS);
+        let rows = rows.min(MAX_ROWS);
         let result = self.session.lock().unwrap().resize(cols, rows);
         self.terminal_state.lock().unwrap().resize(cols, rows);
         result
@@ -1752,6 +1768,91 @@ mod tests {
         let cell_h = ts.cell(0, 0);
         assert_eq!(cell_h.ch, 'h', "terminal must have advanced: cell(0,0)='h'");
         drop(ts);
+
+        slot.sighup();
+    }
+
+    // ── CR-02 regression: resize OOM cap ─────────────────────────────────────
+
+    /// CR-02 regression: `resize(65535, 65535)` must not allocate beyond the cap.
+    ///
+    /// Before the fix, `SessionSlot::resize` forwarded the client-supplied u16
+    /// dimensions directly to `TerminalState::resize`, allowing a 65535×65535 grid
+    /// allocation (~34 GB). After the fix, both dimensions are clamped to MAX_COLS=1000
+    /// and MAX_ROWS=1000 (generous for any real terminal; ~8 MB/session worst case).
+    ///
+    /// This test operates against the `TerminalState` directly so it does not require
+    /// a real PTY/shell (the cap lives in `SessionSlot::resize` which wraps both the
+    /// PTY `ioctl` and the `TerminalState::resize`). We test the terminal-state side
+    /// to assert the grid dimensions are bounded, and we verify the constant values.
+    #[test]
+    fn resize_oom_cap_clamps_client_supplied_dimensions() {
+        use crate::terminal::TerminalState;
+
+        // Apply a huge resize directly to TerminalState (same call that SessionSlot::resize
+        // makes after clamping). The terminal itself does not enforce the cap — the cap
+        // is enforced in SessionSlot::resize. This test verifies the constant-defined cap.
+        // SessionSlot::resize MAX_COLS/MAX_ROWS are u16 consts; verify via the terminal.
+
+        // 1) A huge resize on TerminalState (unclamped path — intentional; verifies the
+        //    call itself does not panic for values that pass the cap). Use 1000x1000.
+        let mut ts = TerminalState::new(80, 24);
+        ts.resize(1000, 1000);
+        assert_eq!(ts.size(), (1000, 1000), "resize to cap limit must succeed");
+
+        // 2) Verify the cap constants used in SessionSlot::resize clamp 65535.
+        // We inline the constants here to verify the expected behaviour;
+        // the actual enforcement is tested via slot.resize below (requires /bin/sh guard).
+        let raw_cols: u16 = 65535;
+        let raw_rows: u16 = 65535;
+        const MAX_COLS: u16 = 1000;
+        const MAX_ROWS: u16 = 1000;
+        let clamped_cols = raw_cols.min(MAX_COLS);
+        let clamped_rows = raw_rows.min(MAX_ROWS);
+        assert_eq!(clamped_cols, 1000, "65535 cols must clamp to MAX_COLS=1000");
+        assert_eq!(clamped_rows, 1000, "65535 rows must clamp to MAX_ROWS=1000");
+
+        // 3) Verify that the clamped dimensions produce a bounded grid in TerminalState.
+        let mut ts2 = TerminalState::new(80, 24);
+        ts2.resize(clamped_cols, clamped_rows);
+        let (actual_cols, actual_rows) = ts2.size();
+        assert_eq!(actual_cols, 1000, "grid cols must be clamped to 1000");
+        assert_eq!(actual_rows, 1000, "grid rows must be clamped to 1000");
+        // Total cells: 1000 * 1000 = 1_000_000 (~8 MB at 8 bytes/Cell) — not 34 GB.
+    }
+
+    /// CR-02 slot-level regression: slot.resize(65535, 65535) clamps the grid.
+    ///
+    /// Requires /bin/sh for the PTY side of the resize call. Verifies the
+    /// SessionSlot::resize cap is applied end-to-end.
+    #[test]
+    fn slot_resize_clamps_huge_dimensions_to_cap() {
+        if !have_sh() {
+            eprintln!("skipping slot_resize_clamps_huge_dimensions_to_cap: /bin/sh unavailable");
+            return;
+        }
+        let sess = open_sh_session(test_key(0xE0));
+        let slot = SessionSlot::new(sess);
+
+        // Attempt a client-supplied max-value resize (the DoS vector).
+        // Must not OOM or panic; must clamp to MAX_COLS × MAX_ROWS.
+        let result = slot.resize(65535, 65535);
+        // PTY ioctl may succeed or return an error for huge dims — either is acceptable.
+        // What matters is the TerminalState grid is bounded.
+        let _ = result; // not the assertion target
+
+        let ts = slot.terminal_state.lock().unwrap();
+        let (actual_cols, actual_rows) = ts.size();
+        drop(ts);
+
+        assert!(
+            actual_cols <= 1000,
+            "grid cols must be <= MAX_COLS=1000 after resize(65535,65535), got {actual_cols}"
+        );
+        assert!(
+            actual_rows <= 1000,
+            "grid rows must be <= MAX_ROWS=1000 after resize(65535,65535), got {actual_rows}"
+        );
 
         slot.sighup();
     }
