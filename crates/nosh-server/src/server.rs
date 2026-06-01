@@ -602,11 +602,18 @@ async fn run_session(
     }
 
     // Best-effort: signal the reader to exit so no reader thread is left parked
-    // after the function returns (covers ShellExited and ClientClosed paths;
-    // TransportLost already signalled and awaited above). The PTY master fd stays
-    // open via the slot on the orphan path — signalling the reader does NOT close it.
+    // after the function returns. Covers ShellExited and ClientClosed paths.
+    // TransportLost already called signal_shutdown() + join-await above; this
+    // second call on that path writes to a pipe whose read-end is closed (the
+    // reader thread dropped it on exit). signal_shutdown() silently ignores the
+    // resulting EPIPE, so this is harmless — no restructuring needed (IN-01).
+    // The PTY master fd stays open via the slot on the orphan path — signalling
+    // the reader does NOT close it.
     reader_handle.signal_shutdown();
-    input_writer.abort();
+    // abort() on spawn_blocking is a no-op (Pitfall 6): the task ignores it and
+    // keeps running until blocking_recv() returns None (from drop(in_tx) above).
+    // The task will store the writer back into the slot on its own and then exit.
+    // Nothing further to do here — drop(input_writer) releases the JoinHandle.
     Ok(())
 }
 
@@ -875,10 +882,14 @@ async fn run_reattach_session(
     }
 
     // Best-effort: signal the reader to exit so no reader thread is left parked
-    // after the function returns (covers ShellExited and ClientClosed paths;
-    // TransportLost already signalled and awaited above).
+    // after the function returns. Covers ShellExited and ClientClosed paths.
+    // TransportLost already called signal_shutdown() + join-await above; the
+    // second call on that path writes to a closed-read-end pipe and is silently
+    // ignored (EPIPE, IN-01). Harmless — no restructuring needed.
     reader_handle.signal_shutdown();
-    input_writer.abort();
+    // abort() on spawn_blocking is a no-op (Pitfall 6): drop(in_tx) above already
+    // unblocked the blocking_recv loop; the task will drain and store the writer
+    // back into the slot on its own. Nothing further to do here.
     Ok(())
 }
 
