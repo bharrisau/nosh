@@ -32,6 +32,16 @@ Depends on Phase 14 (the confirmed datagram path + compositor + ConnectionLossOv
   (iTerm2/kitty/wezterm/recent tmux do; some disable by default). Acceptable per the standard
   tmux approach. arboard-crate direct-OS-clipboard was rejected (extra dep + headless/Wayland
   edge cases).
+- **D-16-01c (OSC accumulation cap — from Phase 12 hardening, MUST address):** Phase 12 set
+  `vte = { default-features = false }` to bound OSC memory, which caps vte's OSC accumulation at
+  **1024 bytes** — so OSC 52 clipboard writes larger than ~762 raw bytes are SILENTLY DROPPED by
+  vte before `osc_dispatch` is ever called. Phase 16 MUST handle this to support real clipboard
+  payloads: either implement a custom OSC-52-accumulation path (intercept the raw OSC bytes
+  before vte's bounded buffer truncates them) OR re-enable vte `std` with an explicit, larger
+  retained-buffer cap in `osc_dispatch` (bounded, e.g. 64–256 KB, to avoid reintroducing the
+  CR-03 unbounded-OSC DoS). See `.planning/phases/12-server-terminal-state-model/12-REVIEW-FIX.md`
+  for the analysis. Picking the bounded approach + the cap value is a planning decision; the
+  cap MUST stay bounded (no return to unbounded OSC).
 
 ### Terminal-title propagation (D-16-02, QOL-03)
 - **D-16-02:** **Re-emit OSC 0/2 to local stdout** (same passthrough mechanism as D-16-01).
