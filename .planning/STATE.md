@@ -3,10 +3,10 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: planning
-last_updated: "2026-06-01T06:47:28.783Z"
+last_updated: "2026-06-01T00:00:00.000Z"
 last_activity: 2026-06-01
 progress:
-  total_phases: 0
+  total_phases: 9
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,36 +17,43 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-29)
+See: .planning/PROJECT.md (updated 2026-06-01)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** v1.1 (M3 Roaming + Windows Client) shipped + archived 2026-05-30. Awaiting next milestone (v1.2 / M4) — run `/gsd:new-milestone`.
+**Current focus:** v1.2 (M4 Predictive Echo + Daily-Driver Readiness) — roadmap defined, Phases 10-18. Start with `/gsd:plan-phase 10`.
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: Not started (roadmap defined)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-06-01 — Milestone v1.2 started
+Status: Ready to plan Phase 10
+Last activity: 2026-06-01 — v1.2 roadmap created (Phases 10-18)
+
+```
+Progress: [░░░░░░░░░░░░░░░░░░░░] 0/9 phases (0%)
+```
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 2 (v1.1)
-- Average duration: - (see v1.0 archive for historical baseline)
-- Total execution time: 0 hours (v1.1)
+- v1.0: 3 phases, 11 plans (single day, 2026-05-29)
+- v1.1: 6 phases (2026-05-30)
+- v1.2: 0/9 phases complete
 
-**By Phase:**
+**By Phase (v1.2):**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 4. Identity Threading | 0/? | - | - |
-| 5. Session Persistence | 0/? | - | - |
-| 6. Cold Reattach Protocol | 0/? | - | - |
-| 7. Connection Migration Validation | 0/? | - | - |
-| 8. Windows Client | 0/? | - | - |
-| 4 | 2 | - | - |
+| 10. PTY Reader Race Fix | 0/? | - | - |
+| 11. Datagram Wire Protocol | 0/? | - | - |
+| 12. Server Terminal State Model | 0/? | - | - |
+| 13. Server Datagram Sender | 0/? | - | - |
+| 14. Client Predictor — Confirmed Rendering | 0/? | - | - |
+| 15. Client Predictor — Speculative Overlay | 0/? | - | - |
+| 16. QoL Feature Pack + Windows CI Gate | 0/? | - | - |
+| 17. Windows-Host Predictive Echo Validation | 0/? | - | - |
+| 18. Security Design Pass | 0/? | - | - |
 
 **Recent Trend:**
 
@@ -71,30 +78,32 @@ Recent decisions affecting current work:
 - v1.1 roadmap: Reattach token is a session selector, not a credential; full TLS handshake re-runs on every reconnect (two-factor design baked in from Phase 6 first implementation, not retrofitted)
 - v1.1 roadmap: `ServerConfig::migration(true)` set explicitly even though it is the QUIC default — documents intent, guards against future default changes (Phase 7)
 - v1.1 roadmap: Windows client (Phase 8) isolated behind `#[cfg]` gates in nosh-client only; nosh-proto, nosh-auth, nosh-server unchanged
+- v1.2 roadmap: PTY reader fix uses `nix::poll` self-pipe trick on `[PTY fd, shutdown pipe]` — `tokio::io::unix::AsyncFd` is the alternative; verify exact `MasterPty::as_raw_fd()` method name at Phase 10 implementation
+- v1.2 roadmap: `termwiz 0.23.3` added as the single new consequential dep — `Surface` + `get_changes` / `flush_changes_older_than` provides the terminal grid and diff API without owning ~2000 lines of bespoke grid logic
+- v1.2 roadmap: `PtyData` on the reliable stream MUST continue to advance `highest_applied` after datagram path lands — the Ack mechanism and SequencedOutputBuffer trim depend on it; never break this invariant
+- v1.2 roadmap: Keystrokes go on the reliable stream only — never as datagrams; keystroke loss is never acceptable
+- v1.2 roadmap: All output to the local terminal goes through `ClientScreen.render_to_stdout()` — never direct `stdout.write_all` once the predictor exists
+- v1.2 roadmap: Datagrams suppressed on the client during reattach replay window; `ResumeComplete` signal gates fresh datagrams post-replay
+- v1.2 roadmap: Epoch-reset-on-cursor-move is a day-one design gate — predicting in cursor-addressing apps produces screen corruption worse than no prediction; conservative fallback baked into initial speculative overlay design
+- v1.2 roadmap: Noecho-suppression is a security requirement of prediction — engine must track server's confirmed echo state and suppress prediction during `stty -echo` prompts; validated with `read -s` test
+- v1.2 roadmap: Phase 17 (Windows-host validation) must execute from a physical Windows PC — halt Linux execution, run from Windows machine like v1.1 Phase 9; HARDEN-02/03 stay in Phase 16 (authorable from Linux)
+- v1.2 roadmap: 0-RTT cold reattach still deliberately deferred — 1-RTT already ships, replay-safety burden not justified
 
 ### Pending Todos
 
-- At Phase 5 start: verify `uuid` crate is already in nosh-server lockfile (research indicates yes — confirm)
-- At Phase 6 start: review PITFALLS.md 13-item reattach checklist before planning; state machine spec is the risk
-- At Phase 8 start: confirm `ring` 0.17.14 precompiled x86_64-windows assembly objects are present (no NASM/CMake needed)
-
-**From 2026-05-30 live Windows→Linux validation (native Windows client authenticated + opened PTY session OK):**
-
-> **RESOLVED in Phase 9 + VALIDATED on Windows host (2026-05-30).** Plan commits `eb2659b` VT-console+`~.`, `2bf6c9d` migration log, `5af3757` authorized_keys skip, `43ba8ac` connect timeout+PathBuf gate, `2d4db1e`/`edb77b8`/`83c6186` review fixes. Plus three Windows-validation follow-up fixes: `1c6afde` (HANDLE type, windows-sys 0.59 build break), `f83093e` (poll terminal::size() instead of EventStream — the real fix for vim REPLACE mode / dead arrows: EventStream was draining the console input queue), `263a60b` (restore terminal before process::exit). **Windows-host validation PASSED** (operator sign-off in docs/windows-client-test.md): vim NORMAL mode + arrows/PageUp-Down, less controllable, `~.` quits, Ctrl-C→remote, clean exit restores prompt, network roaming survives real path change. Phase 8 D-02 and Phase 9 Windows `human_needed` items are now CONFIRMED. **Still OPEN:** only the `WSAEMSGSIZE` investigation below (deliberately deferred; connection works) and a process item — wire a git remote so `windows-cross.yml` CI compiles the `#[cfg(windows)]` path automatically (would have caught `1c6afde`).
-
-- `authorized_keys` must IGNORE unsupported/unparseable entries (warn + skip, like sshd) — currently `load_authorized_keys` (`crates/nosh-auth/src/keys.rs:118`) propagates the first parse error via `?`, so a single RSA/ECDSA/malformed line rejects the entire file. Real-world `authorized_keys` files routinely contain non-Ed25519 keys.
-- Client needs a **connection timeout** when no server responds — `connect(...).await` (`crates/nosh-client/src/client.rs:188-190`) has no timeout and hangs; wrap in `tokio::time::timeout` with a clear error.
-- Unused `PathBuf` import warning on Windows builds — `crates/nosh-auth/src/signer.rs:15` is only used by the `#[cfg(unix)]` `AgentSigner`; gate the import.
-- Investigate Windows `quinn_udp` `WSAEMSGSIZE` (Os code 10040) sendmsg warning (len 1389, ECN Ect0) — connection still succeeded, likely benign GSO/segmentation-offload fallback, but confirm it doesn't degrade Windows reliability or spam logs.
-- **[client UX — pairs with VT-input fix] ssh-style `~.` escape sequence.** When the server dies / connection is stuck, the running client has no local way out (and once Ctrl-C is forwarded to the remote per the VT-input fix, there's no local quit at all). Implement the OpenSSH escape: at line start (after a newline, and at session start), `~` begins an escape; `~.` disconnects/quits the client locally; `~~` sends a literal `~`; any other char after `~` passes through with the `~`. Implement as a small state machine in the stdin path of `run_pump` (`crates/nosh-client/src/main.rs`) BEFORE bytes are forwarded to the server. Document the escape in client help/usage. This is the local-quit mechanism on all platforms.
-- **[VALIDATION WIN] Network roaming works on the live Windows client** — a real network change (QUIC connection migration) was survived with no re-auth/reconnect (effectively D-06 / ROAM-01 SC#4 passing on a real path change from a native Windows client). Gap: the **server logs nothing when migration happens** — add an INFO log when a session's peer/remote address changes (session_id + old→new addr) for observability. Detect via `connection.remote_address()` change in the server session loop (quinn 0.11 has no direct migration callback).
-- **[SIGNIFICANT — Phase 8 gap] Windows console not put into virtual-terminal INPUT mode.** Root cause: `run_pump` (`crates/nosh-client/src/main.rs:415`) forwards raw `tokio::io::stdin()` bytes (Unix VT model), and `client.rs:275` calls `crossterm::terminal::enable_raw_mode()` which on Windows only clears line/echo/processed-input — it does NOT set `ENABLE_VIRTUAL_TERMINAL_INPUT`. Symptoms (live test): vim opens in REPLACE mode (Insert key), arrow/up-down keys don't work, `less` uncontrollable (special keys not encoded as ANSI escape seqs); Ctrl-C terminates nosh-client.exe (exit 130) instead of being forwarded to the remote shell as 0x03. Fix (consolidated pass, `#[cfg(windows)]`): after enable_raw_mode, `GetConsoleMode`/`SetConsoleMode` on the stdin handle to add `ENABLE_VIRTUAL_TERMINAL_INPUT` and ensure `ENABLE_PROCESSED_INPUT` is cleared (Ctrl-C delivered as 0x03 byte, forwarded to remote like Unix); set stdout `ENABLE_VIRTUAL_TERMINAL_PROCESSING`; restore on exit. Reconsider `quit_signal()`/`tokio::signal::ctrl_c` on Windows so Ctrl-C interrupts the REMOTE command (Unix semantics) rather than quitting the client — pick a different client-quit mechanism. Requires Windows-host re-test (vim, less, arrows, Ctrl-C). This means Phase 8 D-02 is currently PARTIAL: line shell + auth + resize work; raw-key/TUI input does not.
+- At Phase 10 start: verify exact `MasterPty::as_raw_fd()` method name in `portable-pty 0.9.0` (STACK.md states `AsRawFd` is available; confirm before wiring shutdown pipe; gate `#[cfg(unix)]`)
+- At Phase 11 start: run per-phase research on sparse-diff encoding strategy — how to handle large-repaint frames (vim file open, `clear`) within QUIC datagram MTU. Three options: cursor-priority partial update, skip-frame-and-wait, reliable-stream fallback for full-screen repaints
+- At Phase 12 start: verify vte 0.15.0 `Perform` trait `osc_dispatch` exact parameter signature at docs.rs before committing to the API (MEDIUM confidence — `fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool)` expected but not verified)
+- At Phase 15 start: run per-phase research on Mosh `terminaloverlay.cc` — epoch model, `Validity` enum, `cull()` logic, `PendingPrediction` lifecycle; budget 2-3 planning passes; this is the hardest UX step in M4
+- At Phase 16 start: add `osc52` feature flag to `nosh-client/Cargo.toml` for crossterm; confirm `crossterm::clipboard::CopyToClipboard` API surface
+- At Phase 17: HALT — execute from a physical Windows host, not a Linux machine
+- At Phase 18: use PITFALLS.md "Looks Done But Isn't" checklist as sign-off criteria for the security doc
 
 ### Blockers/Concerns
 
-- Phase 6 (Cold Reattach): state machine correctness and two-factor authorization design are the principal risk; must be correct from first implementation (cannot retrofit identity check after token-only build without a protocol change)
-- Phase 8 (Windows): Windows ACL permission check gap — `std::fs::Permissions` cannot read ACLs; best-effort warning + documented limitation is the agreed approach
-- Phase 8 (Windows): crossterm `use-dev-tty` feature must NOT be enabled (Unix-only; breaks Windows build with `event-stream` per issue #935)
+- Phase 15 (Speculative Overlay): highest-complexity area of M4; epoch-reset correctness and noecho-suppression are security requirements that cannot be retrofitted; adversarial tests (vim, `read -s`, CJK) are required before the phase is marked done
+- Phase 17 (Windows validation): requires a physical Windows host; cannot be executed from CI or Linux cross-compile
+- Phase 11 (wire format): sparse-diff encoding strategy for large repaints is an open design decision that blocks all prediction work; must be resolved as Phase 11's first task
 
 ## Deferred Items
 
@@ -102,21 +111,29 @@ Items acknowledged and carried forward:
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| v2 (M4) | Predictive local echo / datagram state sync (ECHO-01) | Deferred to M4 | Init |
-| v2 (M5) | Channel multiplexing, forwarding, OSC 52 (FEAT-01..06) | Deferred to M5 | Init |
+| v2 (M5) | Channel multiplexing, forwarding (MUX-01/02, FWD-01/02) | Deferred to M5 | Init |
+| v2 (M5) | Full native scrollback sync (SCROLL-01) | Deferred to M5 | Init |
+| v2 (M5) | Named/numbered session selection | Deferred to M5 | v1.1 scoping |
+| v2 (M5) | File transfer (XFER-01) | Deferred to M5 | Init |
 | v2 (M6) | Windows ConPTY / native server (PLAT-01) | Deferred to M6 | Init |
-| v2 (M7) | WebTransport / NAT topologies (TOPO-01..03) | Deferred to M7 | Init |
-| v2 (M3+) | Connection status / latency indicator (ROAM-03) | Deferred to M4+ | v1.1 scoping |
-| v2 (M3+) | Windows ssh-agent / Pageant (WIN-05) | Deferred post-v1.1 | v1.1 scoping |
-| v2 (M3+) | Encrypted key passphrase prompt (WIN-06) | Deferred post-v1.1 | v1.1 scoping |
-| v2 (M5+) | Named/numbered session selection | Deferred to M5+ | v1.1 scoping |
+| v2 (M6) | Windows ssh-agent / Pageant signing (PLAT-02) | Deferred post-v1.1 | v1.1 scoping |
+| v2 (M6) | Encrypted key passphrase prompt | Deferred post-v1.1 | v1.1 scoping |
+| v2 (M7) | WebTransport / NAT topologies | Deferred to M7 | Init |
+| v2 (post-M4) | 0-RTT cold reattach | Deliberately deferred | INIT.md; 1-RTT ships |
+| v2 (post-M4) | RFC 7250 RPK (TLS raw public keys) | Deferred; cert-pinning proven first | v1.0 |
+| v2 (post-M4) | OSC 52 clipboard read (paste remote→local) | Excluded: security hole | v1.2 scoping |
+| v2 (post-M4) | tmux/screen integration | Excluded by maintainer | v1.2 scoping |
+| v2 (post-M4) | Bell/notification passthrough (OSC 9) | Low daily-driver value | v1.2 research |
 
 ## Session Continuity
 
-Last session: 2026-05-30T05:31:22.885Z
-Stopped at: Phase 4 context gathered
-Resume file: .planning/phases/04-identity-threading/04-CONTEXT.md
+Last session: 2026-06-01
+Stopped at: Roadmap defined — v1.2 Phases 10-18 written
+Resume file: .planning/ROADMAP.md
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+1. Run `/gsd:plan-phase 10` to plan the PTY Reader Race Fix (no research phase needed — nix::poll self-pipe is a standard pattern)
+2. Phase 11 and 12 will prompt for research phases at plan time (wire format sparse-diff strategy; vte osc_dispatch verification)
+3. Phase 15 will prompt for a research phase (Mosh terminaloverlay.cc translation — highest complexity)
+4. Before Phase 17: switch to a physical Windows host

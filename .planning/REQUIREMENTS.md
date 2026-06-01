@@ -86,35 +86,33 @@ Explicitly excluded for v1.2. Documented to prevent scope creep.
 
 ## Traceability
 
-Populated during roadmap creation. Each requirement maps to exactly one phase.
-
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| HARDEN-01 | TBD | Pending |
-| HARDEN-02 | TBD | Pending |
-| HARDEN-03 | TBD | Pending |
-| SYNC-01 | TBD | Pending |
-| SYNC-02 | TBD | Pending |
-| SYNC-03 | TBD | Pending |
-| PREDICT-01 | TBD | Pending |
-| PREDICT-02 | TBD | Pending |
-| PREDICT-03 | TBD | Pending |
-| PREDICT-04 | TBD | Pending |
-| PREDICT-05 | TBD | Pending |
-| PREDICT-06 | TBD | Pending |
-| PREDICT-07 | TBD | Pending |
-| QOL-01 | TBD | Pending |
-| QOL-02 | TBD | Pending |
-| QOL-03 | TBD | Pending |
-| QOL-04 | TBD | Pending |
-| SEC-01 | TBD | Pending |
-| SEC-02 | TBD | Pending |
+| HARDEN-01 | Phase 10 | Pending |
+| HARDEN-02 | Phase 16 | Pending |
+| HARDEN-03 | Phase 16 | Pending |
+| SYNC-01 | Phase 11 | Pending |
+| SYNC-02 | Phase 12 | Pending |
+| SYNC-03 | Phase 13 | Pending |
+| PREDICT-01 | Phase 14 | Pending |
+| PREDICT-02 | Phase 15 | Pending |
+| PREDICT-03 | Phase 15 | Pending |
+| PREDICT-04 | Phase 15 | Pending |
+| PREDICT-05 | Phase 15 | Pending |
+| PREDICT-06 | Phase 15 | Pending |
+| PREDICT-07 | Phase 17 | Pending |
+| QOL-01 | Phase 16 | Pending |
+| QOL-02 | Phase 16 | Pending |
+| QOL-03 | Phase 16 | Pending |
+| QOL-04 | Phase 16 | Pending |
+| SEC-01 | Phase 18 | Pending |
+| SEC-02 | Phase 18 | Pending |
 
 **Coverage:**
 - v1.2 requirements: 19 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 19 ⚠️
+- Mapped to phases: 19
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-06-01*
-*Last updated: 2026-06-01 after initial definition*
+*Last updated: 2026-06-01 — traceability populated after roadmap creation*
