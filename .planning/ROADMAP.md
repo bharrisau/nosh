@@ -37,7 +37,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 
 - [x] **Phase 10: PTY Reader Race Fix** — Replace spawn_blocking PTY read loop with nix::poll self-pipe; bounded blocking-thread count (completed 2026-06-01)
 - [x] **Phase 11: Datagram Wire Protocol** — StateDiff sparse-diff wire format in nosh-proto; postcard encode/decode; size-cap tests (completed 2026-06-01)
-- [ ] **Phase 12: Server Terminal State Model** — TerminalState vte::Perform impl in nosh-server; unit-tested against known VT sequences
+- [x] **Phase 12: Server Terminal State Model** — TerminalState vte::Perform impl in nosh-server; unit-tested against known VT sequences (completed 2026-06-01)
 - [ ] **Phase 13: Server Datagram Sender** — Wires TerminalState into run_session select! loop; coalesced diffs over QUIC datagrams; ResumeComplete gate
 - [ ] **Phase 14: Client Predictor — Confirmed Rendering** — ClientScreen renders confirmed terminal state from datagrams; ConnectionLossOverlay stub; all display through single render path
 - [ ] **Phase 15: Client Predictor — Speculative Overlay** — Full SSP-style prediction engine: epoch tracking, conservative fallback, underline rendering, adaptive RTT mode, wide-char handling
@@ -83,8 +83,8 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   3. `push_output_and_parse` on `SessionSlot` feeds both `SequencedOutputBuffer` (unchanged) and `TerminalState` — cold-reattach replay is not affected
   4. Unit tests pass for representative VT sequences: plain text, cursor motion (CSI A/B/C/D), erase-in-display, OSC 0/2 title, OSC 52 clipboard
 **Plans**: 2 plans
-- [ ] 12-01-PLAN.md — Build TerminalState (vte::Perform) with grid, cursor, bounded scrollback, echo-state, OSC handling; full isolation unit tests
-- [ ] 12-02-PLAN.md — Wire push_output_and_parse into SessionSlot + 3 server.rs callsites; resize hook; prove reattach replay byte-identical
+- [x] 12-01-PLAN.md — Build TerminalState (vte::Perform) with grid, cursor, bounded scrollback, echo-state, OSC handling; full isolation unit tests
+- [x] 12-02-PLAN.md — Wire push_output_and_parse into SessionSlot + 3 server.rs callsites; resize hook; prove reattach replay byte-identical
 
 ### Phase 13: Server Datagram Sender
 **Goal**: The server emits coalesced terminal-state diffs over QUIC datagrams from the session pump, gated by a ResumeComplete signal so they never corrupt a partial cold-reattach replay
@@ -170,7 +170,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 9. Windows Client Polish & Hardening | — | Shipped | 2026-05-30 |
 | 10. PTY Reader Race Fix | 2/2 | Complete    | 2026-06-01 |
 | 11. Datagram Wire Protocol | 1/1 | Complete    | 2026-06-01 |
-| 12. Server Terminal State Model | 0/? | Not started | - |
+| 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
 | 13. Server Datagram Sender | 0/? | Not started | - |
 | 14. Client Predictor — Confirmed Rendering | 0/? | Not started | - |
 | 15. Client Predictor — Speculative Overlay | 0/? | Not started | - |
