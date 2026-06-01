@@ -161,7 +161,8 @@ const CLOSE_PROTOCOL: u32 = 1;
 /// QUIC application close code for peer identity extraction failure (should
 /// never happen on an AuthorizedKeysVerifier-enforced connection — D-04).
 const CLOSE_AUTH: u32 = 2;
-/// PTY output read chunk size.
+/// PTY output read chunk size (used in `crate::pty_io`).
+#[allow(dead_code)]
 const PTY_CHUNK: usize = 8 * 1024;
 
 /// How the session loop ended (D-02).
@@ -353,24 +354,15 @@ async fn run_session(
     // exits (W2 fix — reliable hand-back, no racy oneshot).
     slot.return_pty_writer(writer);
 
-    // OUTPUT pump: a blocking thread reads PTY output and forwards chunks; an
-    // async task drains them into PtyData frames on the stream.
+    // OUTPUT pump: an interruptible reader thread polls [master_fd, shutdown_pipe]
+    // before each read. Async teardown signals the pipe to stop the thread
+    // cleanly (Pitfall 6: abort() on spawn_blocking is a no-op; this replaces it).
+    // Extract the master raw fd while the session lock is held briefly, then
+    // release it before spawning (Pitfall 2 — no lock held across spawn_blocking).
+    let master_raw_fd = slot.master_raw_fd().expect("Unix PTY master fd available");
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let mut reader = reader;
-    let output_reader = tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; PTY_CHUNK];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // PTY EOF: shell closed.
-                Ok(n) => {
-                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break; // receiver gone — stop reading.
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let mut reader_handle = crate::pty_io::start_interruptible_reader(master_raw_fd, reader, out_tx)
+        .expect("start interruptible PTY reader");
 
     // INPUT pump: writes from the client stream go to the PTY. The blocking
     // writer is taken from the slot. W2 fix: instead of recovering the writer
@@ -559,6 +551,14 @@ async fn run_session(
             // inside the slot held by the registry.
             tracing::info!("transport lost; orphaning session (PTY kept alive, no SIGHUP)");
 
+            // D-03: signal the interruptible reader to exit and AWAIT its clean
+            // thread exit BEFORE calling registry.orphan(). This guarantees the
+            // prior reader has fully exited before a future reattach clones a new
+            // reader on the same master fd — no two live readers racing on the same
+            // fd (Pitfall 3 / T-10-04). Mirror the W2 writer-handback pattern exactly.
+            reader_handle.signal_shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut reader_handle.join).await;
+
             // W2 fix: the input task stores the writer back into the slot on
             // exit. The `drop(in_tx)` above unblocks it; AWAIT its completion so
             // the writer is guaranteed to be in the slot BEFORE we orphan — no
@@ -601,10 +601,11 @@ async fn run_session(
         }
     }
 
-    // Best-effort: ensure the blocking I/O tasks unwind (the PTY master fd stays
-    // open via the slot on the orphan path — aborting the I/O bridge tasks does
-    // not close it).
-    output_reader.abort();
+    // Best-effort: signal the reader to exit so no reader thread is left parked
+    // after the function returns (covers ShellExited and ClientClosed paths;
+    // TransportLost already signalled and awaited above). The PTY master fd stays
+    // open via the slot on the orphan path — signalling the reader does NOT close it.
+    reader_handle.signal_shutdown();
     input_writer.abort();
     Ok(())
 }
@@ -743,23 +744,13 @@ async fn run_reattach_session(
     // We then follow the same pump pattern as run_session.
     slot.return_pty_writer(writer);
 
-    // OUTPUT pump.
+    // OUTPUT pump: same interruptible reader pattern as run_session.
+    // Extract master raw fd under the brief lock, then release before spawning
+    // (Pitfall 2 — no lock held across spawn_blocking).
+    let master_raw_fd = slot.master_raw_fd().expect("Unix PTY master fd available for reattach");
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
-    let mut reader = reader;
-    let output_reader = tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; PTY_CHUNK];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let mut reader_handle = crate::pty_io::start_interruptible_reader(master_raw_fd, reader, out_tx)
+        .expect("start interruptible PTY reader for reattach");
 
     // INPUT pump. W2 fix: store the writer back into the slot on exit (same as
     // run_session) so an orphaned-then-reattached session always has a usable
@@ -867,6 +858,13 @@ async fn run_reattach_session(
         }
         SessionEnd::TransportLost => {
             tracing::info!("transport lost during reattach; re-orphaning");
+            // D-03: signal the interruptible reader and AWAIT its clean exit
+            // BEFORE registry.orphan() — guarantees the prior reader has fully
+            // exited before the next reattach clones a fresh reader on the same
+            // master fd (Pitfall 3 / T-10-04). Mirror the W2 writer-handback pattern.
+            reader_handle.signal_shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut reader_handle.join).await;
+
             // W2 fix: await the input task so it stores the writer back into the
             // slot BEFORE we orphan — the re-orphaned slot always has a usable
             // writer for the next reattach.
@@ -876,7 +874,10 @@ async fn run_reattach_session(
         }
     }
 
-    output_reader.abort();
+    // Best-effort: signal the reader to exit so no reader thread is left parked
+    // after the function returns (covers ShellExited and ClientClosed paths;
+    // TransportLost already signalled and awaited above).
+    reader_handle.signal_shutdown();
     input_writer.abort();
     Ok(())
 }
