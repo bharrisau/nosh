@@ -25,6 +25,12 @@ pub enum ProtoError {
     /// Underlying I/O error while reading or writing a framed message.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// `cap` argument to `encode_datagram` is below the minimum safe value
+    /// ([`crate::datagram::MIN_CAP`]). The header-only (zero-run) payload is
+    /// 7 bytes; any `cap <= 7` cannot satisfy the strict `payload.len() < cap`
+    /// guarantee regardless of the diff content.
+    #[error("datagram cap {0} is below minimum ({1})")]
+    CapTooSmall(usize, usize),
 }
 
 /// Encode a [`Message`] into a length-delimited frame: 4-byte big-endian body

@@ -25,6 +25,19 @@ const TAG_STATE_DIFF: u8 = 0x01;
 /// malformed packet forcing a multi-megabyte allocation (T-11-02 DoS guard).
 pub const MAX_RUNS: usize = 4096;
 
+/// Minimum valid `cap` argument for [`encode_datagram`].
+///
+/// The header-only (zero-run) [`StateDiff`] payload is 7 bytes under postcard
+/// (1 tag byte + 6-byte body: epoch=1-byte varint, cols=1, rows=1, cursor.row=1,
+/// cursor.col=1, runs.len=1). Any `cap <= 7` cannot satisfy the strict
+/// `payload.len() < cap` guarantee; callers must pass `cap >= MIN_CAP`.
+///
+/// In practice `cap` always derives from `Connection::max_datagram_size()` (QUIC
+/// negotiated MTU minus overhead), which is always >= 1200 bytes — well above
+/// this floor. The guard exists to make the API contract explicit and to catch
+/// any future callsite that constructs a synthetic cap.
+pub const MIN_CAP: usize = 8;
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
 /// A sparse terminal-state diff sent as a QUIC datagram (loss-tolerant,
@@ -138,10 +151,16 @@ impl CellStyle {
 ///
 /// ## Size guarantee (D-11-01b)
 ///
-/// For ANY input, `payload.len() < cap`. This is enforced by the cursor-priority
-/// fill loop using `postcard::experimental::serialized_size` with a strict bound:
-/// a run is kept only if `serialized_size(candidate_body) + 1 < cap` (the `+1`
-/// accounts for the tag byte; strict less-than per the off-by-one pitfall).
+/// For any input where `cap >= MIN_CAP` (8), `payload.len() < cap` strictly.
+/// This is enforced by the cursor-priority fill loop using
+/// `postcard::experimental::serialized_size` with a strict bound: a run is kept
+/// only if `serialized_size(candidate_body) + 1 < cap` (the `+1` accounts for
+/// the tag byte; strict less-than per the off-by-one pitfall).
+///
+/// **Precondition:** `cap >= MIN_CAP`. Callers that pass `cap < MIN_CAP` receive
+/// `Err(ProtoError::CapTooSmall)`. In practice, `cap` always derives from
+/// `Connection::max_datagram_size()` (QUIC MTU, always >= 1200) — this bound is
+/// never reached from real callers.
 ///
 /// ## Continued-fill past rejection
 ///
@@ -159,12 +178,23 @@ impl CellStyle {
 ///
 /// # Errors
 ///
-/// Returns [`ProtoError`] if postcard serialization fails (should not occur for
-/// well-formed types).
+/// Returns [`ProtoError::CapTooSmall`] if `cap < MIN_CAP` (8). The minimum
+/// valid cap is [`MIN_CAP`]; the header-only payload is 7 bytes so any cap
+/// below 8 cannot satisfy the strict `< cap` guarantee.
+///
+/// Returns [`ProtoError::Postcard`] if postcard serialization fails (should
+/// not occur for well-formed types).
 pub fn encode_datagram(
     diff: &StateDiff,
     cap: usize,
 ) -> Result<(Bytes, Vec<DiffRun>), ProtoError> {
+    // Enforce the minimum-cap precondition before touching anything else.
+    // Callers that derive cap from max_datagram_size() (always >= 1200) will
+    // never hit this; the guard exists for future callers and tests.
+    if cap < MIN_CAP {
+        return Err(ProtoError::CapTooSmall(cap, MIN_CAP));
+    }
+
     // Reserve 1 byte for the TAG_STATE_DIFF prefix (Pitfall 4).
     // All `serialized_size` comparisons use `body_cap`; the final payload is
     // `body + 1 tag byte`, so `payload.len() = body.len() + 1 < cap` iff
