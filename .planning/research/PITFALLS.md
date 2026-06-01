@@ -1,334 +1,305 @@
 # Pitfalls Research
 
-**Domain:** QUIC-based roaming remote shell (Rust) — v1.1 M3 Roaming + Windows Client
-**Researched:** 2026-05-30
-**Confidence:** HIGH (quinn/rustls official docs; RFC 9000; ssh-key crate docs; Windows terminal research; QUIC path validation research)
+**Domain:** QUIC-based roaming remote shell (Rust) — v1.2 M4 Predictive Echo + Daily-Driver Hardening
+**Researched:** 2026-06-01
+**Confidence:** HIGH (Mosh USENIX paper + GitHub issues; QUIC RFCs + quinn docs; tokio spawn_blocking docs; nosh codebase v1.1 inspection)
 
 ---
 
 ## CRITICAL PITFALLS
 
-### Pitfall 1: `ServerConfig::migration` Not Set — Migration Silently Disabled on the Server
+### Pitfall 1: Predicting in Cursor-Addressing Apps — The vim/less/htop Trap
 
 **What goes wrong:**
-The client IP changes (Wi-Fi→cellular, NAT rebind), quinn sends updated packets from the new address, but the server drops them. The session stalls, then times out. `quinn`'s `ServerConfig::migration` defaults to `true`, but if anyone explicitly set it to `false` for an earlier test or security audit, the server silently refuses all client address changes.
+The prediction engine echoes the typed character at the current cursor position on the client-side terminal model, then waits for server confirmation. In a line-discipline shell prompt this is almost always correct. In cursor-addressing apps (vim, less, htop, emacs, any curses app), the "current cursor position" is wherever a cursor-move escape sequence last landed — and that position changes faster than round-trip confirmation arrives. The predicted echo lands in the wrong cell, producing a corrupt screen that flickers and then corrects one RTT later. This is WORSE than no prediction: the screen looks broken on every keystroke.
 
 **Why it happens:**
-Migration is a server-side gate: `ServerConfig::migration(bool)`. Even if the client correctly uses a fresh connection ID on the new path (as RFC 9000 §9.3 requires), the server will ignore address changes when migration is disabled. The failure looks like a network drop, not a config error.
+CSI A/B/C/D (cursor movement), CSI H (cursor position), ED/EL (erase) sequences all move or invalidate the cursor position without producing visible characters. If the prediction engine trusts cursor position from the last-seen confirmed state while the server has moved the cursor with escape sequences that have not yet arrived at the client, every prediction will be displaced.
+
+Mosh solves this by running a FULL terminal emulator model on both sides (the server sends terminal state diffs, not raw byte streams); naive implementations that predict against the raw stream fail immediately on any curses app.
 
 **How to avoid:**
-- Confirm `ServerConfig::migration(true)` is set explicitly, not just relying on the default.
-- Add an integration test: establish a connection on loopback `127.0.0.1`, then force the client to rebind to `127.0.0.2` (or use a dual-interface test) and assert the connection survives.
-- In headless CI, simulate migration by changing the client socket binding mid-session; verify no `ConnectionError::ConnectionClosed` results.
+- Do NOT attempt to predict while the client's terminal model has unconfirmed cursor-move or erase sequences outstanding. Track an "is-in-cursor-addressing-app" flag: any non-echoed control sequence in the pending-confirmation window → disable prediction for that epoch.
+- Alternatively (Mosh's approach): run the terminal model on the client, accept state diffs from the server, and only echo when the client model agrees the cursor is at a stable position and the character at that position is the predicted one.
+- The conservative fallback is mandatory: if any prediction from an epoch is not confirmed within one RTT, reset epoch and go dark (show no predicted characters, wait for confirmed state). This gives vim/less/htop correct behaviour at the cost of no prediction.
+- Write an adversarial test: open a vim session, type `iHello`, confirm zero corrupt cells appear in the client terminal model during the typing.
 
 **Warning signs:**
-Session drops immediately after a network interface switch; `ConnectionError::TimedOut` rather than continued operation; migration test passes on loopback but fails on real interfaces.
+Prediction is attempted after any CSI sequence; prediction epoch never resets on arrow-key press; the prediction engine treats the remote terminal as a simple line-editor even in alternate-screen mode.
 
 **Phase to address:**
-Phase 1 (migration) — first thing to verify before any other migration work.
+Predictive echo phase (M4) — this is the design gate; the entire prediction architecture must be built around epoch-reset-on-cursor-move from the start.
 
 ---
 
-### Pitfall 2: Path Validation Anti-Amplification Stall After Migration
+### Pitfall 2: Wide Characters (CJK, Emoji) Corrupt the Predicted Cursor Column
 
 **What goes wrong:**
-After the client migrates to a new IP, the server is subject to the anti-amplification limit on the new path: it may send at most 3× the bytes it has received from that address until path validation completes (RFC 9000 §9.4). In a shell session with large server output (e.g. `cat bigfile`), the server stalls mid-stream waiting for the client to send enough data to raise the amplification limit, even though the connection is alive. This manifests as an output pause of 1–2 RTTs after every migration.
+CJK characters and emoji occupy two columns in most terminal emulators. The prediction engine inserts a predicted character at column N and advances the cursor model by 1. The remote shell, having received a wide character, advances by 2. The client-side cursor model is now 1 column ahead of reality. Every subsequent prediction lands one cell to the left of where it should be. The mismatch accumulates until the server sends a confirmed state that resets the model. In the meantime the display shows characters written on top of each other.
 
 **Why it happens:**
-RFC 9000 mandates this limit to prevent amplification attacks. On migration, the client's new address is initially unvalidated. The server sends PATH_CHALLENGE and waits for PATH_RESPONSE before fully lifting the limit. Any large burst of server output during this validation window is throttled.
+Unicode column-width is not trivially derived from the code point — it depends on `wcwidth()` semantics (East Asian Width property), combining characters (zero-width), variation selectors, and emoji sequences. Implementations that assume `char → 1 column` produce wrong predictions for any CJK user.
+
+Mosh explicitly documents this as a known gap in its canonical-mode editing: "there is no easy solution to this problem."
 
 **How to avoid:**
-- Send a small PING or control frame from the client immediately after detecting that migration has occurred (to quickly advance the amplification budget for the server).
-- In the migration test, pipe a large payload from server→client and assert no gap longer than 2 RTTs appears in the output stream after a simulated path change.
-- Do not attempt to pre-validate an alternate path before the migration (multipath) — that is a separate QUIC extension not in scope for v1.1.
+- Use a proper Unicode width library (`unicode-width` crate in Rust) to compute column advance for every predicted character.
+- For characters where `unicode_width::UnicodeWidthChar` returns `None` or `2` (wide), either skip prediction entirely for that character or emit a tentative two-column prediction and reset the epoch immediately so the server can correct.
+- Combining characters (zero-width), variation selectors (VS15/VS16), and multi-codepoint emoji sequences (ZWJ, flag sequences) should all trigger epoch reset (no prediction for that input unit) unless the terminal model explicitly tracks them.
+- Write a test: type `你好` (CJK wide chars) into a predicted shell and verify cursor column is reported correctly after each character.
 
 **Warning signs:**
-Terminal output pauses for ~100–500 ms after a network change; `cat`/`tail -f` pauses then resumes; no connection error, just a delay.
+Predicted cursor column advances by 1 for every codepoint regardless of width; no `unicode-width` dependency in the prediction subsystem; tests use only ASCII.
 
 **Phase to address:**
-Phase 1 (migration) — validate with an output-heavy stream test around migration events.
+Predictive echo phase (M4) — the width logic must be part of the initial prediction commit, not a follow-up.
 
 ---
 
-### Pitfall 3: Connection ID Linkability — Not Rotating CIDs on Migration
+### Pitfall 3: Paste / Bulk Input Floods the Prediction Engine
 
 **What goes wrong:**
-The client migrates to a new IP but keeps using the same connection ID. An eavesdropper on both the old and new network paths (e.g. a corporate VPN and a cellular carrier) can correlate the two paths to the same user session. RFC 9000 §9.5 explicitly requires that a migrating endpoint use a new connection ID to prevent linkability.
+User pastes 200 characters. The prediction engine eagerly predicts all 200 characters one at a time, inserting predicted cells into the client terminal model. The server processes the paste differently (shell may run the text as a command, readline may scroll, bracketed paste mode may wrap it). The mismatch between predicted state and actual state is large; the correction visible to the user is a jarring full-screen repaint 1 RTT later.
+
+A second failure mode: during the paste, datagrams carrying the predicted state arrive at the server and the client simultaneously, but the client updates its model faster than the server sends back confirmations. The client's epoch counter races ahead; when the first confirmed response arrives it may confirm a stale epoch, resetting prediction for an epoch that is already 50 characters stale.
 
 **Why it happens:**
-quinn manages CID rotation automatically if the endpoint has been supplied with enough CIDs via `NEW_CONNECTION_ID` frames. The failure mode is: the server runs out of CIDs to issue (because `EndpointConfig` sets a low `cid_generator` limit or no fresh CIDs are issued), so the client is forced to reuse the current CID. The functional behavior is correct but the privacy property is broken.
+Prediction is designed for single-keystroke interactive input. Paste is a bulk operation. Mosh added explicit bracketed paste support (commit c6bf3a2) specifically because the prediction engine's behaviour on paste was visually worse than no prediction.
 
 **How to avoid:**
-- Ensure the server issues new CIDs proactively via quinn's built-in mechanism. The default `EndpointConfig` generates new CIDs automatically.
-- After a migration, verify (in tests with QUIC event logging enabled) that the new-path packets use a CID different from those on the old path.
-- Enable quinn's `qlog` feature during integration testing and inspect `connection_id_updated` events around path changes.
+- Detect bracketed paste mode (CSI ?2004h/l from the server): when the server has told the client it is in bracketed paste mode, suppress ALL prediction for the duration of the paste (between `\x1b[200~` and `\x1b[201~` in the input stream).
+- Detect non-bracketed bulk input heuristically: if more than N bytes arrive in the same tokio `select!` batch (e.g. > 4 bytes in one read), skip prediction for that batch and send as raw PTY data.
+- Emit a conservative epoch reset whenever more than one keystroke is queued.
 
 **Warning signs:**
-QUIC qlog shows no `new_connection_id` events around migration; the same CID appears in packets on both the old and new local address.
+Prediction runs on every byte of input without a bulk-input fast-path; bracketed paste mode not tracked in the terminal state model; no test for paste-mode prediction suppression.
 
 **Phase to address:**
-Phase 1 (migration) — validate via qlog inspection, not just functional correctness.
+Predictive echo phase (M4) — bracket paste mode detection is a required feature of the initial implementation, not an optional improvement.
 
 ---
 
-### Pitfall 4: Keep-Alive and Migration Interact — Session Drops Immediately After IP Change if Keep-Alive Is on the Wrong Side or Misconfigured
+### Pitfall 4: Epoch / Confirmation Desync After Datagram Loss
 
 **What goes wrong:**
-After migration, the old path is dead. If the server is sending keep-alive PINGs and the client is not, the server continues PINGing the old address (it may not have received the path-change notification yet). The client, now on a new address, gets no PING ACKs. Both sides' idle timers start counting. If the session idle timeout is shorter than the path-validation round trip, the session drops before migration completes.
+The server sends a terminal state-sync datagram confirming epoch N, predictions 0..K. The datagram is lost (QUIC datagrams are unreliable). The client never receives the confirmation. The prediction engine keeps predictions from epoch N tentative indefinitely, eventually expiring them after a timeout and resetting the epoch. Meanwhile the server, having seen epoch N confirmed, starts sending diffs assuming those cells are accepted. The client and server's models diverge: the client shows no prediction, the server believes confirmed predictions were applied. The session will eventually self-correct when the next confirmed datagram lands, but during the divergence window the screen is corrupted.
+
+A subtler variant: the client's epoch counter is incremented (due to a control character) between when a server datagram was sent and when it arrives. The server's confirmation carries epoch N but the client is now in epoch N+1. The confirmation is silently discarded. The N+1 predictions are never confirmed; they eventually expire. Each frame the user sees an underlined prediction appear, flicker, and disappear.
 
 **Why it happens:**
-Keep-alive is configured on the **client** per the v1.0 design. However, there is a gap: during the migration window, the server may not immediately begin sending on the new path. If the client has migrated but the keep-alive interval fires before path validation is complete (and the PING goes to the new path but gets no ACK because path is still validating), the client may prematurely declare timeout.
+QUIC datagrams are RFC 9221 best-effort. The prediction confirmation must handle loss gracefully. The naive approach is to confirm exactly one epoch/sequence per datagram — if that datagram is lost, the confirmation is simply never received.
+
+Mosh's SSP sends entire terminal state objects (not diffs of predictions), so the confirmation is implicit in the state rather than a separate acknowledgment message. A diff-based design must handle explicit confirmation loss.
 
 **How to avoid:**
-- Keep the client-side `keep_alive_interval` at 15 s and `max_idle_timeout` at 300 s (as established in v1.0), with the idle timeout large enough to survive multi-second path validation.
-- Do not reduce idle timeout for "faster failure detection" during migration testing — this is the most common footgun.
-- Set `max_idle_timeout` on both sides to at least 60 s during migration tests; reduce only after migration is proven stable.
+- Design the datagram payload to carry the FULL current terminal state (or enough of a diff that any single received datagram is self-consistent), not a delta that requires every prior datagram. "Latest-state-wins": each datagram is idempotent — receiving datagram N makes datagram N-1 irrelevant.
+- Confirmation of predictions should be implicit: when the client receives a server state that matches the predicted cell at position (row, col), that prediction is considered confirmed, regardless of epoch numbering. The epoch is a grouping hint, not a strict ack sequence.
+- The client must coalesce consecutive dropped confirmations rather than failing after one miss: wait at least 2 RTTs before resetting epoch on an unconfirmed prediction.
+- Write a test: simulate 30% datagram loss during a typing session; confirm no permanent screen corruption (may flicker, but must self-correct within 2 RTTs after loss stops).
 
 **Warning signs:**
-Session drops with `ConnectionError::TimedOut` within 1–5 s of an IP change; reducing keep-alive interval "fixes" it (a lie — you've just made keep-alive fire more often than the timeout).
+Each datagram carries only a delta that requires all prior datagrams to interpret; confirmation is a separate ack message (not implicit in state); epoch resets on first missed confirmation rather than after a timeout.
 
 **Phase to address:**
-Phase 1 (migration) — verify idle timeout survives a 5–10 s simulated path change window.
+Predictive echo phase (M4) — the datagram state format must be designed for idempotency before any prediction code is written.
 
 ---
 
-### Pitfall 5: Orphaned Session Memory Growth Without a Cap — Per-Identity Limit Is the Safety Valve
+### Pitfall 5: Datagram MTU Limits — Terminal State Objects Too Large
 
 **What goes wrong:**
-Server-side sessions persist after client disconnect (Mosh-style). Without a per-identity cap, a user who connects and disconnects repeatedly (or a client that crashes in a loop) accumulates orphaned sessions. Each holds a live PTY, a shell process, and buffered output. Memory grows without bound. At 10 sessions of ~5 MB each, that is 50 MB per user; at 100 sessions it is a denial-of-service against the server.
+The terminal state sync datagram exceeds `connection.max_datagram_size()`. Quinn returns `SendDatagramError::TooLarge`. The terminal state update is dropped. The prediction engine's state diverges from the server. On Windows (quinn_udp), the OS returns `WSAEMSGSIZE` for oversized UDP sends, which quinn surfaces as the same error but which also manifests as the existing v1.1 warning log that has been carried as tech debt.
 
 **Why it happens:**
-The idle timeout defaults to 0 (disabled) per the v1.1 design decision. This is correct for the UX goal but means no automatic session eviction. Without an explicit cap, every disconnect becomes a permanent resource leak until the shell inside exits.
+A full 80x24 terminal cell grid is 1920 cells. Even a compact binary encoding (cell = char + style flags) at 4 bytes/cell = 7.68 KB — well over the ~1200-byte QUIC datagram limit. Even a sparse diff can exceed the limit on a large terminal refresh (initial screen draw, vim `:e` file reload, `clear` + `cat big_file`).
+
+`max_datagram_size()` fluctuates during the connection lifetime as DPLPMTUD probes the path. The minimum guaranteed value is ~1200 bytes.
 
 **How to avoid:**
-- Implement the per-identity cap before enabling session persistence. The cap should be configurable (default 5 sessions per identity); any new connection that would exceed the cap must either reject the reattach, evict the oldest orphan, or be explicitly documented.
-- Store orphaned sessions in a `HashMap<SshIdentityFingerprint, VecDeque<OrphanedSession>>` with a max-len guard on insert.
-- Log a warning whenever the cap is hit; do not silently evict.
+- Never send the full terminal state grid as one datagram. Send only the **changed cells** since the last confirmed server state, capped at `max_datagram_size() - overhead` bytes.
+- Always check `connection.max_datagram_size()` before each `send_datagram()` call. If the diff exceeds the limit: (a) send the largest subset that fits, with sequence context so the receiver can apply it; or (b) fall back to sending a partial state snapshot (prioritize current cursor context) and let the full state arrive via the reliable stream sync on the next reattach.
+- For the `WSAEMSGSIZE` warning: it means the datagram was sized above the path MTU before DPLPMTUD had finished probing. Fix by capping outgoing datagrams at 1200 bytes during the first 10 datagrams (before DPLPMTUD converges) and then tracking `max_datagram_size()` dynamically.
+- Add a hard assertion in tests: `assert!(payload.len() <= 1100)` (reserve 100 bytes for QUIC framing overhead).
 
 **Warning signs:**
-Server memory grows monotonically under stress; `ps aux` shows many shell processes per SSH fingerprint; no limit in the orphan map data structure.
+Datagram payload serializes the full terminal grid regardless of size; `max_datagram_size()` is not called before `send_datagram()`; the `WSAEMSGSIZE` warning is suppressed rather than fixed; no test for datagram size compliance.
 
 **Phase to address:**
-Phase 2 (session persistence) — the cap must exist before first orphan is stored, not added later.
+Predictive echo phase (M4) — datagram size must be enforced in the first implementation of state sync. The `WSAEMSGSIZE` fix is bundled in the daily-driver hardening sub-phase.
 
 ---
 
-### Pitfall 6: Zombie Shell Processes When PTY Outlives the QUIC Connection
+### Pitfall 6: PTY Reader Zombie Race — `spawn_blocking` + `abort()` Cannot Interrupt a Blocked `read()`
 
 **What goes wrong:**
-The server's QUIC connection closes (clean or abrupt). The server stores the orphaned session (PTY + shell PID). If the shell eventually exits but the server never calls `Child::wait()` (or equivalent), the process enters zombie state: the OS keeps the exit-status entry in the process table. At scale, a server accumulates thousands of zombie entries.
+The current server code in `run_session` spawns a `spawn_blocking` task that calls `reader.read(&mut buf)` in a loop. When a session is orphaned or cleaned up, the code calls `output_reader.abort()`. But `abort()` on a `spawn_blocking` task has no effect on a task that is already executing — it can only cancel tasks that have not yet started. The blocking thread remains alive indefinitely, holding the PTY master reader fd open and consuming a thread from tokio's blocking pool.
+
+If the shell exits, the PTY master fd becomes EOF and the `read()` returns 0, unblocking the thread naturally. But while the shell is alive (orphaned session), the `spawn_blocking` thread is permanently blocked on `read()`. Under the default idle_timeout=0, this is every orphaned session — one permanently-stuck blocking thread per orphan.
+
+Two failure cascades: (1) tokio's blocking thread pool (`max_blocking_threads`, default 512) fills up over time with blocked PTY readers, new `spawn_blocking` calls start returning errors or hanging; (2) the PTY master fd is held open by the zombie reader thread even after the slot is evicted from the registry, preventing the MasterPty from closing, preventing SIGHUP from reaching the shell, and creating a genuine resource leak.
 
 **Why it happens:**
-`portable-pty`'s `Child` trait requires explicit `wait()` or `try_wait()` calls; there is no auto-reaping. The orphaned session struct holds the `Child` handle. If the `OrphanedSession` is dropped without calling `wait()`, the zombie persists until the server process exits.
+tokio's documentation explicitly states: "Tasks spawned using `spawn_blocking` cannot be aborted because they are not async. If you call abort on a spawn_blocking task, it will not have any effect once the task has started running." Blocking I/O (read on a PTY master fd) has no async cancellation point. The only way to unblock it is to close the fd it is reading from — which is what dropping `MasterPty` would do, but `MasterPty` is held by the session slot.
 
 **How to avoid:**
-- Run a background task (e.g. `tokio::spawn`) that periodically calls `child.try_wait()` on all orphaned sessions and removes entries where the shell has exited.
-- In `OrphanedSession`'s `Drop` impl, send SIGHUP to the shell if the shell is still running and the session is being evicted.
-- Write a test: create an orphaned session, let the shell exit, assert that `ps aux | grep Z` shows no zombie within 5 s.
+The fix is to use a separate signaling fd (a self-pipe or a non-blocking eventfd/pipe pair) to interrupt the blocking read. The pattern:
+1. Create a `(signal_read_fd, signal_write_fd)` pipe (or `eventfd` on Linux) alongside the PTY master fd.
+2. In the blocking reader thread: use `select()` or `poll()` on both the PTY master fd and the signal fd. When either is readable, check which: if PTY data, forward it; if signal fd, break out of the loop.
+3. To interrupt the reader: write one byte to `signal_write_fd` from async code. The blocked `read()` / `select()` wakes up and exits cleanly.
+4. The PTY master fd can then be closed by dropping `MasterPty`, which is now safe.
+
+Alternatively: use OS-level non-blocking mode on the PTY master fd combined with tokio's `AsyncFd` to poll the PTY fd from async code directly (requires `O_NONBLOCK` on the PTY master; `portable-pty` may need to expose this). This avoids the blocking thread entirely.
+
+A simpler stopgap that bounds the damage without fully fixing it: after orphaning a session, close the master reader fd clone used by the output pump (not the master fd in the slot, but the clone returned by `try_clone_reader()`). This causes the blocking `read()` to return `Err(EIO)` or `Ok(0)`, exiting the loop. The slot's `MasterPty` still holds the master fd open (so no SIGHUP), but the blocking thread exits. Then on reattach, `slot.clone_pty_reader()` gets a fresh reader clone.
 
 **Warning signs:**
-`ps aux | grep defunct` shows entries accumulating over time; shell exit is not logged by the server even though the PTY master fd is readable.
+`output_reader.abort()` is called on a `JoinHandle` from `spawn_blocking` and expected to interrupt a live read; no signal mechanism to wake the blocking thread; blocking thread count grows monotonically with orphaned sessions; PTY master fd is not closed on reattach (old reader clone still live).
 
 **Phase to address:**
-Phase 2 (session persistence) — implement the reaper task immediately alongside the orphan store.
+Daily-driver hardening sub-phase — this is the latent tech debt bug identified in the v1.1 audit. Must be the first thing addressed in M4 before any load testing.
 
 ---
 
-### Pitfall 7: SIGHUP Sent to Shell on Client Disconnect — Session Terminates Instead of Persisting
+### Pitfall 7: Interaction Between Datagram State Sync and Reliable-Stream Reattach Replay
 
 **What goes wrong:**
-The client QUIC connection closes. The server closes the PTY master fd (e.g. by dropping the `MasterPty` handle). The kernel detects no open master fd for the PTY and delivers SIGHUP to the shell (session leader). The shell exits. The session does not persist — the user's long-running job is killed.
+The existing reattach protocol (ROAM-02) replays reliable-stream chunks from the `SequencedOutputBuffer` to restore the client's view after reconnect. When datagram state sync is added in M4, the server maintains two parallel views of terminal state: the reliable-stream sequence (byte-exact replay buffer) and the datagram state (lossy terminal cell grid). On reattach, the client replays the reliable stream, which gives it the byte sequence but not necessarily the rendered terminal state (the sequence may include escape sequences that the client's new terminal session does not render identically).
+
+If the client also receives a datagram state before the reliable-stream replay is complete, it may apply the datagram state to a partially-replayed terminal, causing a visual discontinuity: cells from the datagram (server's current state) overwrite cells from the replay (server's historical state), producing a torn view.
 
 **Why it happens:**
-SIGHUP is sent by the kernel to the PTY session leader when the controlling terminal is "hung up" — which is exactly what happens when the last open master fd is closed. This is the correct Unix behavior for a session that ends, but the wrong behavior for a session that should persist.
+The reliable stream and datagrams are independent channels. After reattach, the reliable stream replay is sequential (one PtyData frame at a time); datagrams are continuous (server keeps sending state updates during replay). The race window is: server sends datagram at T=100ms, replay completes at T=150ms, client applies datagram to partial replay state.
 
 **How to avoid:**
-- Do not close the `MasterPty` handle when the client disconnects. Instead, move the `MasterPty` (and the `Child`) into the `OrphanedSession` struct. Keep the master fd open.
-- The server process must hold the master fd open for the lifetime of the orphaned session. This is what prevents SIGHUP.
-- Verify by running a shell that prints a message on SIGHUP (`trap 'echo got SIGHUP' HUP`), disconnecting the client, and asserting the message does not appear.
+- During reattach replay, suppress datagram state application until replay is complete. The client should ignore incoming datagrams between `ReattachOk` and the end of replayed `PtyData` frames (or until the client explicitly signals "replay complete").
+- Send a `ResumeComplete` frame (or repurpose `Ack` with a special flag) from client to server after all replayed frames are applied; the server then starts sending fresh datagrams.
+- Alternatively, after reattach the server sends one terminal state datagram AFTER the replay is complete (as the `ResumeComplete` trigger), giving the client a full authoritative state.
 
 **Warning signs:**
-Shell exits immediately when the client disconnects; log shows "session terminated" at client disconnect time rather than at shell exit time.
+Server sends datagrams immediately after `ReattachOk` without waiting for replay completion; client applies datagram state during replay; no `ResumeComplete` handshake in the reattach protocol.
 
 **Phase to address:**
-Phase 2 (session persistence) — this is the core correctness requirement; get it right before any reconnect work.
+Predictive echo phase (M4), specifically the sub-phase that integrates datagram state sync with existing reattach.
 
 ---
 
-### Pitfall 8: Cold Reattach Token Bound to Transport Layer, Not SSH Identity — Session Hijacking Risk
+### Pitfall 8: TOFU Pin Forgery Window — First Connection to a New Server Is Unprotected
 
 **What goes wrong:**
-The reattach token is issued to a connection (e.g. derived from the QUIC connection ID or a random nonce stored per-connection) rather than bound to the authenticated SSH identity. An attacker who learns the token (e.g. from a server log, a side channel, or a compromised network path) can reattach to the session without possessing the SSH private key.
+nosh uses TOFU for the server host key: on first connect, the server's SPKI is stored in `known_hosts` and trusted on all subsequent connections. If an attacker can intercept the very first connection (before the pin is stored), they can present a forged host key and the client will trust it. All subsequent connections use the forged pin. The session is now proxied through the attacker indefinitely.
+
+This is the canonical TOFU weakness — it does not protect against attackers present at first contact. SSH has the same weakness. The security doc must name it explicitly so operators know whether to pre-distribute host keys out-of-band.
 
 **Why it happens:**
-The natural implementation is: "on disconnect, store the session with a random token; on reattach, check the token." The token check replaces auth. This is wrong for nosh — the token must be a secondary check; the primary check is that the reconnecting client can prove it holds the same SSH identity.
+TOFU accepts anything on first contact by design. nosh's `known_hosts` implementation stores the server SPKI on first use and pins it thereafter (correct behaviour). The gap is the first contact window.
 
 **How to avoid:**
-- Reattach authorization is a **two-factor check**: (1) the new QUIC connection must complete the same mutual SSH-key TLS handshake as the original connection — the same `authorized_keys` check runs; (2) the `ReattachRequest` control message must carry the session token AND the SSH identity fingerprint from step 1 must match the fingerprint stored in the orphaned session.
-- The session token prevents reattaching to the wrong session (session selector), but the SSH handshake prevents theft.
-- If either check fails, close the connection with an error; do not reveal whether a session with that token exists (oracle leak).
+- The security doc must describe the TOFU threat model honestly: the system is secure against MITM on all connections AFTER the first, assuming the first contact was to the genuine server.
+- Provide a mechanism to pre-populate `known_hosts` (e.g. `nosh-keyscan` or manual copy of the server's host public key) before first connection for high-security deployments.
+- The client must display the server fingerprint on first connection and require explicit user confirmation before storing it (SSH-style `The authenticity of host '...' can't be established. [...] Are you sure you want to continue connecting (yes/no)?`). Silently auto-accepting is an anti-pattern.
+- For the threat model doc: categorize TOFU under "accepted residual risk with mitigation available (pre-distribution)" rather than "mitigated."
 
 **Warning signs:**
-Reattach is implemented without re-running the TLS mutual auth; a test that reattaches with a correct token but a different key succeeds.
+First connection silently stores the host key without user confirmation; no `nosh-keyscan` equivalent; security doc omits the TOFU first-contact window.
 
 **Phase to address:**
-Phase 3 (cold reattach) — the identity check must be in the design from the start; it cannot be retrofitted without changing the protocol.
+Security design pass phase — document the threat explicitly; UX of first-connection prompt belongs to a subsequent QoL phase.
 
 ---
 
-### Pitfall 9: Sequence-Number Resync Delivers Duplicate or Missing Output on Reattach
+### Pitfall 9: Predicted Echo as a Timing Side-Channel (Information Leak)
 
 **What goes wrong:**
-The client reconnects and sends a `ReattachRequest{last_seen_sequence: N}`. The server resumes from sequence N+1. However:
-- If the server's "sent up to sequence M" counter is not the same as "acknowledged by client up to sequence N" (because the sequence space is not continuously tracked), the server may re-send output the client already displayed, or skip output the client never received.
-- If sequence numbers are 32-bit and the session generates enough output between connections, wrap-around causes the comparison to be incorrect.
+The prediction engine immediately echoes predicted characters to the screen before receiving server confirmation. An attacker who can observe the client terminal output (e.g. screen-recording malware, physical shoulder surfing, or a compromised terminal multiplexer) can learn what the user is typing in real-time from the predicted echo, even if the reliable stream to the server is encrypted. For password prompts (which suppress echo on the server), the client must suppress prediction — if it does not, passwords are leaked visually at the client.
 
 **Why it happens:**
-Sequence numbers in a reattach protocol are easy to get wrong because they cover the boundary between two different QUIC connections — reliable delivery within a connection is handled by QUIC streams, but the cross-connection gap must be handled by the application layer.
+The prediction engine runs on the client before any data reaches the server. Passwords typed into a `noecho` tty (stty -echo) will NOT be echoed back by the server in the terminal state diffs — but a naive prediction engine will still echo them locally, since it does not know the server is suppressing echo.
 
 **How to avoid:**
-- Use a monotonically increasing, never-resetting u64 sequence number for server→client output. Assign sequence numbers per-byte or per-message at the application layer (not QUIC stream offset, which resets per connection).
-- The server maintains a ring buffer of the last N bytes of output (for scrollback on reconnect). On reattach, it replays from `last_seen_sequence + 1` up to the current tail.
-- On initial connection, `last_seen_sequence = 0` (no replay). On reattach, the client supplies its last acknowledged sequence.
-- Write a test: disconnect mid-stream during a large output run; reconnect; verify the combined output on the client matches the full server-side output with no gaps or duplicates.
+- Track echo state from the server's terminal model. When the server's diff indicates `stty -echo` mode (no character echo), the prediction engine MUST suppress local echo for typed characters. This is visible in the terminal state as the TTY echo flag or, more practically, as the absence of echoed characters in the server state diffs.
+- Conservatively: if the last server-confirmed state does not echo the previous typed character within one RTT, disable prediction for the current epoch. This naturally suppresses prediction during password prompts.
+- This is Mosh's behaviour: "Mosh does not make predictions that would echo back keystrokes in contexts where the remote is not echoing."
+- Write a test: start a `read -s` (noecho) prompt; type characters; confirm the client terminal model shows no predicted characters for those keystrokes.
 
 **Warning signs:**
-Duplicate lines appear after reconnect; output from before disconnect is missing; scrollback is inconsistent between connect and reconnect paths.
+Prediction always runs regardless of server echo state; no test for password prompt echo suppression; prediction epoch is not reset when server echo is disabled.
 
 **Phase to address:**
-Phase 3 (cold reattach) — sequence numbering must be designed before any reconnect message is defined.
+Predictive echo phase (M4) — this is a security requirement of the prediction feature itself, not a separate hardening step. Must be in the initial design.
 
 ---
 
-### Pitfall 10: Reattach Race — Two Clients Claim the Same Session
+### Pitfall 10: Security Design Doc Omits the Datagram Injection / Replay Surface
 
 **What goes wrong:**
-A client disconnects but the QUIC connection is not yet fully dead (still in the idle-timeout window). A second client (or the same client reconnecting quickly) sends a `ReattachRequest` for the same session. Both connections are briefly active; the old connection's event loop is still reading from the PTY master fd. The shell receives garbled input from two readers; the new client gets incomplete output.
+The security threat model covers the reliable-stream protocol (auth, reattach token, session hijacking) thoroughly but treats datagram session traffic as equivalent in security to reliable streams. QUIC datagrams ARE authenticated and encrypted by TLS 1.3 (same connection), so injection from outside the connection is not possible. However, two specific threats must be explicitly documented:
 
-**Why it happens:**
-The original connection is in a zombie state: the application layer has not yet received `ConnectionError` (the idle timeout hasn't fired). The server's orphan store doesn't yet have the session (it is still attached to the old connection). The new reattach request arrives before the original disconnect is fully processed.
+1. **Replay within a session**: QUIC provides replay protection per-connection via packet number space. A datagram sent in session epoch N cannot be replayed as epoch N+1 by an on-path attacker (QUIC's crypto handles this). The doc should state this explicitly to close the question.
+
+2. **Stale state application**: A delayed datagram (QUIC may deliver old datagrams, and there is no strict ordering guarantee between datagrams and streams) carrying an old terminal state diff may be applied after a newer diff, moving the terminal model backwards. This is a correctness bug, not a crypto issue, but the security doc should note that datagram-carried state must carry a monotonic sequence number so the client can discard stale updates.
 
 **How to avoid:**
-- The server must atomically transition a session from "connected" to "orphaned" to "reconnected." Use a state machine with explicit states: `Active(connection_id)`, `Orphaned(token, fingerprint)`, `Reconnecting(token, fingerprint, new_connection_id)`.
-- Only transition to `Reconnecting` if the session is in `Orphaned` state. If `Active`, send a `ReattachConflict` error.
-- On the original connection's final close (however it arrives), the state transition from `Active` to `Orphaned` must run exactly once.
-- A session in `Active` state is not reattachable — the reattach request must wait until the session becomes `Orphaned` or fail fast.
+- The datagram state payload must include a monotonic sequence number (or timestamp). The client discards any datagram whose sequence is not greater than the last applied datagram.
+- The security doc should explicitly address: (a) QUIC's TLS 1.3 provides datagram authentication (no external injection); (b) QUIC per-packet replay protection applies to datagrams; (c) application-layer monotonic sequencing handles within-connection stale delivery.
+- Write a test: send two datagrams with seq=10 then seq=5; confirm the client applies only seq=10 (seq=5 is discarded as stale).
 
 **Warning signs:**
-Two simultaneous connections produce garbled shell output; reattach succeeds when the original client is still connected; no state machine around session lifecycle.
+Datagram state carries no monotonic sequence number; security doc does not address datagram replay/staleness; datagrams treated as if ordering is guaranteed.
 
 **Phase to address:**
-Phase 3 (cold reattach) — the state machine is the protocol; implement it before any reconnect logic.
+Both predictive echo phase (implement monotonic seq) and security design pass phase (document the analysis).
 
 ---
 
-### Pitfall 11: `Session.identity` Fingerprint Captured Before Handshake Completes
+### Pitfall 11: Security Design Doc Omits Privilege Model Gap (Server Runs as the Connecting User)
 
 **What goes wrong:**
-The `Session.identity` field is populated from the peer cert during connection setup, but the code path that reads `connection.peer_identity()` or the equivalent is called before the TLS handshake completes. The result is `None` or the previous connection's identity (if the connection object is reused). Reattach authorization then either panics, silently succeeds with no identity check, or compares against stale data.
+The nosh server runs as the single authenticated user — there is no privilege drop, no separate daemon process, no privilege separation (as SSH's `sshd` achieves with `privsep`). The security doc must name this clearly:
 
-**Why it happens:**
-`quinn`'s `Connecting::await` completes when the QUIC handshake finishes, but the peer certificate is not available until `connection.peer_identity()` is called after `Connecting` resolves. If the auth code calls this method too early (on a `Connecting` future, not a fully established `Connection`), it gets nothing or garbage.
+- The server process has full access to the user's files, environment, and processes — compromising the nosh server binary or exploiting a bug in the session handler is equivalent to full user compromise (not root, but the full user account).
+- There is no MAC/SELinux/AppArmor sandboxing on the server process in the default configuration.
+- The server does NOT run as root and cannot acquire root, so privilege escalation to root requires an additional step (sudo bug, kernel exploit, etc.).
+
+The risk is not that this is wrong — it is the correct design for a single-account shell tool — but that the threat model doc must state it explicitly so operators can audit appropriately.
 
 **How to avoid:**
-- Extract `Session.identity` exactly once, immediately after `connecting.await?` resolves to a `Connection`, before any application data is processed.
-- Encapsulate the extraction in a `NoshSession::from_authenticated_connection(conn: Connection) -> Result<NoshSession>` constructor that extracts and validates identity, returning `Err` if absent.
-- Write a test that asserts `session.identity` equals the fingerprint of the key that was presented in the handshake (not just that it is non-empty).
-- Never allow a `Session` struct to exist without a populated identity field — use a type-level guarantee (the `identity` field is not `Option<T>`, it is `T`, populated at construction).
+The security doc must include a "Privilege Model" section that:
+1. States the server runs as the authenticated user (no privilege drop, no daemon, single-account model).
+2. Contrasts this with sshd's privsep model (which nosh intentionally does not implement).
+3. Notes that exploiting a bug in the nosh server gives the attacker the same access as the authenticated user.
+4. Notes that the pre-auth connection handler (before `handle_connection` dispatches to `run_session`) runs with the same user permissions as the authenticated session — there is no privsep layer separating pre-auth from post-auth code.
+5. Lists the security mitigations in place: pre-auth DoS cap, auth timeout, env sanitization, TLS mutual auth.
 
 **Warning signs:**
-`session.identity` is `Option<_>` and code does `unwrap_or_default()` or `unwrap_or(EMPTY)`; identity is populated in a separate `init()` method called after construction.
+Security doc says "no privilege escalation" without explaining the privilege model; threat model does not address the absence of privsep; no "privilege model" section at all.
 
 **Phase to address:**
-Phase 4 (identity threading) — this unblocks the rest of v1.1; address in the first phase before migration or persistence work.
+Security design pass phase — this is a documentation gap, not a code change.
 
 ---
 
-### Pitfall 12: Windows On-Disk Private Key — Key Material Remaining in Process Memory After Use
+### Pitfall 12: Windows Cross-Compile CI Gate — False-Green from Build-Only Check
 
 **What goes wrong:**
-The Windows client reads the private key from disk with `PrivateKey::read_openssh_file()`, uses it to sign the TLS handshake, and then drops the `PrivateKey` struct. However, due to Rust's memory model (no guarantee of memory scrubbing on drop by default), the raw key bytes may remain in process memory and be visible in a crash dump, core dump, or via process memory inspection.
+The current CI gate compiles the Windows client cross-target (`x86_64-pc-windows-gnu` or `-msvc`) but does not run any tests on a real Windows runner. The build passes because the Rust type system catches most cross-platform errors at compile time. But runtime Windows-specific behaviour (codepage, VT processing, resize events, socket errors including `WSAEMSGSIZE`) is not tested. The CI gate gives false confidence: "it builds, so it works on Windows." Real bugs that only manifest at runtime on Windows remain undetected.
 
 **Why it happens:**
-`ssh-key`'s `PrivateKey` struct uses `Zeroizing<Vec<u8>>` for key material internally, which scrubs memory on drop. However, the decrypted key bytes may have been copied into intermediate buffers (e.g. during passphrase decryption, DER encoding, or signature algorithm lookup) that are not zeroized. This is a best-effort mitigation, not a guarantee.
+Running a Windows job in CI requires a `windows-latest` GitHub Actions runner. Cross-compiling from Linux is cheaper and faster. Developers set up cross-compilation as the CI gate and never wire up an actual Windows job because they cannot test it locally.
+
+The v1.1 audit noted: "Windows cross-compile CI gate exists but has never run (no git remote configured)."
 
 **How to avoid:**
-- Sign only inside a narrow scope: load, sign, drop immediately. Do not hold the `PrivateKey` across async await points.
-- Use `let key = ...; let sig = key.sign(...)?;` — the key is dropped at end of the block, not after the connection's lifetime.
-- For passphrase-protected keys, use `PrivateKey::decrypt()` inside the same narrow scope.
-- Explicitly document that Windows key-file signing is a temporary exception to the "never handle the private key directly" invariant, with a code comment pointing to the M5/M6 Windows agent integration path.
-- Do not log, trace, or serialize the private key at any level.
+- Add a `windows-latest` GitHub Actions job that runs `cargo test` on the Windows runner — not just `cargo build`. At minimum, run the unit tests that do not require a real network connection (`cargo test -- --skip integration`).
+- The cross-compile job on Linux is kept as a fast smoke check. The Windows native job is the functional gate.
+- Pin the Windows toolchain version in `rust-toolchain.toml` so runner drift does not silently change the build environment.
+- Add the `MSVC` or `GNU` target explicitly in `rust-toolchain.toml` or the workflow file, not as an ad-hoc `rustup target add`.
+- Verify the git remote is configured and the CI workflow file is present and syntactically valid before treating this as complete.
 
 **Warning signs:**
-`PrivateKey` stored in a struct field that lives for the connection duration; passphrase or key bytes appear in `tracing` spans.
+CI only runs cross-compile from Linux; no `windows-latest` runner job; no `rust-toolchain.toml` pinning the toolchain; git remote not configured (the current known state).
 
 **Phase to address:**
-Phase 5 (Windows client) — this design discipline must be baked in before first implementation; not a refactor.
-
----
-
-### Pitfall 13: Windows File Permission Check for Private Key Uses `std::fs::Permissions` — ACLs Not Checked
-
-**What goes wrong:**
-The Windows client loads the private key from disk and optionally warns if permissions are too open. Using `std::fs::metadata().permissions().readonly()` only checks `FILE_ATTRIBUTE_READONLY` — it does not evaluate Windows ACLs. A key file readable by other users on the system (via ACL) passes the check and no warning is issued.
-
-**Why it happens:**
-`std::fs::Permissions` on Windows wraps `FILE_ATTRIBUTE_READONLY` only. The Rust standard library explicitly documents that it does not read ACLs. OpenSSH for Windows (`Win32-OpenSSH`) uses `GetNamedSecurityInfo` + `GetSecurityDescriptorDacl` to verify that only the key owner has access. Rust's `std::fs` cannot replicate this.
-
-**How to avoid:**
-- For v1.1, emit a warning at startup if the key file is world-readable by `std::fs` check, but clearly document that the ACL check is not implemented and the user should manually verify.
-- Do not claim the permission check is comprehensive; treat it as best-effort.
-- Optionally use `windows-acl` crate or raw Win32 API (via `windows` crate) for a real ACL check — but this is optional scope for v1.1.
-- Document this gap as a known limitation in the Windows client.
-
-**Warning signs:**
-Code uses `fs::metadata().permissions().readonly()` and claims it has validated key security; no documentation of the ACL limitation.
-
-**Phase to address:**
-Phase 5 (Windows client) — at minimum emit the best-effort warning and document the gap.
-
----
-
-### Pitfall 14: Windows Client Resize Events — WINDOW_BUFFER_SIZE_RECORD vs. SIGWINCH
-
-**What goes wrong:**
-The Windows client needs to detect terminal resize and send a resize message to the server. On Linux, this is `SIGWINCH`. On Windows, there is no `SIGWINCH` — resize events arrive as `WINDOW_BUFFER_SIZE_RECORD` records in `ReadConsoleInputW`, or in VT mode are not delivered at all. A Windows client that waits for `SIGWINCH` (or the `crossterm` Unix path) never sends resize messages; the server PTY stays at its initial size.
-
-**Why it happens:**
-`crossterm` handles resize events on both platforms, but the mechanism is fundamentally different. On Windows, resize events can be confused with scroll events (`WINDOW_BUFFER_SIZE_RECORD` is emitted for both). Additionally, `crossterm::terminal::size()` in some Windows Terminal versions returns the buffer size (including scrollback) rather than the viewport size when the terminal is not in VT mode.
-
-**How to avoid:**
-- Use `crossterm::event::EventStream` to poll resize events — it abstracts the platform difference. On Windows, this polls `ReadConsoleInputW` internally.
-- After any resize event, double-check the dimensions with `crossterm::terminal::size()` and send the authoritative size, not the event's delta.
-- Test resize behavior specifically inside Windows Terminal (not just in cmd.exe or PowerShell): start a session, resize the window, verify the server PTY reflects the new size within 100 ms.
-- Do not implement a SIGWINCH listener on Windows — it does not exist.
-
-**Warning signs:**
-Resize events are never sent from the Windows client; `vim` or `less` does not reflowing content on terminal resize; resize works on Linux client but not Windows.
-
-**Phase to address:**
-Phase 5 (Windows client) — write a resize integration test that is Windows-only.
-
----
-
-### Pitfall 15: Windows Client CRLF / Codepage — Raw Mode Breaks or Output Is Garbled
-
-**What goes wrong:**
-The Windows client enters raw mode (disables `ENABLE_PROCESSED_INPUT` and `ENABLE_LINE_INPUT`). The server sends VT/ANSI escape sequences for the remote terminal. Windows Terminal handles these natively, but cmd.exe and older PowerShell hosts do not enable `ENABLE_VIRTUAL_TERMINAL_PROCESSING` by default. Result: escape sequences are printed verbatim rather than interpreted, and the terminal output is unreadable garbage.
-
-**Why it happens:**
-`ENABLE_VIRTUAL_TERMINAL_PROCESSING` must be explicitly set on the Windows console output handle before escape sequences are interpreted. `crossterm` sets this flag when entering raw mode, but only for the console it controls — not for inherited console handles. Additionally, the default Windows codepage is not UTF-8 (it is typically CP1252 or similar); non-ASCII characters in the remote shell output are misinterpreted.
-
-**How to avoid:**
-- Call `crossterm::terminal::enable_raw_mode()` — it handles `ENABLE_VIRTUAL_TERMINAL_PROCESSING` and `ENABLE_PROCESSED_OUTPUT` flags.
-- At startup, check the current output codepage via `GetConsoleOutputCP()` (accessible via the `windows` crate) and emit a warning if it is not 65001 (UTF-8). Ideally, set it via `SetConsoleOutputCP(65001)` or instruct the user.
-- Test the client in both Windows Terminal and a legacy cmd.exe window to verify both work (or at least fail gracefully).
-
-**Warning signs:**
-Escape sequences printed as literal `^[[H^[[2J` strings; non-ASCII characters replaced with `?` or `â€`; output is correct in Windows Terminal but garbled in cmd.exe.
-
-**Phase to address:**
-Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
+Daily-driver hardening sub-phase — wire this early so subsequent M4 work is validated on Windows from the start.
 
 ---
 
@@ -336,13 +307,15 @@ Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| Skip per-identity session cap for now | Simpler orphan store | Unbounded memory growth under crash/reconnect abuse | Never; cap must exist before first orphan is stored |
-| Session state machine as ad-hoc `Option<Connection>` flags | Simpler code | Reattach race condition; two clients one session | Never; use explicit state enum |
-| Hold `PrivateKey` for the lifetime of the connection | Simpler key-loading code | Key material in memory longer than needed; visible in dumps | Never; narrow-scope load-sign-drop |
-| Check file permissions with `std::fs` on Windows | Cross-platform code path | ACLs not checked; false security assurance | Acceptable for v1.1 with explicit documentation |
-| `crossterm` resize polling without double-check of `terminal::size()` | Simpler event loop | Stale size sent to server on fast consecutive resizes | Only if resize accuracy is not critical |
-| Reattach token without re-running SSH auth | Simpler reconnect flow | Session hijacking if token is leaked | Never; auth runs on every connection |
-| Store orphaned sessions in a global `Mutex<HashMap>` | Trivial to implement | Contention at scale; hard to integrate per-identity cap | Only if sessions per server is very small (< 10) |
+| Predict on all input without epoch reset on cursor-move | Simpler prediction engine | Corrupted screen in vim/less/htop; worse than no prediction | Never; epoch-reset-on-cursor-move is the minimum viable design |
+| Skip Unicode width check in prediction | Simpler code | CJK cursor drift; accumulating prediction errors for all CJK users | Never for CJK-bearing products; acceptable for ASCII-only spike |
+| Predict on paste (no bulk input detection) | Simpler code | Jarring screen flicker on paste; prediction causes visible regression | Never; paste suppression must be in the initial design |
+| Full terminal grid in each datagram | Simplest state sync | Always exceeds MTU (>7 KB); mandatory `TooLarge` errors | Never; must use diffs with size cap |
+| `output_reader.abort()` to clean up spawn_blocking PTY reader | One-line cleanup | Abort has no effect; zombie thread per orphan; blocking pool exhaustion | Never in production; spike use only |
+| Build-only CI gate for Windows | Cheaper CI | False confidence; runtime Windows bugs slip through | Only until a real Windows runner job is added (short-term acceptable) |
+| Security doc omits TOFU first-contact gap | Simpler doc | Operators don't know to pre-distribute host keys | Never; TOFU gaps must be named in the security doc |
+| No echo-state tracking in prediction (predict on noecho prompts) | Simpler prediction | Passwords leaked visually at client | Never; this is a security requirement |
+| Datagram state carries no monotonic sequence number | Simpler format | Stale datagrams corrupt terminal state; no defence against delayed delivery | Never; monotonic seq is required for correctness |
 
 ---
 
@@ -350,15 +323,14 @@ Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 | Integration | Common Mistake | Correct Approach |
 |-------------|----------------|------------------|
-| quinn migration | Not setting `ServerConfig::migration(true)` explicitly | Assert migration is enabled in server config constructor; add integration test |
-| QUIC path validation | Assuming anti-amplification is transparent | Factor in 1–2 RTT stall after migration in output-heavy test assertions |
-| Session orphan store | Inserting session before verifying identity is threaded | Use `NoshSession::from_authenticated_connection()` constructor that panics if identity absent |
-| Cold reattach auth | Checking token only, not re-running SSH handshake | Two-factor check: SSH handshake + token + identity fingerprint match |
-| Windows key loading | Holding `PrivateKey` in a `Connection` struct | Narrow scope: load in signing function, drop before first `await` |
-| Windows resize | Using `SIGWINCH` handler on Windows | Use `crossterm::event::EventStream` which abstracts platform |
-| Windows raw mode | Assuming `enable_raw_mode()` handles VT processing | Test in both Windows Terminal and cmd.exe; VT processing may be off in legacy hosts |
-| Zombie orphan cleanup | No periodic `try_wait()` on orphaned child processes | Background reaper task polls all orphaned sessions |
-| Sequence resync | Using QUIC stream offsets as sequence numbers | Use application-layer u64 monotonic counter; QUIC offsets reset per connection |
+| vte `Perform` trait for terminal state | Treating control sequences as opaque bytes in prediction | Parse with vte; track cursor position, scroll regions, alternate screen mode, and echo state to gate prediction |
+| portable-pty reader + spawn_blocking | Calling `abort()` to interrupt blocked read | Use a self-pipe / eventfd signal fd so the blocking thread wakes up on demand; close the reader clone on orphan |
+| QUIC datagrams + terminal state | Sending full terminal grid per datagram | Send only changed cells; cap at `max_datagram_size() - 100`; check before every send |
+| Reattach replay + datagram sync | Server sends datagrams during replay window | Client ignores datagrams until replay is complete; server waits for `ResumeComplete` signal |
+| Prediction + noecho (password) prompts | Prediction runs regardless of TTY echo state | Track server echo state; suppress prediction when server echo is disabled |
+| Windows CI gate | Cross-compile only from Linux | Add `windows-latest` native runner job with `cargo test`; pin toolchain in `rust-toolchain.toml` |
+| Mosh-style prediction + fish/zsh autosuggestions | Prediction inserts before autosuggestion rather than overwriting it | Epoch-reset on any input that changes cursor context; let server correction handle the rest |
+| Token rotation on reattach send failure | Rotate token before confirming send → client never receives new token | Mint candidate, send, then commit (W1 pattern — already implemented in v1.1, preserve on any refactor) |
 
 ---
 
@@ -366,10 +338,11 @@ Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| PATH_CHALLENGE flood attack per Seemann 2023 | Server memory grows unbounded if attacker sends many PATH_CHALLENGEs | quinn 0.11.x limits queued PATH_RESPONSE frames to 256 per connection — verify the version in use includes this fix | Under deliberate attack; quinn >= 0.10.4 has the fix |
-| Orphaned session ring buffer unbounded growth | Server memory grows proportional to shell output × session count | Cap ring buffer at a fixed size (e.g. 64 KB per session); this bounds the reattach replay size | When many sessions are orphaned and shells produce high output |
-| Resize coalescing not applied on Windows | Resize flood on window drag on Windows too | Apply same 30–50 ms debounce as Linux path | Any window drag on Windows client |
-| Cold reattach replays entire ring buffer on reconnect | Reconnect latency grows with buffer size | Only replay unacknowledged bytes (from `last_seen_sequence`), not the full buffer | If ring buffer is large and reconnect is frequent |
+| Datagram sent once per PTY output chunk | One datagram per `PtyData` frame even for small chunks | Coalesce PTY output chunks into one datagram per tick (e.g. drain `out_rx` channel, build one diff, send one datagram per frame interval ≈ 16 ms) | Under high-throughput output (large file cat) |
+| Datagram encode/decode on every frame regardless of change | Wasted work on quiet sessions | Track dirty cells; only encode when something changed | Always on sessions where nothing is happening |
+| Blocking pool exhaustion from zombie PTY readers | New `spawn_blocking` hangs; server unresponsive | Fix PTY reader interrupt (Pitfall 6) | At ~512 orphaned sessions (tokio default blocking pool limit) |
+| vte parsing on both client and server for state sync | Double parse of every escape sequence | The server-side vte parse is already required (for the state diff); the client parse is for echo-state tracking; share the same parse tree if possible | With large escape sequence bursts (full-screen redraws) |
+| Wide char detection on every keystroke | microseconds per check but called O(1) per key | Acceptable cost; `unicode_width` is a pure lookup table | Not a real problem; mention for completeness |
 
 ---
 
@@ -377,13 +350,13 @@ Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 | Mistake | Risk | Prevention |
 |---------|------|------------|
-| Reattach token replaces SSH auth (not supplements it) | Token theft = session hijacking without key possession | SSH handshake runs on every connection; token is a session selector only |
-| Session token logged or included in error messages | Token exposure via log aggregators | Never log the token; use session IDs (non-secret) for logging |
-| Oracle: reveal whether session token exists on mismatch | Attacker enumerates valid tokens | Return same error for "bad token" and "bad identity" |
-| Windows private key in memory beyond signing scope | Key visible in dumps/memory probes | Narrow scope; `Zeroizing` types in `ssh-key` help but are not a guarantee |
-| Windows key file world-readable (ACL gap) | Any user on the system can read the private key | Warn if `FILE_ATTRIBUTE_READONLY` is not set; document ACL limitation |
-| CID reuse across migration paths | Correlates user across networks | Rely on quinn's automatic CID rotation; verify with qlog |
-| Orphaned session not bound to SSH identity | Any authenticated user can reattach to any orphan | Identity fingerprint stored in `OrphanedSession`; checked on reattach |
+| Predict on `noecho` (password) prompts | Passwords displayed in plaintext at the client terminal | Track server echo state; suppress prediction when echo is disabled (Pitfall 9) |
+| Security doc omits TOFU first-contact vulnerability | Operators don't pre-distribute host keys; MITM on first connect is undetected | Name the TOFU gap explicitly with mitigation (Pitfall 8) |
+| Security doc treats datagram channel as equivalent to reliable stream without analysis | Stale-delivery and "is QUIC replay protection sufficient?" left unanswered for readers | Document QUIC TLS 1.3 datagram authentication + per-packet replay protection + application-layer monotonic seq (Pitfall 10) |
+| Reattach token leaked via failed-send recovery (W1 bug pattern) | Client holds old token; server rotated → session permanently un-reattachable after one failed send | Mint candidate, send, THEN commit — preserve the v1.1 W1 fix across any refactor of the reattach path |
+| Datagram state sync bypasses reattach two-factor auth | An attacker who corrupts a datagram mid-session gets... nothing extra (QUIC auth applies); document this explicitly | Note in security doc that datagrams share the TLS 1.3 session — same auth as streams |
+| Security doc omits privilege model (no privsep) | Operators assume separation between pre-auth and post-auth code | Explicit "Privilege Model" section describing single-account, no-privsep design (Pitfall 11) |
+| Prediction epoch state logged with token context | Token bytes appear in prediction debug logs | Prediction state logs must not include reattach token; log only epoch number and fingerprint |
 
 ---
 
@@ -391,29 +364,28 @@ Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 | Pitfall | User Impact | Better Approach |
 |---------|-------------|-----------------|
-| No resize event sent on cold reattach | Remote editor/pager wrong size after reconnect | Send a resize message as part of the `ReattachRequest` or immediately after reattach completes |
-| Reattach latency hides behind "connecting..." | User unsure if reconnect is working or hung | Emit a brief client-side status message: "Reconnecting..." then "Session resumed." |
-| Windows codepage warning on every startup | Annoys users who already have UTF-8 set | Only warn once; cache the check; suppress if codepage is already 65001 |
-| Orphan eviction kills a running job silently | User loses work | Log a message when an orphan is evicted due to the per-identity cap; make the cap configurable |
-| Session token visible in process arguments | Leaks token to other local users via `ps` | Pass token via control message on the QUIC stream, not as a command-line argument |
+| Prediction visible in full-screen apps (vim, less) | Screen corruption on every keystroke; worse than no prediction | Epoch reset on any cursor-move or alternate-screen sequence; go dark until confirmed |
+| No underline on tentative predictions | User cannot distinguish predicted text from confirmed text | Dim/underline predicted cells (Mosh behaviour); remove styling on confirmation |
+| Prediction immediately displayed with no delay threshold | On low-latency local network, prediction makes screen flicker visually | Use adaptive threshold: only display predictions when RTT > ~40 ms (Mosh `--predict=adaptive` mode) |
+| Full-screen repaint flicker on paste | Paste followed by a full-screen correction 1 RTT later | Suppress prediction on paste (Pitfall 3); use bracketed paste detection |
+| No connection-loss visual indication during datagram-only window | User doesn't know if their input is being received when reliable stream is gone but datagrams still flow | Connection-loss notification must fire when reliable stream is lost even if datagrams continue; reliable stream is the auth-checked channel |
+| WSAEMSGSIZE warning in log every session on Windows | Log noise; operators file bug reports about "errors" that aren't errors | Fix the MTU sizing (Pitfall 5) so the warning never fires; don't suppress it |
 
 ---
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **Migration enabled:** Assert `ServerConfig::migration(true)` is set; run a test that migrates the client IP and verifies the session survives.
-- [ ] **CID rotation on migration:** Inspect QUIC qlog; verify new CIDs are used on the new path.
-- [ ] **Anti-amplification stall test:** Run a large server→client output stream through a simulated migration; assert no pause longer than 3 RTTs.
-- [ ] **Session persists through disconnect:** Disconnect client mid-session; verify server-side shell is still running; verify no SIGHUP delivered.
-- [ ] **Per-identity cap enforced:** Create more sessions than the cap for one identity; verify new connections are rejected or oldest orphan is evicted.
-- [ ] **Zombie reaper running:** Let multiple orphaned shells exit; within 10 s, verify `ps aux | grep defunct` shows no zombies.
-- [ ] **Reattach requires SSH re-auth:** Reattach with a valid token but a different key; verify the connection is rejected.
-- [ ] **Reattach with correct identity and token succeeds:** Full happy-path reconnect test; verify output is replayed correctly from `last_seen_sequence`.
-- [ ] **Sequence resync: no duplicates, no gaps:** Disconnect during large output; reconnect; diff combined output against full server-side log.
-- [ ] **Identity threaded:** After handshake, log `session.identity`; assert it equals the expected SSH fingerprint.
-- [ ] **Windows key-file narrow scope:** Confirm `PrivateKey` is not stored in any long-lived struct; code review the signing path.
-- [ ] **Windows resize works:** In Windows Terminal, resize the window during a running session; verify the server PTY reflects the new size.
-- [ ] **Windows VT processing:** Run the client in cmd.exe; verify escape sequences are interpreted, not printed literally.
+- [ ] **Prediction in vim:** Open vim, type `iHello<Esc>`, confirm no corrupt cells appear in the client terminal model at any point during typing (prediction must be suppressed in cursor-addressing mode).
+- [ ] **Wide char cursor column:** Type `你好` into a predicted shell; verify cursor column is reported correctly (2 columns per character, not 1).
+- [ ] **Paste suppression:** Enable bracketed paste mode, paste 50 characters, confirm no predicted cells appear between `\x1b[200~` and `\x1b[201~`.
+- [ ] **Datagram size:** Assert every outgoing datagram payload is `<= max_datagram_size() - 100` bytes; add this assertion in test/debug builds.
+- [ ] **WSAEMSGSIZE resolved:** No `WSAEMSGSIZE`/`TooLarge` log line appears during a normal session on Windows.
+- [ ] **PTY reader thread exits on orphan:** After orphaning a session, verify the `spawn_blocking` reader task exits within 1 s (the signal pipe woke it up); verify blocking thread count does not grow with orphan count.
+- [ ] **Password prompt no echo:** Start `read -s` in the shell; type characters; confirm client terminal model shows NO predicted characters.
+- [ ] **Datagram staleness rejected:** Send two datagrams in reverse order (seq=10 then seq=5); confirm client applies only seq=10.
+- [ ] **Reattach during datagram sync:** Connect, trigger datagram state, disconnect, reattach; confirm replay completes before any post-reattach datagram is applied.
+- [ ] **Windows CI runs:** A `windows-latest` GitHub Actions job runs `cargo test` (not just `cargo build`) and passes.
+- [ ] **Security doc covers:** TOFU first-contact gap (with mitigation), privilege model (no privsep), datagram replay analysis, echo-suppression for passwords, reattach two-factor design.
 
 ---
 
@@ -421,13 +393,14 @@ Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| `ServerConfig::migration` off — sessions drop on IP change | LOW | Add `.migration(true)` to server config; re-run migration integration test |
-| Orphan SIGHUP kills shell on disconnect | HIGH (protocol redesign) | Restructure session ownership: `MasterPty` must be moved to orphan struct, not dropped |
-| Reattach token without SSH re-auth shipped | HIGH (security incident) | Add SSH handshake check before honoring token; audit any sessions that reattached during the window |
-| Sequence number wrap-around causes output corruption | MEDIUM | Upgrade u32 to u64; bump protocol version; add wrap detection test |
-| Windows key file held too long — key in memory dump | MEDIUM | Refactor signing path to narrow scope; key-dropping is a code change only |
-| Zombie accumulation — reaper not implemented | MEDIUM | Add `try_wait()` background task; force-kill orphans above a threshold |
-| Windows VT processing not enabled — garbled output | LOW | `crossterm::terminal::enable_raw_mode()` sets the flag; verify it is called before first byte of output |
+| Prediction in cursor-addressing apps ships corrupted | HIGH (UX regression, requires protocol change) | Add epoch-reset-on-cursor-move; requires prediction format revision; client-only change |
+| Wide char prediction cursor drift ships | MEDIUM (affects CJK users, hard to test without CJK environment) | Add `unicode-width` column advance; client-only change; deploy new client binary |
+| PTY reader zombie race fills blocking pool | MEDIUM (server degradation, not crash) | Implement self-pipe interrupt; requires server restart to clear blocked threads |
+| Password echo leak (noecho prediction) ships | HIGH (security incident for password users) | Disable prediction entirely as emergency hotfix; then implement echo-state tracking |
+| WSAEMSGSIZE / datagram MTU bug ships | LOW (warning log, not functional breakage) | Fix outgoing datagram size cap; Windows-only change |
+| Windows CI false-green masks runtime bugs | MEDIUM (bugs discovered in production) | Add Windows runner job; run existing tests; fix any failures found |
+| Security doc omits TOFU gap | MEDIUM (operator misunderstanding) | Update doc; no code change needed |
+| Token rotation W1 pattern broken during refactor | HIGH (sessions permanently un-reattachable after one failed send) | Revert refactor; restore mint-send-commit order |
 
 ---
 
@@ -435,41 +408,41 @@ Phase 5 (Windows client) — test in both Windows Terminal and a legacy host.
 
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| `ServerConfig::migration` not set | Phase 1 (migration) | Integration test: IP change during active session; session must survive |
-| Anti-amplification stall after migration | Phase 1 (migration) | Large-output stream test through migration event |
-| CID linkability across migration | Phase 1 (migration) | qlog inspection: new CIDs on new path |
-| Keep-alive/idle timeout misconfig during migration | Phase 1 (migration) | 5–10 s simulated path change; no `TimedOut` |
-| Orphaned session memory growth (no cap) | Phase 2 (session persistence) | Stress test: many disconnects; memory stays bounded |
-| Zombie shell processes | Phase 2 (session persistence) | Orphan then exit shell; `ps aux | grep defunct` = empty |
-| SIGHUP kills shell on disconnect | Phase 2 (session persistence) | Disconnect client; shell still running after 5 s |
-| Reattach token without SSH re-auth | Phase 3 (cold reattach) | Negative test: correct token, wrong key → rejected |
-| Sequence number resync (duplicates/gaps) | Phase 3 (cold reattach) | Diff combined output against full server log |
-| Reattach race (two clients one session) | Phase 3 (cold reattach) | Concurrent reattach test; only one must succeed |
-| `Session.identity` not threaded | Phase 4 (identity threading) | Assert `session.identity` matches presented key fingerprint |
-| Windows key material in memory | Phase 5 (Windows client) | Code review + test: `PrivateKey` not in long-lived structs |
-| Windows file permission ACL gap | Phase 5 (Windows client) | Document limitation; best-effort `readonly()` warning |
-| Windows resize (no SIGWINCH) | Phase 5 (Windows client) | Windows-only resize integration test |
-| Windows VT processing off in legacy hosts | Phase 5 (Windows client) | Test in cmd.exe; escape sequences interpreted not printed |
+| Prediction in cursor-addressing apps (vim/less) | M4 Predictive echo — design gate | Adversarial test: vim session with prediction active; zero corrupt cells |
+| Wide char cursor drift | M4 Predictive echo — initial implementation | Typed CJK; cursor column correct after each character |
+| Paste / bulk input flood | M4 Predictive echo — initial implementation | Bracketed paste; zero predicted cells during paste |
+| Epoch/confirmation desync after datagram loss | M4 Predictive echo — datagram format design | 30% loss simulation; self-corrects within 2 RTTs |
+| Datagram MTU / WSAEMSGSIZE | M4 Predictive echo + daily-driver hardening | Datagram size assertion; no WSAEMSGSIZE on Windows |
+| PTY reader zombie race | M4 Daily-driver hardening — first task | Thread count stable under orphan load; reader exits within 1s of orphan |
+| Datagram sync / reattach race | M4 Predictive echo — reattach integration | Reattach during datagram session; no torn view |
+| TOFU first-contact gap (doc) | M4 Security design pass | Security doc names TOFU gap + mitigation |
+| Predicted echo as info leak (noecho) | M4 Predictive echo — initial implementation | `read -s` shows no predicted characters |
+| Datagram injection/replay (doc) | M4 Security design pass | Security doc covers QUIC TLS auth + monotonic seq |
+| Privilege model gap (doc) | M4 Security design pass | Security doc has "Privilege Model" section |
+| Windows CI false-green | M4 Daily-driver hardening | `windows-latest` CI job runs and passes `cargo test` |
 
 ---
 
 ## Sources
 
-- Quinn `ServerConfig` docs — `migration()` method and default (enabled): https://docs.rs/quinn/latest/quinn/struct.ServerConfig.html
-- Quinn `TransportConfig` docs — `keep_alive_interval`, `max_idle_timeout` defaults: https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html
-- RFC 9000 §9.4 — Anti-amplification limit on new paths (3× bytes received): https://www.rfc-editor.org/rfc/rfc9000.html
-- RFC 9000 §9.5 — CID rotation requirement on migration for privacy: https://www.rfc-editor.org/rfc/rfc9000.html
-- Marten Seemann — PATH_CHALLENGE flood attack, 256-frame cap fix: https://seemann.io/posts/2023-12-18---exploiting-quics-path-validation/
-- ssh-key `PrivateKey` docs — `Zeroizing` types, `read_openssh_file`, signing: https://docs.rs/ssh-key/latest/ssh_key/private/struct.PrivateKey.html
-- Windows OpenSSH private key permissions — ACL vs FILE_ATTRIBUTE_READONLY: https://github.com/PowerShell/Win32-OpenSSH/wiki/Security-protection-of-various-files-in-Win32-OpenSSH
-- Rust `std::fs::Permissions` docs — ACLs not read: https://doc.rust-lang.org/std/fs/struct.Permissions.html
-- Windows Terminal — no VT encoding for resize events; WINDOW_BUFFER_SIZE_RECORD quirks: https://github.com/microsoft/terminal/issues/394
-- crossterm resize events on Windows — `WINDOW_BUFFER_SIZE_RECORD` vs SIGWINCH: https://github.com/crossterm-rs/crossterm/issues/165
-- crossterm window size on Windows Terminal returns buffer not viewport: https://github.com/crossterm-rs/crossterm/issues/1021
-- QUIC multipath — simultaneous both-endpoint migration via CID distinction: https://quicwg.org/multipath/draft-ietf-quic-multipath.html
-- INIT.md §9 (session persistence, cold reattach design) — authoritative source for sequence-number reattach model
-- INIT.md §5 (security invariants) — env sanitization, no SSH_AUTH_SOCK in env, privilege-escalation footguns
+- Mosh USENIX paper (Keith Winstein & Hari Balakrishnan, 2012): epoch-based prediction, conservative mode, wide character gap — https://mosh.org/mosh-paper.pdf
+- Mosh GitHub issue #932: predictive echo + fish autosuggestions interaction (text pushed right instead of overwritten) — https://github.com/mobile-shell/mosh/issues/932
+- Mosh GitHub issue #6: misdisplayed prediction with Enter at bottom of screen (prediction at scrolling boundary) — https://github.com/mobile-shell/mosh/issues/6
+- Mosh bracketed paste implementation (commit c6bf3a2) — https://github.com/mobile-shell/mosh/commit/c6bf3a2025e86b34512a995ea8b1e45d7586860f
+- Mosh GitHub issue #427: bracketed paste background — https://github.com/mobile-shell/mosh/issues/427
+- tokio `spawn_blocking` abort semantics (cannot abort once started): https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html
+- tokio discussion #6570: Aborting a Task with spawn_blocking — https://github.com/tokio-rs/tokio/discussions/6570
+- quinn issue #1572: UDP packet size and MTU fragmentation — https://github.com/quinn-rs/quinn/issues/1572
+- Marten Seemann: IP fragmentation and DPLPMTUD — https://seemann.io/posts/2025-02-19---ip-fragmentation/
+- RFC 9221: Unreliable Datagram Extension to QUIC (datagrams are unreliable, not replayed) — https://datatracker.ietf.org/doc/rfc9221/
+- RFC 9001: QUIC-TLS (TLS 1.3 provides per-packet authentication including datagrams)
+- QUIC security review (Springer 2022): datagram injection and replay surface analysis — https://link.springer.com/article/10.1007/s10207-022-00630-6
+- SSH agent explained (Smallstep): agent attack surface, no key export — https://smallstep.com/blog/ssh-agent-explained/
+- TOFU weakness (Wikipedia/HN): first-contact MITM window — https://news.ycombinator.com/item?id=41848404
+- nosh codebase v1.1: session.rs (PTY spawn, spawn_blocking reader), server.rs (output_reader.abort() pattern), registry.rs (W1 mint-send-commit token rotation)
+- nosh PROJECT.md v1.2: PTY reader-zombie race identified as latent tech debt requiring `/gsd:debug` pass
+- dvtm PR #69: self-pipe trick for SIGWINCH/SIGCHLD in PTY-using programs — https://github.com/martanne/dvtm/pull/69
 
 ---
-*Pitfalls research for: QUIC-based roaming remote shell (nosh), v1.1 M3 Roaming + Windows Client*
-*Researched: 2026-05-30*
+*Pitfalls research for: QUIC-based roaming remote shell (nosh), v1.2 M4 Predictive Echo + Daily-Driver Hardening*
+*Researched: 2026-06-01*

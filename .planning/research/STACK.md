@@ -1,25 +1,27 @@
 # Stack Research
 
-**Domain:** QUIC-based roaming remote shell (Rust) — v1.1 M3 Roaming + Windows Client
-**Researched:** 2026-05-30
-**Confidence:** HIGH (all crate versions and APIs verified against docs.rs live data)
+**Domain:** QUIC-based roaming remote shell (Rust) — v1.2 M4 Predictive Echo + Daily-Driver Readiness
+**Researched:** 2026-06-01
+**Confidence:** HIGH (all version claims and APIs verified against docs.rs / GitHub live data)
 
 ---
 
-## Existing Validated Stack (v1.0 — DO NOT RE-RESEARCH)
+## Existing Validated Stack (v1.0/v1.1 — DO NOT RE-RESEARCH)
+
+These are locked-in and shipped. Do not revisit.
 
 | Technology | Pinned Version | Role |
 |------------|---------------|------|
-| `quinn` | 0.11.9 | QUIC transport |
-| `rustls` | 0.23.x | TLS 1.3 (via quinn) |
-| `tokio` | 1.52.x | Async runtime |
+| `quinn` | 0.11.9 | QUIC transport (latest on crates.io, confirmed) |
+| `rustls` | 0.23.x | TLS 1.3 via quinn |
+| `tokio` | 1.52.3 | Async runtime (latest) |
 | `portable-pty` | 0.9.0 | PTY (Linux) |
 | `ssh-key` | 0.6.7 | Key parsing / authorized_keys / known_hosts |
 | `ssh-agent-client-rs` | 1.1.x | Agent signing (Linux) |
 | `ed25519-dalek` | 2.2.0 | Ed25519 material |
-| `vte` | 0.15.0 | VT parser |
+| `vte` | 0.15.0 | VT parser (server-side, existing) |
 | `rcgen` | 0.14.x | Ephemeral self-signed certs |
-| `crossterm` | 0.28.1 | Client terminal raw mode + event reading |
+| `crossterm` | 0.29.0 | Client terminal raw mode + event reading |
 | `postcard` + `serde` | 1.x / 1.x | Frame serialization |
 | `bytes`, `tracing`, `anyhow`, `thiserror`, `clap` | — | Shared utilities |
 | `uuid` | 1.x (v4) | Session IDs (server) |
@@ -29,237 +31,292 @@
 
 ---
 
-## v1.1 Stack Additions and Changes
+## v1.2 Stack Additions and Changes
 
-### 1. QUIC Connection Migration (quinn 0.11.9)
+### 1. Terminal Grid/Screen Abstraction for Predictive Echo
 
-**No new crate required.** Migration is already implemented inside quinn 0.11.9. The findings below are the authoritative API surface.
+**Decision: `termwiz` 0.23.3 for client-side screen model; keep `vte` 0.15.0 for server-side VT parsing.**
 
-#### How migration works in quinn 0.11.9
+This is the most consequential new dependency in M4. Here is the full rationale.
 
-**NAT rebinding (passive — zero code change needed):** When the client's source UDP 4-tuple changes due to NAT rebind, the server receives packets from the new address. With `ServerConfig::migration(true)` (the DEFAULT), quinn-proto automatically runs PATH_CHALLENGE/PATH_RESPONSE on the new path. If path validation succeeds, the connection migrates. No application-level call is needed on either side. `Connection::remote_address()` will reflect the new address after migration. This is the behavior that handles Wi-Fi→cellular IP change at the OS/NAT level.
+#### What M4 needs and does NOT have
 
-**Deliberate interface switch (active — client must call `Endpoint::rebind`):** When the client deliberately switches to a new network interface (e.g., binding a new local UDP socket), the application must call `Endpoint::rebind(socket: UdpSocket) -> Result<()>` or `Endpoint::rebind_abstract(socket: Arc<dyn AsyncUdpSocket>) -> Result<()>`. These methods replace the underlying UDP socket live across all active connections, sending a `ConnectionEvent::Rebind` to each connection driver. The QUIC layer then probes the new path with PATH_CHALLENGE.
+The existing `vte` 0.15.0 is a VT/ANSI _parser_ — it fires a `Perform` callback for each escape sequence. It does NOT maintain a screen grid, does NOT track cell content, and does NOT produce diffs. For predictive echo to work, the _client_ needs:
 
-**Warning from docs:** `Endpoint::rebind` — "Incoming connections and connections to servers unreachable from the new address will be lost." This is expected: the intent is exactly to change the local socket when the network interface changes.
+1. A full terminal screen grid (rows × columns of cells with attributes)
+2. The ability to apply incoming server VT data to that grid
+3. A way to overlay speculative "prediction" cells on top of the confirmed grid
+4. A diff mechanism for the datagram payload (what changed from frame N to frame N+1)
 
-#### Exact method signatures (verified, quinn 0.11.9)
+Neither `vte` nor `alacritty_terminal` provide (3) or (4) in a usable form:
 
-```rust
-// On Endpoint
-pub fn rebind(&self, socket: UdpSocket) -> Result<()>
-pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> Result<()>
-pub fn local_addr(&self) -> Result<SocketAddr>
+- **`alacritty_terminal` 0.26.0**: Has a `Grid<Cell>` and `Term` but no change-tracking or diff API. It is also clearly an internal component of the Alacritty terminal emulator — not designed as a general library dep. The API is unstable (sub-1.0), not documented for external use, and diffs would require hand-rolling a full grid comparison.
 
-// On ServerConfig
-pub fn migration(&mut self, value: bool) -> &mut ServerConfig  // default: true
+- **`termwiz` 0.23.3**: Specifically designed as a reusable library. Its `Surface` type is the correct primitive:
+  - Maintains a terminal grid (rows × cols of `Cell`s with full attribute state)
+  - `add_change(Change)` / VT parsing via `termwiz::terminal::parser` → `Surface`
+  - `get_changes(seq: SequenceNo) → (SequenceNo, Cow<[Change]>)` — returns incremental change log since a sequence number
+  - `flush_changes_older_than(seq)` — prunes the log (exactly the "trim acked" pattern already used by the replay buffer)
+  - `diff_screens(&other_surface) → Vec<Change>` — computes the change vector between two screen states
+  - `Change` enum is `Serialize + Deserialize` with `use_serde` feature — postcard can encode `Vec<Change>` directly
+  - `SequenceNo` is a monotonic counter — directly usable as the epoch tracker for confirming predictions
 
-// On Connection (complete method list — no migrate/set_path/network_path exist)
-pub fn remote_address(&self) -> SocketAddr   // updates after migration
-pub fn local_ip(&self) -> Option<IpAddr>     // local side; may be None on some platforms
-pub fn rtt(&self) -> Duration
-pub fn stats(&self) -> ConnectionStats       // includes PathStats (rtt, cwnd, lost_packets, current_mtu)
-pub fn stable_id(&self) -> usize             // stable for connection lifetime; use as session map key
-// ... open_bi, accept_bi, open_uni, accept_uni, send_datagram, read_datagram, close, etc.
-```
+This maps Mosh's Framebuffer+diff model onto a Rust type the project does not need to own.
 
-**Methods that do NOT exist in 0.11.9:**
-- `Connection::migrate()` — does not exist
-- `Connection::set_path()` — does not exist
-- `Connection::network_path()` — does not exist
-- `Connection::path()` — does not exist
+**Confidence: HIGH** — `get_changes`, `flush_changes_older_than`, `diff_screens`, `Surface`, `SequenceNo` all verified in docs.rs/termwiz 0.23.3. `Change` serde confirmed. Version 0.23.3 released 2026-03-20.
 
-#### TransportConfig knobs affecting migration quality
+**Dependency footprint caveat**: termwiz 0.23.3 has ~30 direct deps and ~14–21 MB dependency tree (lib.rs confirmed). It pulls in `wezterm-bidi`, `wezterm-color-types`, `vtparse`, `pest`, `unicode-segmentation`, `terminfo`, and others. This is moderate but not negligible. Evaluate whether the `widgets` feature is needed (it is not for nosh — omit it). Use `default-features = false, features = ["use_serde"]` to reduce build surface.
+
+**Wire format for datagram state sync**: `Vec<Change>` serialized with `postcard` (already in tree). Do NOT add `prost`/protobuf. Mosh uses protobuf for its C++ wire format, but nosh already has a serde/postcard discipline and `Change` is serde-serializable. Postcard encodes smaller and faster than prost for this type of structured payload (confirmed by djkoloski/rust_serialization_benchmark). A bespoke datagram envelope:
 
 ```rust
-let mut tc = quinn::TransportConfig::default();
-// Keep-alive prevents idle timeout during quiescent network change
-tc.keep_alive_interval(Some(Duration::from_secs(15)));
-// Generous idle timeout gives cold-reconnect window (Mosh-style persistence)
-tc.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap()));
-// MTU discovery adapts to new path characteristics after migration
-tc.mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
+// In nosh-proto/src/datagram.rs (new file)
+#[derive(Serialize, Deserialize)]
+pub struct ScreenFrame {
+    /// Monotonic epoch. Client uses this to confirm predictions.
+    pub epoch: u64,
+    /// Sequence number of the last input frame the server has processed.
+    /// Client uses this to retire predictions older than echo_ack.
+    pub echo_ack: u64,
+    /// Incremental change stream since the last acknowledged frame.
+    pub changes: Vec<termwiz::surface::change::Change>,
+}
 ```
 
-#### Connection ID management
+The `epoch` field replaces Mosh's `confirmed_epoch`/`prediction_epoch` pair; `echo_ack` is Mosh's "server has processed input up to frame N" signal that drives prediction retirement.
 
-`EndpointConfig::cid_generator()` allows custom CID generation (e.g., for load balancers). The default `HashedConnectionIdGenerator` is appropriate for nosh. `Connection::stable_id()` returns a usize that is stable for the lifetime of the connection and is the correct handle for the server-side orphaned-session registry key.
+#### Prediction Engine (bespoke — no crate exists)
 
-**Confidence: HIGH** — verified from docs.rs/quinn 0.11.9 Connection method enumeration, Endpoint source, quinn-proto connection/mod.rs path migration logic.
+The prediction/local echo logic is bespoke, as in Mosh. No Rust crate implements Mosh-style SSP prediction. The Mosh C++ reference is `src/frontend/terminaloverlay.cc`. The key data structures to port:
+
+```rust
+// In nosh-client/src/prediction.rs (new file)
+struct ConditionalCell {
+    replacement: termwiz::surface::change::Change,
+    tentative_until_epoch: u64,   // confirmed when server epoch >= this
+    original: CellContents,       // what was there before prediction
+    active: bool,
+}
+
+struct PredictionEngine {
+    overlays: Vec<Vec<ConditionalCell>>,  // indexed [row][col]
+    cursors: Vec<PredictedCursor>,
+    current_epoch: u64,
+    confirmed_epoch: u64,  // from last ScreenFrame.echo_ack
+}
+```
+
+The `cull()` method compares the prediction overlay against the latest confirmed `Surface` state and retires predictions whose epoch is <= `confirmed_epoch`. This is ~200–300 lines of logic with no external dep.
+
+**Server-side**: Keep `vte` 0.15.0. The server feeds raw PTY output through `vte` into a `termwiz::surface::Surface` (replacing the existing custom `Perform` handler), then calls `surface.get_changes(last_sent_epoch)` and encodes a `ScreenFrame` datagram.
 
 ---
 
-### 2. Windows Client — Terminal I/O
+### 2. Cargo.toml Changes for Predictive Echo
 
-**`crossterm` already in the tree at 0.28.1. Upgrade to 0.29.0 is recommended.**
+```toml
+# workspace Cargo.toml — add to [workspace.dependencies]
+termwiz = { version = "0.23", default-features = false, features = ["use_serde"] }
 
-#### crossterm 0.28.1 → 0.29.0 upgrade
+# nosh-proto/Cargo.toml — add
+termwiz = { workspace = true }
 
-0.29.0 (released April 5, 2025) adds OSC52 clipboard support (useful for M5), keyboard enhancement flag queries, and rustix 1.0. No breaking API changes for the existing raw-mode + event loop usage. Ratatui and gitui have both bumped to 0.29.0. Recommend bumping crossterm to 0.29.0 in the workspace.
+# nosh-server/Cargo.toml — add
+termwiz = { workspace = true }
 
-#### Windows MSVC support
+# nosh-client/Cargo.toml — add
+termwiz = { workspace = true }
+```
 
-crossterm 0.29.0 explicitly lists `x86_64-pc-windows-msvc` and `i686-pc-windows-msvc` as supported targets. `enable_raw_mode()` works on Windows 10+ via VT mode; falls back to WinAPI on older systems. Windows 10 is the minimum realistic nosh client target.
+---
 
-#### Async event reading (tokio EventStream)
+### 3. OSC 52 Clipboard (QoL UX)
 
-Enable the `event-stream` feature to get `crossterm::event::EventStream`, which implements `futures::Stream<Item = Result<Event>>` and works with tokio select loops.
+**Use `crossterm` 0.29.0 `CopyToClipboard` — already in tree, zero new dep.**
+
+crossterm 0.29.0 (already in `nosh-client`) added OSC 52 clipboard support via `crossterm::clipboard::CopyToClipboard`. It requires the `osc52` feature flag (verified: module documented as `requires feature = "osc52"`).
 
 ```toml
 # nosh-client/Cargo.toml
-crossterm = { version = "0.29", features = ["events", "event-stream"] }
-futures = "0.3"  # for StreamExt
+crossterm = { version = "0.29", features = ["events", "osc52"] }
 ```
 
 ```rust
-use crossterm::event::{EventStream, Event};
-use futures::StreamExt;
+use crossterm::clipboard::CopyToClipboard;
+// Write clipboard via OSC 52 escape sequence:
+execute!(std::io::stdout(),
+    CopyToClipboard::to_clipboard_from(text_content))?;
+```
 
-let mut event_stream = EventStream::new();
+**Limitation**: OSC 52 requires the terminal emulator and any multiplexer to pass through the escape sequence. Works in most modern terminals (iTerm2, WezTerm, modern xterm, Windows Terminal). Kitty and tmux may require config. This is a best-effort UX feature, not a reliability requirement. Server must detect OSC 52 in the PTY output stream and forward it as a dedicated `Message::Osc52` control frame (not raw PTY bytes) because the client terminal, not the server's PTY, is the clipboard target.
+
+**Confidence: HIGH** — crossterm 0.29.0 `CopyToClipboard` API verified on docs.rs; `osc52` feature requirement confirmed.
+
+---
+
+### 4. Connection-Loss Notifications (QoL UX)
+
+**No new crate required.** This is pure application logic over the existing `tokio` + `quinn` stack.
+
+Pattern: wrap the QUIC `Connection` in a state machine with states `{ Connected, Reconnecting { since: Instant, attempt: u32 }, Failed }`. On `Connection::closed()` or a stream I/O error, transition to `Reconnecting` and write a status line to the terminal via `crossterm::style::Print`. The reconnect loop already exists from M3 reattach — this feature is a display wrapper around it.
+
+```rust
+// No new deps. crossterm already writes status lines.
+// Display: "[nosh] connection lost — reconnecting (attempt 3)…"
+// Abort instruction: "Press ~. to quit"
+```
+
+The `~.` quit escape is already implemented in the client (M3 phase 9). No stack changes needed.
+
+---
+
+### 5. PTY Reader-Zombie Race Fix
+
+**Pattern: replace `spawn_blocking` + `read()` with `tokio::io::unix::AsyncFd` + `O_NONBLOCK`.**
+
+The current issue: `portable-pty` returns a `Box<dyn Read>` (the master PTY reader). The code wraps this in `tokio::task::spawn_blocking`, which cannot be interrupted by `abort()` once the blocking `read()` syscall is in flight. This is the "zombie race" — on reconnect, the server loop cannot cleanly stop the reader task.
+
+**The fix** (verified via tokio issue #4488 and AsyncFd docs):
+
+1. After `openpty()`, extract the raw file descriptor from the master PTY via `AsRawFd` (already available because `nix` 0.29 is in tree).
+2. Set the fd to non-blocking: `fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))` (nix already in tree, no new dep).
+3. Wrap in `tokio::io::unix::AsyncFd::new(fd)`.
+4. Use `async_fd.readable().await` + `try_io(|inner| unistd::read(inner.get_ref(), buf))` in the session loop — this is now a proper tokio future that respects cancellation/select.
+
+```rust
+// nosh-server/src/session.rs (modified, no new deps)
+use tokio::io::unix::AsyncFd;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::unistd;
+
+let raw_fd = pty_master.as_raw_fd();
+fcntl(raw_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+let async_fd = AsyncFd::new(raw_fd)?;
+
 loop {
-    tokio::select! {
-        Some(Ok(event)) = event_stream.next() => { /* handle */ }
-        // ... other nosh futures
-    }
+    let mut guard = async_fd.readable().await?;
+    guard.try_io(|inner| {
+        let mut buf = [0u8; 4096];
+        match unistd::read(*inner.get_ref(), &mut buf) {
+            Ok(n) => Ok(n),
+            Err(nix::errno::Errno::EAGAIN) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+        }
+    })?;
 }
 ```
 
-The existing Linux client already uses crossterm; the same code compiles and runs on Windows MSVC without changes.
+This loop is a proper tokio future; `tokio::select!` with a cancellation channel can abort it cleanly. The `JoinHandle::abort()` issue goes away because there is no `spawn_blocking`.
 
-**Critical: do NOT enable the `use-dev-tty` feature.** It is Unix-only and breaks the build in combination with `event-stream` (crossterm issue #935). The default Windows path in crossterm does not need this flag.
+**Caveats**: The `AsyncFd` approach requires bypassing `portable-pty`'s `Box<dyn Read>` abstraction and accessing the raw fd directly. This is Linux-specific (Unix fd). It does not affect the Windows server path (M6, out of scope). Gate with `#[cfg(unix)]`.
 
-#### Does quinn/tokio/ring build on `x86_64-pc-windows-msvc`?
+**No new crates needed.** `tokio::io::unix::AsyncFd` is in the existing tokio dep (it is part of the `io-util` feature already enabled). `nix` 0.29 is already in the server's deps.
 
-Yes. `ring` 0.17.14 ships precompiled assembly objects for `x86_64-windows` in the crates.io package — no NASM assembler required. The only prerequisite is "Build Tools for Visual Studio 2022" with the "Desktop development with C++" workload. `tokio` and `quinn` are pure Rust and build on all MSVC targets. `quinn` uses `socket2` for UDP, which has full Windows support.
-
-**What correctly does NOT build on Windows (excluded from v1.1 Windows client scope):**
-- `nosh-server` — has `portable-pty` (Linux PTY) and `nix` (Unix-only signal/user features)
-- `ssh-agent-client-rs` — Unix socket client; deferred on Windows (Pageant uses named pipes, different protocol)
-
-**Confidence: HIGH** — crossterm 0.29.0 Windows targets verified on docs.rs; ring BUILDING.md precompiled-object claim verified; quinn/tokio known-pure-Rust.
+**Confidence: HIGH** — `AsyncFd` approach confirmed working for PTY in tokio issue #4488; `try_io` / `readable` API verified on docs.rs/tokio 1.52.3.
 
 ---
 
-### 3. On-Disk OpenSSH Key Signing (Windows Client)
+### 6. WSAEMSGSIZE quinn-udp Warning on Windows
 
-**No new crate required.** `ssh-key 0.6.7` already in the tree has the complete API.
+**Current status: this is a known, open quinn-rs issue (#2041) with no upstream fix. The connection functions correctly despite the log warning.**
 
-#### Loading a private key from disk
+Root cause (verified from quinn-rs/quinn#2041 and source inspection): quinn-udp's Windows receive path uses `WSARecvMsg()` with a 128-byte control buffer. When Windows GRO (Generic Receive Offload) is active, it tries to append `UDP_COALESCED_INFO` to the control buffer. If the buffer is too small, the coalesced packet metadata is not delivered and quinn-udp receives an oversized datagram. This is logged as a warning. The actual UDP data arrives intact; the packet is not lost.
 
-```rust
-use ssh_key::PrivateKey;
-use std::path::Path;
+**Resolution options (in priority order):**
 
-// Requires: ssh-key features "std" (already enabled in the workspace)
-let key = PrivateKey::read_openssh_file(Path::new("/home/user/.ssh/id_ed25519"))?;
-```
+1. **Suppress the warning with a tracing filter** (simplest, M4-appropriate): Add a `tracing_subscriber` filter that drops quinn-udp's `WARN` log level for the `quinn_udp` target on Windows. No code change to quinn itself required.
 
-#### Passphrase-encrypted keys
+   ```rust
+   // nosh-client/src/main.rs, Windows initialization
+   #[cfg(target_os = "windows")]
+   fn build_subscriber() -> impl tracing::Subscriber {
+       tracing_subscriber::fmt()
+           .with_env_filter(
+               tracing_subscriber::EnvFilter::from_default_env()
+                   .add_directive("quinn_udp=error".parse().unwrap())
+           )
+           .finish()
+   }
+   ```
 
-```rust
-// Requires: ssh-key feature "encryption" (not currently enabled — must add for Windows path)
-if key.is_encrypted() {
-    let passphrase = /* prompt user */;
-    let key = key.decrypt(passphrase.as_bytes())?;
-}
-```
+   This silences the warning without suppressing genuine quinn errors.
 
-The `encryption` feature pulls in `bcrypt-pbkdf`, AES-256-CTR, and ChaCha20Poly1305 — all pure Rust, no native deps, builds on Windows MSVC cleanly. This feature is NOT needed on Linux (where signing goes through ssh-agent), so gate it via `cfg(target_os = "windows")` or a `file-key` Cargo feature to avoid inflating the Linux server binary.
+2. **Wait for upstream fix**: quinn-udp 0.6.1 (March 2025) added "disable GSO after probing" and "reuse existing socket for probing GRO/GSO support." These changes partially address Windows GRO/GSO reliability. Monitor quinn 0.11.x changelog for a full WSAEMSGSIZE resolution. Update `quinn` in the workspace when a fix ships.
 
-#### Ed25519 signing without ssh-agent
+3. **Do NOT disable GRO globally** via quinn transport config — there is no public API to do so in quinn 0.11.9, and doing so would harm performance on Linux where GRO works correctly.
 
-`PrivateKey` implements `signature::Signer` (from the `signature` crate, a transitive dep). For wiring into `rustls::sign::SigningKey`, extract the raw Ed25519 key material and delegate to `ed25519-dalek`:
-
-```rust
-// Extract dalek SigningKey from ssh_key::PrivateKey
-let ed_kp = private_key.key_data().ed25519()
-    .ok_or(anyhow::anyhow!("not an Ed25519 key"))?;
-// ed_kp.private is the 32-byte seed (+ public key in expanded form)
-// ed25519_dalek::SigningKey::from_bytes(&seed_bytes) gives a dalek key
-// Then implement rustls::sign::Signer::sign(message) via dalek_key.sign(message)
-```
-
-Signing path: `read_openssh_file → decrypt (if encrypted) → extract Ed25519 bytes → ed25519-dalek::SigningKey → rustls::sign::Signer`. Zero agent round trips. The `WindowsFileSigningKey` struct implementing `rustls::sign::SigningKey` lives in `nosh-auth`, gated on `cfg(windows)` or a `file-key` feature.
-
-**Required feature addition (Windows target only):**
-
-```toml
-# In nosh-auth/Cargo.toml or nosh-client/Cargo.toml, gated:
-[target.'cfg(target_os = "windows")'.dependencies]
-ssh-key = { version = "0.6", default-features = false,
-            features = ["ed25519", "std", "alloc", "encryption"] }
-```
-
-**Confidence: HIGH** — `PrivateKey::read_openssh_file`, `decrypt`, `is_encrypted`, key_data API all verified from docs.rs/ssh-key 0.6.7; encryption feature deps verified from Cargo.toml source.
+**Confidence: MEDIUM** — issue #2041 confirmed open; suppression via tracing filter confirmed viable as a workaround; no upstream fix in 0.11.9.
 
 ---
 
-### 4. Session Persistence and Reattach Tokens
+### 7. Windows Cross-Compile CI Gate
 
-**No new crates required.** The existing tree already has everything needed.
+**No new crate required. Pure CI/GitHub Actions configuration.**
 
-#### Reattach token generation
+The existing Windows client code compiles natively (confirmed in v1.1). The CI gate was wired but never ran because there is no git remote. Once a remote is configured, add this job to `.github/workflows/ci.yml`:
 
-`uuid` 1.x with `v4` feature (already in `nosh-server/Cargo.toml`) generates tokens via `Uuid::new_v4()`, which calls `getrandom` internally (CSPRNG-backed OS call). UUID v4 provides 122 bits of entropy — sufficient for an unguessable reattach token. Token is bound to the SSH identity at creation and checked against the re-authenticating peer at reattach time.
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Windows client
+        run: cargo build --locked --target x86_64-pc-windows-msvc -p nosh-client
+```
 
-If 32 bytes of entropy are preferred, `getrandom` is already transitive in the lockfile (0.2.17, 0.3.4, and 0.4.2 all present via ring/ssh-key). `getrandom::fill(&mut [0u8; 32])` — no direct dep addition needed.
+Key notes confirmed from research:
+- `windows-latest` runner already has MSVC Build Tools installed — no extra setup for `ring` (ring 0.17.14 ships precompiled asm objects for `x86_64-windows`, no NASM needed).
+- Build is native (not cross-compile) — the runner IS Windows x86_64, so `--target x86_64-pc-windows-msvc` does not require cross toolchain or emulation.
+- Only `nosh-client` (-p nosh-client) builds on Windows. Do NOT build `nosh-server` (has `portable-pty`, `nix`, Unix-only) or `nosh-auth` in the Windows target without `--no-default-features` (ssh-agent-client-rs is already `cfg(unix)`-gated).
+- Do NOT add `cargo-xwin` or `cross` — they are for cross-compiling FROM Linux TO Windows. Here we run natively ON Windows.
 
-#### Sequence-numbered resume buffer (ET BackedReader pattern)
-
-Application logic over existing quinn streams — no new crate. Pattern:
-
-- Server maintains a `VecDeque<(seq: u64, Bytes)>` per orphaned session, bounded by a max-bytes cap (e.g., 1 MiB)
-- Each outbound frame carries an incrementing `seq` field in the nosh-proto envelope (postcard + serde already serializes this)
-- On reattach, client sends `ReattachRequest { session_token, last_acked_seq: u64 }` over a new authenticated connection
-- Server verifies the token matches the claiming identity, then replays `seq > last_acked_seq` frames on the new stream
-
-#### Session identity threading (v1.0 seam)
-
-After handshake: `connection.peer_identity()` returns `Option<Box<dyn Any + Send>>`. For quinn's rustls backend, downcast to `Vec<CertificateDer>`. Extract SPKI with `x509-parser` (already in `nosh-auth`). Parse to `ssh_key::PublicKey`. Store in `Session.identity`. All existing crates; no new deps.
-
-`Connection::stable_id()` (usize, stable for connection lifetime) is the correct live-connection key for the session map; replaced by the reattach token on disconnect.
-
-#### Per-identity session cap
-
-`HashMap<ssh_key::Fingerprint, VecDeque<OrphanedSession>>` in the server, bounded by count or total buffer bytes. `ssh_key::PublicKey::fingerprint(HashAlg::Sha256)` provides the identity hash. No new crates.
-
-**Confidence: HIGH** — uuid v4 → getrandom path verified in lockfile; postcard/serde already used for proto frames; Connection::stable_id and peer_identity verified from docs.rs.
+**Confidence: HIGH** — windows-latest + x86_64-pc-windows-msvc + ring pattern verified in multiple 2024/2025 CI guides; ring precompiled objects confirmed in ring/BUILDING.md.
 
 ---
 
-## Summary of Cargo.toml Changes
+## Summary of Cargo.toml Changes for v1.2
 
-### Workspace `Cargo.toml`
-
-```toml
-[workspace.dependencies]
-# Add futures for crossterm EventStream (tokio-based async event reading)
-futures = "0.3"
-# Bump crossterm from 0.28.1 to 0.29.0
-crossterm = { version = "0.29", features = ["events"] }
-```
-
-### `nosh-client/Cargo.toml`
+### Workspace `Cargo.toml` — add to `[workspace.dependencies]`
 
 ```toml
-# Add event-stream feature (was missing in 0.28.1 entry)
-crossterm = { workspace = true, features = ["event-stream"] }
-futures = { workspace = true }
-
-# Windows-only: on-disk key signing with passphrase support
-[target.'cfg(target_os = "windows")'.dependencies]
-ssh-key = { version = "0.6", default-features = false,
-            features = ["ed25519", "std", "alloc", "encryption"] }
-# Remove ssh-agent-client-rs from Windows target (Unix socket only)
+termwiz = { version = "0.23", default-features = false, features = ["use_serde"] }
 ```
 
-### `nosh-server/Cargo.toml`
+### `nosh-proto/Cargo.toml` — add
 
-No new dependencies for roaming or session persistence. `uuid` v4 already present.
+```toml
+termwiz = { workspace = true }
+```
 
-### `nosh-auth/Cargo.toml`
+(Needed because `ScreenFrame` in `nosh-proto` references `termwiz::surface::change::Change`.)
 
-No new crates. Add `WindowsFileSigningKey` implementation gated on `cfg(windows)` using existing `ssh-key` and `ed25519-dalek`.
+### `nosh-server/Cargo.toml` — add
+
+```toml
+termwiz = { workspace = true }
+```
+
+(Server maintains a `Surface` and calls `get_changes()` to build datagram payloads.)
+
+### `nosh-client/Cargo.toml` — changes
+
+```toml
+termwiz = { workspace = true }
+# Add osc52 feature to existing crossterm dep:
+crossterm = { version = "0.29", features = ["events", "osc52"] }
+```
+
+### `nosh-server/Cargo.toml` — no new deps for PTY fix
+
+`tokio::io::unix::AsyncFd` is already available via the existing tokio dep (`io-util` feature already enabled). `nix` 0.29 is already present.
 
 ---
 
@@ -267,13 +324,13 @@ No new crates. Add `WindowsFileSigningKey` implementation gated on `cfg(windows)
 
 | Category | Recommended | Alternative | Why Not |
 |----------|-------------|-------------|---------|
-| Reattach token | `uuid` v4 (already in tree) | `rand::random::<[u8; 32]>()` | uuid already present, formats cleanly, 122-bit entropy sufficient |
-| Reattach token | `uuid` v4 | `getrandom` directly | Both work; uuid more ergonomic for serialization |
-| Resume buffer | Hand-rolled VecDeque | A dedicated replay crate | No such crate exists at the right abstraction; the pattern is ~50 lines |
-| Windows terminal | `crossterm` 0.29 | `windows-rs` console API directly | crossterm abstracts WinAPI/ANSI duality; already in tree; no reason to drop |
-| Windows key signing | `ssh-key` + `ed25519-dalek` (in-process) | `ssh-agent-client-rs` on Windows | Pageant uses named pipes, not Unix sockets; ssh-agent-client-rs is Unix-only |
-| crossterm version | 0.29.0 | Stay at 0.28.1 | 0.29.0 adds OSC52 (useful M5) and rustix 1.0; upgrade cost is minimal |
-| Crypto backend | Keep `rustls-ring` | Switch to `aws-lc-rs` | aws-lc-rs needs CMake on Windows; ring 0.17.14 has precompiled x86_64 objects |
+| Client terminal grid | `termwiz` 0.23.3 | `alacritty_terminal` 0.26.0 | alacritty_terminal has no diff/change-tracking API; not designed as an external library dep; unstable sub-1.0 API |
+| Client terminal grid | `termwiz` 0.23.3 | Roll bespoke grid from scratch | ~1,500–2,000 lines to get correct cell+attribute semantics, Unicode width, scrollback — termwiz is battle-tested in wezterm |
+| Datagram serialization | `postcard` (existing) + `termwiz::Change` serde | `prost` / protobuf | prost adds a build-time `protoc` dependency; postcard is already in the tree, smaller payloads, same or better perf; `Change` is already serde-serializable |
+| PTY async read | `AsyncFd` + `O_NONBLOCK` (tokio stdlib) | `tokio_pty_process` crate | `tokio_pty_process` is unmaintained (last release 2019); `AsyncFd` is the current tokio-idiomatic approach |
+| OSC 52 clipboard | `crossterm` 0.29.0 (existing) | `copypasta-ext` crate | `crossterm` already in tree and supports OSC 52 write; `copypasta-ext` adds a dep for the same functionality |
+| WSAEMSGSIZE | tracing filter workaround | Patch quinn-udp | Patching quinn-udp is out of scope for M4; the connection works correctly; upstream fix is the right path |
+| Windows CI | Native `windows-latest` job | `cargo-xwin` from Linux | `cargo-xwin` is for cross-compile from Linux; `windows-latest` runner has MSVC natively — simpler and more faithful |
 
 ---
 
@@ -281,47 +338,49 @@ No new crates. Add `WindowsFileSigningKey` implementation gated on `cfg(windows)
 
 | Avoid | Why | Use Instead |
 |-------|-----|-------------|
-| Any dedicated "session resume" crate | None at the right abstraction; BackedReader is ~50 lines of VecDeque logic | Hand-roll on postcard + serde |
-| `russh` for Windows key signing | Full SSH protocol implementation; pulls large transitive deps | `ssh-key` + `ed25519-dalek` (already in tree) |
-| `crossterm` `use-dev-tty` feature | Unix-only; breaks build combined with `event-stream` (issue #935) | Omit this feature flag |
-| `getrandom` as a direct dependency | Already transitive via ring and uuid; adding a direct dep risks version skew | Use `Uuid::new_v4()` for tokens |
-| `tokio-rustls` | Not needed; quinn handles TLS/QUIC internally | quinn only |
-| `ed25519-dalek` 3.0.0-pre.* | Pre-release API; may change | `ed25519-dalek` 2.2.0 (stable, already in tree) |
+| `prost` / protobuf | Adds `protoc` build-time dep; `termwiz::Change` is already serde-serializable; postcard is already in tree and produces smaller payloads | `postcard` + `termwiz::Change` serde |
+| `alacritty_terminal` | Sub-1.0 unstable API, no diff/change-tracking, designed as internal Alacritty component | `termwiz::surface::Surface` |
+| `tokio_pty_process` | Last released 2019, unmaintained | `tokio::io::unix::AsyncFd` + `O_NONBLOCK` directly |
+| `copypasta` or `clipboard` crate | Native clipboard requires platform-specific APIs (X11, Wayland, Win32); for a remote shell the only meaningful clipboard path is OSC 52 (terminal-mediated) | `crossterm` 0.29.0 `CopyToClipboard` |
+| `cargo-xwin` or `cross` | These are Linux→Windows cross-compile tools; the nosh Windows CI runs natively on `windows-latest` | Native cargo on `windows-latest` runner |
+| `termwiz::widgets` feature | Provides TUI widget layout — not needed for nosh; adds build weight | `default-features = false, features = ["use_serde"]` |
+| Any 0-RTT reattach crate | 0-RTT is deliberately deferred (INIT.md, PROJECT.md); 1-RTT cold reattach is already implemented | Nothing |
+| `rkyv` or other zero-copy serde | overkill for datagram-sized terminal diffs; introduces unsafe; no serde compatibility with existing `Change` type | `postcard` |
 
 ---
 
-## Version Compatibility (v1.1 additions only)
+## Version Compatibility (v1.2 additions)
 
 | Package | Compatible With | Notes |
 |---------|-----------------|-------|
-| `crossterm` 0.29.0 | `tokio` 1.44+ | EventStream works with tokio 1.44+ (verified dev dep constraint); no breaking changes from 0.28.1 |
-| `crossterm` 0.29.0 | `x86_64-pc-windows-msvc` | Explicit supported target in docs.rs 0.29.0 |
-| `ring` 0.17.14 | `x86_64-pc-windows-msvc` | Precompiled asm objects in crates.io package; no NASM needed |
-| `quinn` 0.11.9 | `x86_64-pc-windows-msvc` | Pure Rust + socket2; confirmed buildable |
-| `ssh-key` 0.6.7 `encryption` feature | `x86_64-pc-windows-msvc` | Pure Rust (bcrypt-pbkdf, AES-CTR); builds on all targets |
+| `termwiz` 0.23.3 | `serde` 1.x | `use_serde` feature enables `#[derive(Serialize, Deserialize)]` on `Change`; serde 1.x already in workspace |
+| `termwiz` 0.23.3 | `tokio` 1.x | No direct tokio dep in termwiz; integration is purely at the application layer |
+| `termwiz` 0.23.3 | `postcard` 1.x | `Change` serializes fine with postcard; no postcard-incompatible types in the variants used |
+| `crossterm` 0.29.0 + `osc52` | `x86_64-pc-windows-msvc` | OSC 52 writes a plain escape sequence to stdout; works cross-platform |
+| `tokio::io::unix::AsyncFd` | `tokio` 1.52.3 | Part of tokio's Unix-specific I/O; `io-util` feature (already enabled in workspace) is required |
+| `nix` 0.29 `fcntl` | Linux only | Already gated `cfg(unix)` in nosh-server; no Windows impact |
 
 ---
 
 ## Sources
 
-- https://docs.rs/quinn/0.11.9/quinn/struct.Connection.html — complete method list verified; no migrate/set_path/network_path confirmed absent
-- https://docs.rs/quinn/0.11.9/quinn/struct.Endpoint.html — rebind / rebind_abstract signatures verified
-- https://docs.rs/quinn/0.11.9/quinn/struct.ServerConfig.html — migration() method signature and default=true verified
-- https://docs.rs/quinn/0.11.9/quinn/struct.TransportConfig.html — keep_alive_interval, max_idle_timeout, mtu_discovery_config verified
-- https://docs.rs/quinn/0.11.9/quinn/struct.ConnectionStats.html — PathStats fields (rtt, cwnd, lost_packets, current_mtu) verified
-- https://docs.rs/quinn/0.11.9/quinn/struct.EndpointConfig.html — cid_generator; stable_id on Connection verified
-- https://github.com/quinn-rs/quinn/blob/main/quinn/src/endpoint.rs — rebind_abstract implementation; ConnectionEvent::Rebind broadcast
-- https://github.com/quinn-rs/quinn/blob/main/quinn-proto/src/connection/mod.rs — path/prev_path/path_counter fields; PATH_CHALLENGE/PATH_RESPONSE logic
-- https://docs.rs/ssh-key/0.6.7/ssh_key/private/struct.PrivateKey.html — read_openssh_file, is_encrypted, decrypt, sign API verified
-- https://github.com/RustCrypto/SSH/blob/master/ssh-key/Cargo.toml — encryption feature deps (bcrypt-pbkdf, AES-CTR, ChaCha20Poly1305) verified
-- https://docs.rs/crossterm/0.29.0/crossterm/index.html — features (event-stream, events, windows), x86_64-pc-windows-msvc target support verified
-- https://docs.rs/crossterm/latest/crossterm/event/struct.EventStream.html — event-stream feature flag, tokio compatibility, Windows targets verified
-- https://github.com/crossterm-rs/crossterm/releases — 0.29.0 released April 5 2025 confirmed latest
-- https://github.com/crossterm-rs/crossterm/issues/935 — use-dev-tty + event-stream incompatibility documented
-- https://github.com/briansmith/ring/blob/main/BUILDING.md — x86_64-pc-windows-msvc precompiled asm objects (no NASM from crates.io) verified
-- https://docs.rs/getrandom/latest/getrandom/ — getrandom 0.4.2; fill() API; already transitive via ring/uuid in lockfile
-- Cargo.lock (nosh workspace, direct inspection) — uuid 1.23.1 v4 in nosh-server; crossterm 0.28.1 in nosh-client; ring 0.17.14; getrandom 0.2.17/0.3.4/0.4.2 all transitive
+- https://docs.rs/termwiz/0.23.3/termwiz/surface/struct.Surface.html — `get_changes`, `flush_changes_older_than`, `diff_screens`, `SequenceNo` API verified
+- https://docs.rs/termwiz/0.23.3/termwiz/surface/change/enum.Change.html — all 15 variants confirmed; `Serialize + Deserialize` confirmed
+- https://lib.rs/crates/termwiz — version 0.23.3 (released 2026-03-20); ~416K SLoC dep tree confirmed
+- https://docs.rs/alacritty_terminal/0.26.0/alacritty_terminal/ — no diff/change-tracking confirmed; sub-1.0 unstable API confirmed
+- https://github.com/mobile-shell/mosh/blob/master/src/frontend/terminaloverlay.cc — prediction engine structure (ConditionalOverlayCell, PredictionEngine, epoch model, cull() pattern) verified
+- https://deepwiki.com/mobile-shell/mosh/3.2-state-synchronization-protocol — SSP diff model, echo_ack mechanism, protobuf serialization confirmed
+- https://docs.rs/crossterm/0.29.0/crossterm/index.html — `clipboard` module, `CopyToClipboard`, `osc52` feature requirement confirmed
+- https://github.com/crossterm-rs/crossterm/blob/master/CHANGELOG.md — OSC 52 added in 0.29.0 ("Copy to clipboard using OSC52 #974") confirmed
+- https://docs.rs/crate/quinn/latest — quinn 0.11.9 confirmed as latest (released 2025-08-27)
+- https://docs.rs/crate/tokio/latest — tokio 1.52.3 confirmed as latest (released 2026-05-08)
+- https://github.com/quinn-rs/quinn/issues/2041 — Windows GRO/WSAEMSGSIZE root cause confirmed (open, no upstream fix); 128-byte control buffer insufficient for UDP_COALESCED_INFO
+- https://github.com/quinn-rs/quinn/releases — quinn-udp 0.6.1 (2025-03-27) "disable GSO after probing" partial Windows fix confirmed; no full WSAEMSGSIZE resolution
+- https://github.com/tokio-rs/tokio/issues/4488 — `AsyncFd` as correct pattern for PTY master fd nonblocking async read confirmed
+- https://docs.rs/tokio/latest/tokio/io/unix/struct.AsyncFd.html — `readable()`, `try_io()`, nonblocking fd requirements confirmed
+- https://github.com/djkoloski/rust_serialization_benchmark — postcard outperforms prost on payload size and encode speed confirmed
+- https://reemus.dev/tldr/rust-cross-compilation-github-actions — `windows-latest` + `x86_64-pc-windows-msvc` native build pattern confirmed (no cross-compile toolchain needed)
 
 ---
-*Stack research for: nosh QUIC remote shell — v1.1 M3 Roaming + Windows Client*
-*Researched: 2026-05-30*
+*Stack research for: nosh QUIC remote shell — v1.2 M4 Predictive Echo + Daily-Driver Readiness*
+*Researched: 2026-06-01*

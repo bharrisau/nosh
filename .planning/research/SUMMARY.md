@@ -1,226 +1,411 @@
 # Project Research Summary
 
-**Project:** nosh — QUIC-based roaming remote shell
-**Domain:** v1.1 M3 Roaming + Windows Client (incremental milestone on a working Rust QUIC shell)
-**Researched:** 2026-05-30
+**Project:** nosh — QUIC roaming remote shell
+**Domain:** v1.2 M4 Predictive Echo + Daily-Driver Readiness
+**Researched:** 2026-06-01
 **Confidence:** HIGH
 
 ## Executive Summary
 
-nosh v1.1 adds two orthogonal but architecturally well-understood capabilities to an already working QUIC shell: QUIC connection migration (roaming) and a bounded Windows-client slice. The research finding that changes the implementation order is that `Session.identity` threading is a prerequisite for nearly everything in this milestone — session persistence, reattach authorization, and the per-identity cap all depend on the authenticated peer SPKI being extracted from the TLS handshake and stored in `Session.identity`. This seam was deliberately deferred in v1.0 and must be the first implementation task. Migration, by contrast, requires almost no application code: `ServerConfig::migration(true)` is the effective totality of the QUIC-layer change, and the pump tasks continue transparently.
+nosh v1.2 adds the headline capability that makes a roaming shell worth using daily: Mosh-style
+speculative local echo over QUIC datagrams. The four research files converge on a clear build
+order: fix the PTY reader zombie race first (it is already a latent server reliability bug and
+must not accumulate further under M4 orphan-session load), then design the datagram state-sync
+wire format before writing a single line of prediction code (the format gates everything else),
+then build the server terminal state model and diff encoder, then the client predictor, then the
+QoL features on top. All four researchers independently flag the PTY race fix and the datagram
+format as blocking prerequisites — this is the strongest cross-cutting signal in the research.
 
-The recommended build order groups work around its dependencies: identity threading first (unblocks everything), then session persistence and the session state machine (precondition for reattach), then cold reattach protocol (the primary implementation complexity), then connection migration validation (nearly independent, lightest by implementation weight), then Windows client (isolated behind `#[cfg]` gates, can overlap with Phases 3-4 once nosh-auth's FileSigner is stable). The stack requires no new crates beyond a `crossterm` bump from 0.28.1 to 0.29.0 and adding `futures = "0.3"` for EventStream; all other building blocks (uuid, ssh-key, ed25519-dalek, postcard) are already in the lockfile.
+The recommended stack addition is `termwiz 0.23.3` (client- and server-side terminal grid and
+`get_changes` diff API) replacing a bespoke grid that would need to be written from scratch. The
+existing `postcard` + `serde` discipline is extended to carry `termwiz::surface::change::Change`
+payloads in QUIC datagrams — no protobuf, no new serialization crate. `crossterm 0.29.0`'s
+`osc52` feature handles clipboard passthrough with zero new dependencies. All other QoL features
+(connection-loss banner, terminal title propagation, `--predict` flags) are application logic on
+the existing stack.
 
-The main implementation risk is the cold reattach subsystem: the `SequencedOutputBuffer` ring buffer plus the session state machine (Active → Orphaned → Reconnecting) must be correct before any reconnect logic is exercised, and the two-factor reattach authorization (SSH handshake identity check AND session token) must be designed in from the start — retrofitting the identity check after a token-only implementation requires a protocol change. The secondary risk is Windows platform behavior: resize events arrive as `WINDOW_BUFFER_SIZE_RECORD` (not SIGWINCH), VT processing must be explicitly enabled in legacy console hosts, and the file-permission check cannot read Windows ACLs and must be documented as best-effort.
+The hardest single design decision is the prediction epoch model: epoch-reset-on-cursor-move is a
+day-one gate, not a refinement. An engine that predicts in cursor-addressing apps (vim, htop,
+less) produces visible screen corruption that is worse than no prediction. Conservative fallback
+(suppress prediction after any CSI cursor-move or non-printing control key; never display on a
+fresh terminal row until the server confirms the first character) must be baked into the initial
+design. Likewise, noecho-suppression (do not predict during `stty -echo` prompts) is a security
+requirement of the prediction feature itself, not a later hardening step. The security design
+document is the last deliverable of the milestone but TOFU prompt UX and noecho-suppression must
+be tracked as requirements during implementation, not deferred.
 
 ## Key Findings
 
 ### Recommended Stack
 
-The v1.1 stack is additive on top of the locked v1.0 crates. The single dependency change is bumping `crossterm` from 0.28.1 to 0.29.0 (OSC52 support useful for M5; rustix 1.0; no breaking API changes) and adding `futures = "0.3"` for the `EventStream` async trait bound. All session persistence, reattach token generation, and output buffering logic is implemented over existing crates (`uuid`, `postcard`, `bytes`, `VecDeque`). The Windows on-disk key signing path is pure Rust (`ssh-key` 0.6.7 `encryption` feature + `ed25519-dalek` 2.2.0), requires no C build toolchain, and builds cleanly on `x86_64-pc-windows-msvc` once `ring` 0.17.14's precompiled assembly objects are in place.
+The v1.1 stack is locked and ships unchanged. The single consequential new dependency is
+`termwiz 0.23.3` added to `nosh-proto`, `nosh-server`, and `nosh-client` with
+`default-features = false, features = ["use_serde"]`. termwiz provides `Surface` (full terminal
+grid), `get_changes(seq)` / `flush_changes_older_than(seq)` (incremental diff log), and
+`diff_screens` — mapping Mosh's framebuffer+diff model onto a maintained Rust type rather than
+owning ~2000 lines of grid logic. The `Change` enum serializes with postcard directly; no
+protobuf and no new serialization crate. All other v1.2 features are zero-new-crate changes:
+OSC 52 from the existing `crossterm 0.29.0` `osc52` feature, the PTY race fix from existing
+`nix 0.29` + `tokio::io::unix::AsyncFd`, and connection-loss notification from existing
+`tokio` + `quinn::Connection::stats()`.
 
-**Core technologies (v1.1 additions and confirmations):**
+**Core v1.2 additions:**
+- `termwiz 0.23.3`: terminal grid + incremental diff API — replaces bespoke grid; `get_changes` is the critical API
+- `crossterm 0.29.0` `osc52` feature: OSC 52 clipboard write — already in tree, feature flag only
+- `tokio::io::unix::AsyncFd` + `nix` `O_NONBLOCK` + `fcntl`: PTY async read — eliminates zombie race, no new deps
+- Bespoke `PredictionEngine` (~250-350 lines): client-side speculative overlay — no Rust crate exists for Mosh SSP
 
-- `quinn` 0.11.9: migration is `ServerConfig::migration(true)` on the server; `Endpoint::rebind()` for deliberate interface switches on the client; `Connection::stable_id()` is the correct live-session map key before orphaning. Methods `Connection::migrate()`, `set_path()`, `network_path()`, `path()` do NOT exist — do not search for them.
-- `crossterm` 0.29.0: Windows raw mode, resize events, and EventStream; upgrade from 0.28.1; do NOT enable `use-dev-tty` (Unix-only, breaks Windows build with `event-stream` per issue #935)
-- `ssh-key` 0.6.7 + `encryption` feature: on-disk private key loading with passphrase decryption for Windows client; gate the `encryption` feature behind `cfg(target_os = "windows")` to avoid inflating the Linux server binary
-- `ed25519-dalek` 2.2.0: Ed25519 signing inside `FileSigner` for Windows; already in tree; do not upgrade to 3.0.0-pre (pre-release API)
-- `uuid` 1.x v4: session token generation (already in nosh-server); 122 bits of CSPRNG entropy sufficient for reattach tokens
-- `rustls-ring` (not `aws-lc-rs`): ring 0.17.14 ships precompiled x86_64-windows assembly — no NASM, no CMake; keep this backend for the Windows build path
+**Do NOT add:**
+- `prost`/protobuf — `termwiz::Change` is serde-serializable; postcard is smaller and faster
+- `alacritty_terminal` — no diff API, sub-1.0 unstable, not designed for external use
+- `tokio_pty_process` — unmaintained since 2019; `AsyncFd` is the current idiomatic approach
+- Any 0-RTT reattach mechanism — deliberately deferred per INIT.md; 1-RTT cold reattach already ships
 
 ### Expected Features
 
-**Must have (table stakes for v1.1 launch):**
+**Must have (table stakes — M4 done when these pass):**
+- Datagram state sync: server sends sparse cell diffs over RFC 9221 datagrams; latest-state-wins
+- Predictive echo: printable characters, backspace, left/right arrow cursor motion
+- Unconfirmed rendering: underline on speculative cells when RTT > FLAG_TRIGGER_HIGH (~80 ms)
+- Prediction epochs: control chars (ESC, Enter, Ctrl-C, up/down arrows) reset epoch; no display until server confirms from new epoch
+- Conservative fallback: no prediction on fresh terminal row; no prediction in cursor-addressing apps; no prediction during noecho prompts
+- Adaptive mode (default): prediction activates above ~30 ms SRTT, suppressed below ~20 ms; `--predict always/adaptive/never` flags
+- Connection-loss banner: overlay row 0 when no datagram for >5 s; elapsed counter; "Press ~. to disconnect" after threshold
+- OSC 52 clipboard passthrough: detect in server PTY output, forward on reliable stream, emit at client; write-only
+- Terminal title propagation: OSC 0/2 sequences pass through unstripped (policy check, likely no new code)
 
-- `Session.identity` threaded from authenticated TLS cert — fills the explicit v1.0 seam at `session.rs:119`; prerequisite for all other persistence and reattach features
-- Server-side session persistence — PTY + shell survive QUIC connection drop; sessions enter orphaned state; `idle_timeout` default 0 (disabled); per-identity cap (default 5) is the memory bound
-- Cold reattach (1-RTT) — `Reattach{token, last_acked_seq}` on the new connection's first stream; server validates identity + token; replays buffered output; 2 RTTs total client-perceived (handshake + 1 message)
-- Reattach authorization bound to SSH identity — two-factor: TLS handshake re-runs on every reconnect (same `authorized_keys` check); token is a session selector, not a credential
-- QUIC connection migration — headless CI test via `Endpoint::rebind()`; `ServerConfig::migration(true)` set explicitly; real Wi-Fi→cellular is a human live-check complement
-- Windows client: VT raw mode and terminal resize — `crossterm::terminal::enable_raw_mode()` on startup; `Event::Resize` via `EventStream`; SIGWINCH handler gated `#[cfg(unix)]`
-- Windows client: on-disk Ed25519 key signing — `ssh-key` parse → optional passphrase decrypt → `ed25519-dalek` sign → `FileSigner` implementing `RawEd25519Signer`
-- Windows client: TERM and locale propagation — `TERM` defaulting to `xterm-256color`; `LANG=en_US.UTF-8` if unset
+**Should have (competitive / daily-driver polish):**
+- `--predict always/adaptive/never` CLI flags — power-user override; low cost once engine exists
+- Terminal title with RTT indicator (`--status`) — OSC 0/2 + SRTT already measured; P3 stretch
 
-**Should have (competitive differentiation):**
+**Defer (post-v1.2):**
+- Windows client predictive echo — Linux client must be validated first; scoped as stretch goal
+- Full native scrollback sync — M5; OSC 52 passthrough covers the main "copy from terminal" case
+- Named/numbered session listing — M5; v1.1 auto-reattach covers the solo use case
+- Bell/notification passthrough (OSC 9) — M5+ point release; low daily-driver value
 
-- Headless migration CI test — makes the "zero-RTT invisible roaming" differentiator testable vs Mosh (seconds-visible stall) and ET (reconnection dialog)
-- Native Windows client without WSL — first among Mosh/ET successors; opens the tool to Windows-first developers
-- Reattach authorization via SSH identity (not a session password) — stronger than ET's separate session password; reattach is as secure as the original login
-
-**Defer (post-v1.1):**
-
-- Windows ssh-agent / Pageant integration — named-pipe IPC; out of scope for bounded Windows slice
-- Passphrase-encrypted key interactive prompt — P2; unencrypted keys work for v1.1
-- 0-RTT reattach — replay-safety burden; gain dwarfed by Wi-Fi/DHCP bring-up; deferred per INIT.md
-- Named/numbered session selection — M5+
-- Connection status bar — only meaningful with M4 predictive echo latency data
+**Anti-features (explicitly excluded):**
+- Predictive echo for all control sequences / vim commands — epoch reset suppresses naturally; predicting CSI sequences produces screen corruption
+- OSC 52 clipboard read (paste remote to local) — security hole; most terminals disable it
+- tmux integration — excluded per PROJECT.md; conflicts with native scrollback story
 
 ### Architecture Approach
 
-v1.1 inserts a `SessionRegistry` between the accept loop and the per-connection session pump, decoupling the QUIC `Connection` lifetime from the `Session` (PTY + child) lifetime. The `SessionSlot` wraps a replaceable `conn: Option<Connection>`, the existing `Session`, and a new `SequencedOutputBuffer` ring buffer. The `Message` enum gains four variants: `SessionOpened`, `Reattach`, `ReattachOk`, `ReattachErr`. The signing abstraction (`RawEd25519Signer` trait) already exists; v1.1 adds `FileSigner` alongside `AgentSigner`. Platform `#[cfg]` gates are confined to `nosh-client/src/main.rs` (SIGWINCH handler and Windows resize polling); no forks needed in nosh-proto, nosh-auth, or nosh-server.
+v1.2 adds two layers to the v1.1 session substrate without replacing any existing paths. A new
+parallel display path carries server-authoritative terminal state diffs over QUIC datagrams to
+the client; the existing reliable stream continues to carry raw `PtyData` chunks for the
+`SequencedOutputBuffer` and cold-reattach replay (these are not replaced). On the server,
+`TerminalState` (new module, `vte::Perform` impl) tracks the rendered screen; `DiffEncoder`
+emits `StateDiff` datagrams from the `run_session` pump's `select!` loop. On the client,
+`Predictor` maintains a confirmed `ScreenGrid` plus a speculative overlay; `ClientScreen`
+composes them into a single render pass; `ConnectionLossOverlay` injects a banner when datagrams
+go silent, as a post-process over the same render path — never as a direct `stdout.write_all`.
 
-**Major components:**
+**Major components (dependency-ordered):**
+1. `nosh-proto/src/datagram.rs` (new): `StateDiff` + `ClientEpoch` wire types; encode/decode using postcard — gates all other work
+2. `nosh-server/src/terminal.rs` (new): `TerminalState` implementing `vte::Perform`; add `term_state: Mutex<TerminalState>` to `SessionSlot`; extend `push_output` to also feed vte
+3. `run_session` / `run_reattach_session` pump (modify): new `diff_interval.tick()` arm — `encode_diff()` + `conn.send_datagram()`
+4. `nosh-client/src/predictor.rs` (new): `Predictor`, `ClientScreen`, `ConnectionLossOverlay`; confirmed rendering first, then speculative overlay
+5. `run_pump` client (modify): add `conn.read_datagram()` arm routing through predictor; suppress direct `stdout.write_all` for display when datagrams are active (still advance `highest_applied`)
+6. PTY reader fix: `Session` gets pipe-based shutdown fd; `output_reader` uses `nix::poll` on `[PTY fd, shutdown pipe]` so `abort()` actually works
 
-1. `SessionRegistry` (`nosh-server/src/registry.rs`, new) — authoritative map of live and orphaned sessions; `open()` / `reattach()` / `mark_idle()` / `remove()` operations; per-identity cap enforced on insert; `Arc<SessionRegistry>` shared into every connection handler task
-2. `SessionSlot` (`nosh-server/src/registry.rs`, new) — wraps `Session` + replaceable `quinn::Connection` + `SequencedOutputBuffer`; identity bound at creation; drives the Active → Orphaned → Reconnecting state machine; pump task `AbortHandle`s aborted on disconnect, restarted on reattach
-3. `SequencedOutputBuffer` (`nosh-server/src/registry.rs`, new) — monotonic u64 sequence counter; `VecDeque<(u64, Bytes)>` ring bounded at 64 KiB; `push()` archives each outgoing PTY chunk; `since(last_acked_seq)` produces the replay slice for cold reattach
-4. Identity threading (`nosh-server/src/server.rs`, modified) — `conn.peer_identity()` downcast to `Vec<CertificateDer<'static>>` → `extract_spki_from_cert` → `nosh_key_from_spki` (exposed from `nosh-auth/src/keys.rs`) immediately after handshake, before any message is read
-5. `FileSigner` (`nosh-auth/src/signer.rs`, new) — `RawEd25519Signer` impl for on-disk OpenSSH private keys; `ZeroizeOnDrop` on the key field; narrow scope: load → sign → drop before first `await`
-
-**Recommended build order:**
-
-1. nosh-proto: add 4 new `Message` variants
-2. nosh-auth: add `FileSigner`; expose `nosh_key_from_spki`
-3. nosh-server: `SessionRegistry` + `SessionSlot` + `SequencedOutputBuffer` (independently unit-testable)
-4. nosh-server: identity threading in `handle_connection`
-5. nosh-server: reattach dispatch (branch on first message: `SessionOpen` vs `Reattach`)
-6. nosh-client: `--identity-file` flag; store `session_token`; send `Reattach` on reconnect; `#[cfg]` gates
-7. Migration headless test (`Endpoint::rebind()`)
-8. Windows cross-compile check (`cargo check --target x86_64-pc-windows-gnu`)
+**Key architectural invariants:**
+- `PtyData` on the reliable stream MUST continue to advance `highest_applied` — the `Ack` mechanism and `SequencedOutputBuffer` trim depend on it
+- Keystrokes go on the reliable stream only — never as datagrams; keystroke loss is never acceptable
+- All output to the local terminal goes through `ClientScreen.render_to_stdout()` — never direct `stdout.write_all` once the predictor exists
+- Datagrams are suppressed on the client during the reattach replay window; a `ResumeComplete` signal gates fresh datagrams post-replay
 
 ### Critical Pitfalls
 
-1. **SIGHUP kills shell on client disconnect** — Do NOT close `MasterPty` when the QUIC connection drops. The kernel delivers SIGHUP to the shell session leader when the last open master fd is closed. `MasterPty` must move into `SessionSlot` and remain open for the entire orphan lifetime. This is the core correctness requirement for session persistence and cannot be restructured after the fact.
+All twelve PITFALLS.md entries are real. The top five that must be resolved at design time, not
+retrofitted:
 
-2. **Reattach token as sole auth factor (session hijacking)** — The reattach flow must run the full mutual TLS handshake on every new connection. The `session_token` is a session selector, not a credential. Both the identity fingerprint match AND the token check must pass. Return the same error for bad-token and bad-identity to prevent oracle enumeration. Never log the token.
+1. **Epoch-reset-on-cursor-move is the design gate** — predicting in cursor-addressing apps (vim, less, htop) produces screen corruption that is visually worse than no prediction. Any CSI cursor-move, ED/EL erase, or alternate-screen sequence must reset the epoch. Conservative fallback (no display on fresh terminal row, no display in confirmed-control-char window) must be built in from the initial commit, not added later. Adversarial test required: vim session, `iHello<Esc>`, zero corrupt cells.
 
-3. **`Session.identity` populated before handshake completes** — Call `conn.peer_identity()` only after `connecting.await?` resolves to a `Connection`. Wrap extraction in a constructor that returns `Err` if identity is absent. Make `identity` a non-optional `NoshPublicKey` field, not `Option<T>`, so the type system enforces the invariant.
+2. **PTY reader zombie race is a prerequisite** — `output_reader.abort()` on a `spawn_blocking` task has no effect while the blocking `read()` syscall is in flight. Under M4 orphan-session load this fills the tokio blocking pool. Fix (self-pipe / `nix::poll`) must be the first task of M4 before any load-testing. Every integration test that creates and drops sessions accumulates stuck threads until this is fixed.
 
-4. **No per-identity session cap before first orphan** — The cap must exist before the first orphaned session is stored. With `idle_timeout = 0` (the correct default), there is no automatic eviction. Also run a background reaper task calling `child.try_wait()` on all orphaned sessions to prevent zombie accumulation.
+3. **Datagram MTU / sparse diff must be designed before prediction code** — a full 80x24 terminal grid is ~7.8 KB; QUIC datagram limit is ~1200 bytes. The `StateDiff` wire format must be sparse (changed cells only) and capped at `max_datagram_size() - 100` bytes before any prediction code references it. This also resolves the v1.1 `WSAEMSGSIZE` log warning on Windows.
 
-5. **`ServerConfig::migration` not set explicitly** — Set it explicitly even though the default is `true`, to guard against future default changes and to document intent. Validate with an integration test: `Endpoint::rebind()` mid-session → assert the active stream continues without `ConnectionError`.
+4. **Noecho-suppression is a security requirement of prediction** — a prediction engine that echoes characters during `stty -echo` prompts leaks passwords visually at the client terminal. Track server echo state from the confirmed terminal model; suppress prediction when the server is not echoing the last confirmed character. Must be in the initial design, with a `read -s` test.
+
+5. **Reattach / datagram sync race** — on cold reattach the client replays `PtyData` from `SequencedOutputBuffer`; a datagram arriving during replay applies to a partial-replay screen, creating a torn view. Client must ignore datagrams between `ReattachOk` and replay-complete; a `ResumeComplete` signal gates fresh datagrams post-replay.
+
+**Also critical but scoped to the security doc pass:**
+- TOFU first-contact gap must be named explicitly in the security doc with a mitigation path
+- Privilege model (no privsep) must have its own section in the security doc
+- Datagram replay/staleness analysis must be in the security doc (QUIC TLS 1.3 authenticates datagrams; application-layer monotonic epoch handles stale delivery)
 
 ## Implications for Roadmap
 
-Based on the dependency graph in the research, the milestone maps to five phases. Phases 4 and 5 can run in parallel with or after Phase 3 once the nosh-auth boundary is stable.
+All four research files agree on the phase ordering below. The dependency chain is strict enough
+that deviating from it produces a blocked phase.
 
-### Phase 1: Identity Threading
+### Phase 1: PTY Reader Race Fix (prerequisite, must be first)
 
-**Rationale:** The explicit v1.0 seam. Session persistence keying, reattach authorization, and per-identity cap all require `Session.identity`. Nothing else in v1.1 can be correctly built without it. The implementation touches three files and is the lowest-risk place to start — it is a seam fill, not new design.
+**Rationale:** The `output_reader.abort()` + `spawn_blocking` zombie race is already latent in
+v1.1. Every M4 integration test that creates and orphans sessions accumulates stuck blocking
+threads. Fixing this first means all subsequent development and load testing is not poisoned by
+a pre-existing reliability hole. This is the only fix that has no dependencies on any other M4
+work; every other phase depends on a functioning server session lifecycle.
 
-**Delivers:** `Session.identity: NoshPublicKey` populated from the TLS handshake on every new connection; existing handshake tests still pass; `identity` is a non-optional field (type-level invariant).
+**Delivers:** A server that cleanly terminates PTY reader threads when sessions are orphaned or
+cleaned up. Blocking thread count stays bounded under orphan load.
 
-**Addresses:** Prerequisite for all reattach and persistence features.
+**Addresses:** PITFALLS.md Pitfall 6 (PTY reader zombie race)
 
-**Avoids:** Pitfall 11 (identity captured before handshake completes); precondition for avoiding Pitfall 8 (token-only reattach).
+**Implementation:** Replace `spawn_blocking` + `reader.read` loop with `nix::poll` on
+`[PTY master fd, shutdown pipe read end]`. Add `shutdown_pipe: RawFd` to `Session`. On orphan /
+abort, write to the pipe write end. Gate with `#[cfg(unix)]`. No new crates.
 
-**Research flag:** Standard patterns; no additional research needed. Implementation: `conn.peer_identity()` → downcast → `extract_spki_from_cert` → `nosh_key_from_spki`; expose from `nosh-auth/src/keys.rs`.
+**Avoids:** Blocking pool exhaustion before any M4 load test is run.
 
-### Phase 2: Session Persistence
+**Research flag:** Standard pattern (nix::poll self-pipe trick is well-documented; tokio AsyncFd
+alternative also documented). Skip research-phase for this phase.
 
-**Rationale:** Sessions must survive connection drop before there is anything to reattach to. All three correctness requirements (keep MasterPty open to prevent SIGHUP, enforce per-identity cap before first orphan, run zombie reaper) must be in place before this phase is complete. The `SequencedOutputBuffer` must also start accumulating output from session open — it cannot be added retroactively when cold reattach arrives.
+---
 
-**Delivers:** `SessionRegistry` + `SessionSlot`; orphaned sessions survive QUIC disconnect; PTY + shell continue running; per-identity cap enforced; zombie reaper running; all outgoing PTY chunks assigned monotonic u64 sequence numbers from the moment of session open.
+### Phase 2: Datagram Wire Protocol (nosh-proto, blocks all prediction work)
 
-**Addresses:** Server-side session persistence; per-identity session cap; configurable idle timeout (default off); output ring-buffer for replay (prerequisite for Phase 3).
+**Rationale:** Every other M4 component — server diff encoder, client predictor, reattach
+integration — references the `StateDiff` and `ClientEpoch` wire types. This must be defined and
+tested in isolation before any other new module is written. Getting the format wrong (full grid
+instead of sparse diff, no monotonic epoch, no size cap) requires retrofitting all consumers.
 
-**Avoids:** Pitfall 7 (SIGHUP kills shell); Pitfall 5 (unbounded orphan memory); Pitfall 6 (zombie shell processes).
+**Delivers:** `nosh-proto/src/datagram.rs` with `StateDiff` (sparse `DiffCell` list, `epoch: u64`,
+`cols`/`rows`, `cursor`), `ClientEpoch` (`confirmed: u64`), `encode_datagram` / `decode_datagram`
+using postcard. Unit tests: encode/decode round-trip; datagram size assertion
+(payload `<= max_datagram_size() - 100`).
 
-**Research flag:** Standard patterns. `SessionRegistry` and `SequencedOutputBuffer` are fully specified in the architecture research with complete struct definitions. Unit-testable independently of the full server.
+**Addresses:** Predictive echo P1 (foundation); PITFALLS.md Pitfalls 4 (desync), 5 (MTU), 10 (stale)
 
-### Phase 3: Cold Reattach Protocol
+**Uses:** `postcard` + `serde` (existing); `termwiz::surface::change::Change` (new dep, use_serde feature)
 
-**Rationale:** The highest-complexity deliverable. Requires the state machine (Active → Orphaned → Reconnecting) to prevent the two-clients-one-session race, and requires the two-factor authorization to be correct from the first implementation. The `Message` variants are added early in the build order, but the reattach dispatch and replay logic is the principal new protocol work.
+**Open question (must be resolved in this phase):** Sparse diff encoding strategy — how to
+represent changed-only cells in a size-bounded payload when a large refresh (vim file open, `clear`)
+changes the entire screen. Options: (a) send cells up to size limit, accept partial update this
+frame; (b) prioritize cells near the cursor; (c) fall back to reliable stream for full-screen
+repaints. Must be decided before implementation.
 
-**Delivers:** New QUIC connection from same SSH identity sends `Reattach{token, last_acked_seq}`; server validates identity + token; replays buffered output; session rebound; pump tasks restarted; headless positive test passes; negative test (correct token, wrong key) rejected.
+**Research flag:** Needs design decision on sparse-diff encoding strategy. Flag for
+`--research-phase` during roadmap.
 
-**Addresses:** Cold reattach 1-RTT (table stakes); reattach authorization bound to SSH identity (table stakes); output sequence numbering and replay (table stakes).
+---
 
-**Avoids:** Pitfall 8 (token without SSH re-auth); Pitfall 9 (sequence resync duplicates/gaps); Pitfall 10 (reattach race — two clients one session).
+### Phase 3: Server Terminal State Model (nosh-server)
 
-**Research flag:** Needs careful implementation against the state machine spec. The PITFALLS.md "Looks Done But Isn't" checklist has the definitive test matrix for this phase (13 items).
+**Rationale:** With the wire protocol defined, the server-side `TerminalState` implementing
+`vte::Perform` can be built and unit-tested against known VT sequences before the QUIC plumbing
+is touched. This isolation keeps the vte integration testable independently.
 
-### Phase 4: Connection Migration Validation
+**Delivers:** `nosh-server/src/terminal.rs` — `TerminalState` (grid of `Cell`, cursor position,
+epoch counter), `vte::Perform` impl (`print`, `execute`, `csi_dispatch`, `osc_dispatch` at
+minimum), `push_output_and_parse` on `SessionSlot` that feeds both `SequencedOutputBuffer` and
+`TerminalState`. Unit tests: feed known VT sequences, assert cell contents and cursor position.
 
-**Rationale:** Migration requires almost no production code (`ServerConfig::migration(true)` plus an explicit transport config call). The deliverable is the test suite. Placed after Phase 3 so migration tests run against a server with full session registry — this validates that migration does not disturb the session slot state.
+**Addresses:** PITFALLS.md Pitfall 1 (cursor-move epoch gate requires accurate server cursor tracking)
 
-**Delivers:** `ServerConfig::migration(true)` explicit; headless migration test via `Endpoint::rebind()`; large-output-stream test through simulated migration (measures anti-amplification stall); qlog inspection confirming CID rotation on path change; human-verified Wi-Fi→cellular live check.
+**Uses:** `vte 0.15.0` (add to `nosh-server/Cargo.toml` — NOT currently present); `termwiz 0.23.3`
 
-**Addresses:** Connection migration NAT rebind (table stakes); connection migration explicit path switch (table stakes); migration invisible to user; QUIC migration as headline differentiator over Mosh and ET.
+**Open question:** vte vs termwiz parser on the server. ARCHITECTURE.md and STACK.md converge on:
+use `vte::Perform` for parsing, `termwiz::Surface` as the storage model. Verify the `vte` 0.15.0
+`Perform` trait surface (specifically `osc_dispatch` for OSC 52 detection) before committing.
 
-**Avoids:** Pitfall 1 (migration flag not set); Pitfall 2 (anti-amplification stall); Pitfall 3 (CID linkability); Pitfall 4 (keep-alive/idle timeout misconfig during migration).
+**Research flag:** MEDIUM confidence on vte 0.15.0 `Perform` API surface — verify `osc_dispatch`
+parameters before phase planning.
 
-**Research flag:** Standard patterns; implementation is largely test authorship. Anti-amplification stall duration should be measured empirically in the test environment.
+---
 
-### Phase 5: Windows Client
+### Phase 4: Server Datagram Sender (run_session pump extension)
 
-**Rationale:** Isolated behind `#[cfg]` gates; shares nosh-proto message types and the existing connection/auth path. Can proceed in parallel with Phases 3-4 once Phase 2's nosh-auth boundary (FileSigner, crossterm bump) is stable. Platform-specific work is confined to nosh-client: SIGWINCH gating, Windows resize via EventStream, `FileSigner` behind `cfg(windows)`, `--identity-file` CLI flag.
+**Rationale:** With protocol types and terminal state model both working, wire them together into
+the server's `run_session` `select!` loop. This phase produces end-to-end datagrams from server to
+client — without any prediction yet, just confirmed state delivery.
 
-**Delivers:** Native Windows client (no WSL); `cargo check --target x86_64-pc-windows-gnu` clean; on-disk Ed25519 key authenticated against Linux server; raw mode and resize working in Windows Terminal; TERM and locale propagation; best-effort file permission warning with documented ACL gap.
+**Delivers:** New `diff_interval.tick()` arm in `run_session` and `run_reattach_session` calling
+`encode_diff()` + `conn.send_datagram()`. Integration test: connect client and server, type
+characters, assert `conn.read_datagram()` on client receives non-empty `StateDiff` frames. Add
+`ResumeComplete` handshake to gate datagrams after reattach replay.
 
-**Addresses:** All four Windows table-stakes features (raw mode, resize, on-disk signing, TERM/locale).
+**Addresses:** PITFALLS.md Pitfall 7 (reattach/datagram race)
 
-**Avoids:** Pitfall 12 (private key in memory — narrow scope + ZeroizeOnDrop); Pitfall 13 (ACL gap — document limitation); Pitfall 14 (WINDOW_BUFFER_SIZE_RECORD vs SIGWINCH — use EventStream); Pitfall 15 (VT processing in legacy console hosts).
+**Uses:** `quinn::Connection::send_datagram` (already enabled in `nosh-proto/src/transport.rs:8-9`)
 
-**Research flag:** Standard patterns for nosh-client integration. Windows-specific behavioral gaps (ACL check, codepage, legacy console host VT processing) are documented in PITFALLS.md; implement to the best-effort level specified there and record all limitations.
+**Note:** Coalesce PTY output — drain `out_rx`, build one diff, send one datagram per 16 ms tick.
+Do NOT send one datagram per `PtyData` chunk.
+
+**Research flag:** Standard pattern. Skip research-phase.
+
+---
+
+### Phase 5: Client Predictor — Confirmed Rendering, Then Speculative Overlay
+
+**Rationale:** Split into two sub-phases to contain complexity. First confirm the datagram path
+works end-to-end (5a); then add speculative overlay (5b). Keeps bisection tractable when
+predictions go wrong.
+
+**Sub-phase 5a — Confirmed rendering:**
+`nosh-client/src/predictor.rs` with `Predictor` (confirmed `ScreenGrid` only), `ClientScreen`
+(render confirmed state to stdout), `ConnectionLossOverlay` (stub). Adds `conn.read_datagram()` arm
+to `run_pump`; suppresses direct `stdout.write_all` for display (still advances `highest_applied`).
+End-to-end test: screen rendered from datagrams matches raw PTY output.
+
+**Sub-phase 5b — Speculative overlay:**
+Adds `PendingPrediction`, epoch tracking, `add_prediction` / `confirm_up_to` / `cull`, epoch-reset
+on control chars, conservative fallback (fresh row, no-confirm window), underline rendering,
+adaptive RTT threshold, `unicode-width` column advance for CJK/wide chars, bracketed paste
+suppression. This is the hardest UX step — budget 2-3 phases per INIT.md §10.
+
+**Addresses:** All P1 features in FEATURES.md; PITFALLS.md Pitfalls 1, 2, 3, 4, 9
+
+**Critical tests before marking done:**
+- vim session: `iHello<Esc>` — zero corrupt cells
+- `read -s` noecho: zero predicted characters
+- `你好` CJK: cursor column correct after each wide character
+- Bracketed paste: zero predicted cells between `\x1b[200~` and `\x1b[201~`
+- 30% datagram loss simulation: self-corrects within 2 RTTs
+
+**Research flag:** Sub-phase 5b needs `--research-phase` during planning — highest-complexity area
+of M4. Mosh `terminaloverlay.cc` cull() logic, epoch model, `Validity` enum all need careful
+translation to Rust.
+
+---
+
+### Phase 6: QoL Feature Pack
+
+**Rationale:** Connection-loss banner, OSC 52 passthrough, and terminal title propagation are
+mostly independent of the prediction engine and share the "detect escape sequence in PTY output"
+mechanism on the server side. Batch them in one phase.
+
+**Delivers:**
+- `ConnectionLossOverlay` activated: `last_datagram_received > 5s` triggers overlay at row 0 with counter + abort instructions
+- OSC 52 passthrough: server detects in `osc_dispatch`; forwards as `Message::Osc52` on reliable stream; client emits via `crossterm::clipboard::CopyToClipboard`
+- Terminal title propagation: verify OSC 0/2 is not stripped; un-filter if needed
+- `--predict always/adaptive/never` CLI flag: wire to `PredictDisplayMode` enum
+
+**Addresses:** FEATURES.md P1 (connection-loss banner, OSC 52) and P2 (terminal title); QoL ranking items 2, 3, 4, 5
+
+**Uses:** `crossterm 0.29.0` with `osc52` feature (add feature flag to `nosh-client/Cargo.toml`); no new crates
+
+**Research flag:** Standard pattern. Skip research-phase.
+
+---
+
+### Phase 7: Windows CI Gate
+
+**Rationale:** The Windows CI gate has existed since v1.1 but has never run (no git remote
+configured). Now that M4 adds new client code, running CI on Windows is required before the
+milestone is complete.
+
+**Delivers:** `.github/workflows/ci.yml` `build-windows` job on `windows-latest` runner running
+`cargo build --locked --target x86_64-pc-windows-msvc -p nosh-client`. Also adds
+`quinn_udp=error` tracing filter on Windows to silence the WSAEMSGSIZE log warning (workaround
+pending upstream quinn fix in a future 0.11.x release).
+
+**Addresses:** PITFALLS.md Pitfall 12 (Windows CI false-green); STACK.md Windows CI section
+
+**Research flag:** Standard pattern. Skip research-phase.
+
+---
+
+### Phase 8: Security Design Document
+
+**Rationale:** The security doc is the last deliverable but TOFU prompt UX and noecho-suppression
+must be tracked as requirements during Phases 5-6, not deferred. The security doc formalizes what
+must already be implemented.
+
+**Delivers:** Security design document covering:
+- TOFU first-contact gap: threat named explicitly; mitigation = first-connection fingerprint prompt + `nosh-keyscan` for pre-distribution
+- Privilege model: server runs as authenticated user; no privsep; contrast with sshd; mitigations listed
+- Datagram replay/staleness: QUIC TLS 1.3 authenticates datagrams; per-packet replay protection; application-layer monotonic epoch handles stale delivery
+- Noecho-suppression: documented as security requirement of prediction; verified via `read -s` test
+- Reattach two-factor (W1 pattern): mint-send-commit token rotation must survive any M4 refactor
+
+**Addresses:** PITFALLS.md Pitfalls 8, 9, 10, 11
+
+**Research flag:** Standard documentation pass. Use PITFALLS.md "Looks Done But Isn't" checklist
+for sign-off criteria.
+
+---
 
 ### Phase Ordering Rationale
 
-- Identity first because it is the prerequisite seam for both persistence and reattach; building either without it produces an anonymous session that cannot be securely reattached.
-- Persistence before reattach because reattach requires an orphaned session to exist, and the `SequencedOutputBuffer` must accumulate from session open.
-- Migration validation after reattach because migration tests are more meaningful against a fully-equipped server, and migration is the lightest phase by production code weight.
-- Windows in parallel after Phase 2 because `FileSigner` and the `cfg` gates are independent of server-side reattach logic once the auth trait boundary is stable.
-- No session-by-name, no 0-RTT, no Pageant — explicitly deferred; these add complexity not validated by this milestone's architecture-validation goal.
+- **Phase 1 before all others:** PTY zombie race is the only fix with no M4 dependencies; all four research files flag it independently as a prerequisite. Every integration test that creates and drops sessions is poisoned until this is fixed.
+- **Phase 2 before Phases 3-5:** Wire protocol is the shared interface between server and client components. Format-churn retrofitting all consumers is the failure mode of getting this wrong.
+- **Phase 3 before Phase 4:** Server terminal state model must be unit-tested in isolation before async QUIC plumbing is added.
+- **Phase 4 before Phase 5:** Confirmed datagram delivery must be end-to-end validated before speculative overlay is built on top.
+- **Phase 5a before Phase 5b:** Confirmed rendering validates the datagram path without speculative complexity; makes bisection tractable.
+- **Phases 6 and 7 after Phase 5a:** QoL features and CI are independent of speculative prediction but should land after the core datagram path is stable.
+- **Phase 8 last:** The security doc formalizes what must already be implemented; cannot be written meaningfully before implementation is stable.
 
 ### Research Flags
 
-Phases needing closer attention during planning:
+Phases needing deeper research during planning:
+- **Phase 2 (datagram wire protocol):** Sparse diff encoding strategy is an open design question — how to handle large terminal refreshes within QUIC datagram size limits. Must be resolved before implementation can be planned.
+- **Phase 3 (server terminal state):** vte 0.15.0 `Perform` trait `osc_dispatch` signature needs verification before phase planning. MEDIUM confidence.
+- **Phase 5b (speculative overlay):** Highest-complexity area of M4. Mosh `terminaloverlay.cc` cull() logic, epoch model, `Validity` state machine all need careful translation. Budget 2-3 phases. Flag for `--research-phase`.
 
-- **Phase 3 (Cold Reattach):** State machine correctness and two-factor authorization are the principal risk. Architecture research specifies exact state transitions; PITFALLS.md has a 13-item "Looks Done But Isn't" checklist — use both as acceptance criteria.
-- **Phase 5 (Windows Client):** Windows platform behavior (ACL permissions, codepage, legacy console VT processing) has known gaps. Plan for Windows-specific integration tests from the start; Linux CI will not catch Windows behavioral issues.
-
-Phases with standard well-documented patterns:
-
-- **Phase 1 (Identity Threading):** ~30 lines across three files; grounded in verified quinn/rustls API.
-- **Phase 2 (Session Persistence):** Standard Rust data structures (VecDeque, HashMap); architecture file has complete struct definitions.
-- **Phase 4 (Connection Migration):** One config flag + three test scenarios; test authorship is more effort than the production code change.
+Phases with standard patterns (skip research-phase):
+- **Phase 1** — nix::poll self-pipe trick; well-documented
+- **Phase 4** — `conn.send_datagram()` already enabled; interval-based coalescing is standard
+- **Phase 6** — crossterm OSC 52 API and connection-loss timer are standard async patterns
+- **Phase 7** — windows-latest + x86_64-pc-windows-msvc native build is well-documented
+- **Phase 8** — security doc; checklist-driven
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | All crate versions and APIs verified against docs.rs live data. No new crates needed. ring precompiled-assembly Windows claim verified from BUILDING.md. crossterm 0.29.0 + futures are the only dependency changes. |
-| Features | HIGH | Derived from INIT.md design brief, Mosh/ET public record, QUIC RFC 9000/9221, and the v1.0 validated codebase. Feature dependency graph grounded in actual code file:line citations. |
-| Architecture | HIGH | Every struct, method, and file path grounded in the actual v1.0 codebase with verified line numbers. quinn API surface (`peer_identity`, `stable_id`, `rebind`) verified from docs.rs. |
-| Pitfalls | HIGH | SIGHUP/MasterPty behavior is standard Unix; reattach race and sequence-number design have clear documented mitigations; Windows pitfalls verified from official Microsoft and crossterm issue trackers. |
+| Stack | HIGH | All crate versions and APIs verified against docs.rs / GitHub live data; termwiz `get_changes` / `flush_changes_older_than` / `Change` serde confirmed; crossterm OSC 52 confirmed; AsyncFd PTY pattern confirmed via tokio issue #4488 |
+| Features | HIGH | Mosh paper + source-level research; SRTT thresholds from deepwiki Mosh analysis; all claims attributed to primary sources |
+| Architecture | HIGH | Every component boundary grounded in actual nosh codebase file:line citations (registry.rs:235, server.rs:409, main.rs:604); Mosh SSP design verified against published paper |
+| Pitfalls | HIGH | 12 pitfalls sourced to primary references (Mosh paper, tokio docs, quinn issues, QUIC RFCs); nosh codebase v1.1 inspection confirms zombie race location |
 
 **Overall confidence:** HIGH
 
 ### Gaps to Address
 
-- **Windows ACL permission check:** `std::fs::Permissions` on Windows does not read ACLs. Emit a best-effort warning based on `FILE_ATTRIBUTE_READONLY` and document the gap. A proper ACL check (`GetNamedSecurityInfo` via the `windows` crate) is optional scope for v1.1.
-- **RPK (RFC 7250) upgrade path:** rustls 0.23.16+ supports raw public keys but v1.0 uses self-signed cert pinning. v1.1 does not require RPK, but the upgrade path should be tracked — it would remove the `rcgen` dependency and simplify the `x509-parser` SPKI extraction. Defer unless the extraction in `handle_connection` proves awkward.
-- **Passphrase-encrypted keys on Windows:** The `ssh-key` `encryption` feature supports decryption but the interactive passphrase prompt is not in scope for v1.1. Unencrypted keys work. Document the limitation; prompt implementation is P2.
-- **Anti-amplification stall duration in practice:** RFC 9000 §9.4 mandates a 1-2 RTT output stall after migration. Actual severity depends on RTT and burst rate in the test environment. The migration headless test should measure this empirically and gate on "no pause longer than 3 RTTs."
+- **Sparse diff encoding (Phase 2):** Open design decision, not a research gap. Must be resolved as the first task of Phase 2 before any wire format is committed. Options: partial update (cursor context first), skip frame and wait for next tick, fall back to reliable stream for large repaints.
+
+- **vte 0.15.0 `osc_dispatch` parameters:** MEDIUM confidence on exact `Perform` trait API for OSC dispatch. Verify `fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool)` signature and alternate-screen handling before Phase 3 planning.
+
+- **termwiz parser vs vte for server-side:** Both work; the integration path (vte parses into termwiz Surface, vs termwiz's own parser) needs a decision before Phase 3 implementation. Low risk either way.
+
+- **portable-pty 0.9.0 `AsRawFd` API:** STACK.md states `AsRawFd` is available; verify the exact method name and whether it requires bypassing the `Box<dyn Read>` abstraction (acknowledged as Linux-specific; gate `#[cfg(unix)]`).
+
+- **Emoji / ZWJ sequence width in prediction:** `unicode-width` handles CJK; ZWJ emoji sequences (family emoji, flag sequences) are not handled by `UnicodeWidthChar` alone. Policy decision needed: epoch-reset for ambiguous-width inputs is the recommended default.
 
 ## Sources
 
 ### Primary (HIGH confidence)
 
-- https://docs.rs/quinn/0.11.9/quinn/struct.Connection.html — complete method list; `peer_identity`, `stable_id`, `remote_address` verified; absence of `migrate()`/`set_path()`/`network_path()` confirmed
-- https://docs.rs/quinn/0.11.9/quinn/struct.ServerConfig.html — `migration()` method and default confirmed
-- https://docs.rs/quinn/0.11.9/quinn/struct.Endpoint.html — `rebind()` / `rebind_abstract()` signatures verified
-- https://docs.rs/quinn/0.11.9/quinn/struct.TransportConfig.html — `keep_alive_interval`, `max_idle_timeout`, `mtu_discovery_config` verified
-- https://docs.rs/rustls/latest/rustls/ — version 0.23.40; `peer_identity` downcast path under rustls-ring backend
-- https://docs.rs/ssh-key/0.6.7/ssh_key/private/struct.PrivateKey.html — `read_openssh_file`, `is_encrypted`, `decrypt`, key_data API; `encryption` feature deps (bcrypt-pbkdf, AES-CTR, ChaCha20Poly1305) pure Rust — all verified
-- https://docs.rs/crossterm/0.29.0/crossterm/ — `event-stream` feature, `x86_64-pc-windows-msvc` target, `enable_raw_mode` verified; 0.29.0 released 2025-04-05
-- https://github.com/crossterm-rs/crossterm/issues/935 — `use-dev-tty` + `event-stream` incompatibility documented
-- https://github.com/briansmith/ring/blob/main/BUILDING.md — x86_64-windows precompiled asm objects; no NASM from crates.io
-- https://www.rfc-editor.org/rfc/rfc9000.html §9.4 — anti-amplification limit on new paths (3x bytes received)
-- https://www.rfc-editor.org/rfc/rfc9000.html §9.5 — CID rotation requirement on migration for privacy
-- Codebase (verified line citations): `session.rs:119` identity seam; `server.rs:101/145/185/264` accept loop / handle_connection / run_session / pump select!; `messages.rs` 4-variant Message enum; `signer.rs:26` RawEd25519Signer trait; `keys.rs:172` extract_spki_from_cert; `verifier.rs:218` parse_ed25519_from_spki; `client.rs:27` ClientIdentity::from_signer; `client.rs:208` RawModeGuard; `main.rs:103` SIGWINCH handler; `transport.rs:28` transport_config
+- https://docs.rs/termwiz/0.23.3/termwiz/surface/struct.Surface.html — `get_changes`, `flush_changes_older_than`, `diff_screens`, `SequenceNo` API verified
+- https://docs.rs/termwiz/0.23.3/termwiz/surface/change/enum.Change.html — 15 variants; `Serialize + Deserialize` confirmed
+- https://docs.rs/crossterm/0.29.0/crossterm/index.html — `clipboard::CopyToClipboard`, `osc52` feature confirmed
+- https://docs.rs/tokio/latest/tokio/io/unix/struct.AsyncFd.html — `readable()`, `try_io()` API confirmed
+- https://github.com/tokio-rs/tokio/issues/4488 — `AsyncFd` as PTY master nonblocking pattern confirmed
+- https://mosh.org/mosh-paper.pdf — SSP, epoch-based prediction, conservative mode, underline rendering, 0.9% error rate
+- https://deepwiki.com/mobile-shell/mosh/4.2-predictive-overlay-system — SRTT thresholds, `Validity` enum, `cull()` pattern
+- https://docs.rs/quinn/latest/quinn/struct.Connection.html — `send_datagram`, `read_datagram`, `max_datagram_size()` API
+- `crates/nosh-server/src/registry.rs:235` — `SessionSlot` struct; `push_output` at line 334 (codebase verified)
+- `crates/nosh-server/src/server.rs:356-373` — `output_reader` spawn_blocking location (codebase verified)
+- `crates/nosh-proto/src/transport.rs:8-9` — datagram buffer sizes already enabled (codebase verified)
 
 ### Secondary (MEDIUM confidence)
 
-- https://github.com/mobile-shell/mosh/issues/394 and /806 — Mosh session persistence / orphan issues; UX expectations for idle-timeout-off default
-- https://eternalterminal.dev/howitworks/ and https://github.com/MisterTea/EternalTerminal/blob/master/docs/protocol.md — ET BackedReader/BackedWriter sequence-number reattach model; `RETURNING_CLIENT` response; session-password auth model
-- Marten Seemann 2023 (https://seemann.io/posts/2023-12-18---exploiting-quics-path-validation/) — PATH_CHALLENGE flood attack; 256-frame cap fix in quinn >= 0.10.4
+- https://deepwiki.com/mobile-shell/mosh/3.2-state-synchronization-protocol — SSP diff model, echo_ack mechanism
+- https://github.com/mobile-shell/mosh/blob/master/src/frontend/terminaloverlay.cc — prediction engine structure (C++ reference for Rust port)
+- https://github.com/quinn-rs/quinn/issues/2041 — Windows GRO/WSAEMSGSIZE root cause (open issue, no upstream fix)
+- https://lib.rs/crates/termwiz — dep tree size (~416K SLoC) confirmed
+- RFC 9221 — QUIC datagram extension (unreliable delivery guarantee)
+- RFC 9001 — QUIC-TLS (TLS 1.3 per-packet authentication applies to datagrams)
 
-### Tertiary (LOW confidence)
+### Tertiary (LOW confidence / needs validation at implementation time)
 
-- https://github.com/rustls/rustls/issues/2257 — RPK compliance caveat; current resolution status unverified
-- https://github.com/microsoft/terminal/issues/394 — Windows Terminal `WINDOW_BUFFER_SIZE_RECORD` quirks; behavior may vary across Windows Terminal versions
+- vte 0.15.0 `Perform` trait `osc_dispatch` signature — verify parameters before Phase 3
+- `portable-pty 0.9.0` `MasterPty::as_raw_fd()` exact method name — verify before Phase 1 implementation
+- termwiz internal VT parser (`termwiz::terminal::parser`) as alternative to vte — mentioned as option; not verified against 0.23.3 API
+- unicode ZWJ emoji handling via `unicode-width` — `UnicodeWidthChar` handles CJK; ZWJ sequences need separate policy decision
 
 ---
-*Research completed: 2026-05-30*
+*Research completed: 2026-06-01*
 *Ready for roadmap: yes*
