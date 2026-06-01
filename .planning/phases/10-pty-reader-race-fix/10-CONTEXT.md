@@ -21,20 +21,23 @@ Phases 11+.
 <decisions>
 ## Implementation Decisions
 
-### Interrupt mechanism (D-01)
-- **D-01:** Unix implementation uses **`AsyncFd` + `O_NONBLOCK`** on the PTY master fd —
-  drive PTY reads from async via `tokio::io::unix::AsyncFd` so there is **no blocking thread
-  at all** for the output reader. This is the strongest answer to success criterion #2
-  ("bounded blocking-thread count"): there is no blocking thread to bound, and orphan
-  teardown is natural async-cancellation (drop the `AsyncFd`-driven task).
-- **D-01a (fallback):** `AsyncFd` + `O_NONBLOCK` requires `portable-pty` to expose the raw
-  master fd and tolerate `O_NONBLOCK` being set on it. **The researcher MUST confirm this
-  feasibility against `portable-pty` 0.9.0's API.** If the master fd is not reachable /
-  `O_NONBLOCK` cannot be set safely, fall back to **signal-fd interrupt**: the reader thread
-  `poll()`/`select()`s on `[pty_master_fd, shutdown_pipe_fd]` and async code writes one byte
-  to the shutdown pipe to wake it (this is the mechanism named in REQUIREMENTS.md HARDEN-01).
-  Either way the zombie is eliminated; the fallback keeps one blocking thread but makes it
-  reliably interruptible.
+### Interrupt mechanism (D-01) — REVISED after research (2026-06-01)
+- **D-01 (LOCKED):** Unix implementation uses a **self-pipe + `nix::poll`**: the
+  `spawn_blocking` reader thread `poll()`s `[pty_master_fd, shutdown_pipe_read_fd]`; async
+  teardown code writes one byte to `shutdown_pipe_write_fd` to wake the blocked `read()` so
+  the thread exits cleanly. This is the mechanism named in REQUIREMENTS.md HARDEN-01.
+  - Cargo.toml: add the `"poll"` feature to `nix`. No `O_NONBLOCK` on the master fd.
+  - The writer loop (`server.rs:385`) is **left untouched** — no EAGAIN handling needed.
+  - One interruptible blocking thread per *live* session; on orphan it exits within one
+    polling interval, so the blocking-pool count stays bounded (success criterion #2).
+- **D-01-history (why not AsyncFd):** `AsyncFd` + `O_NONBLOCK` was the initial lean (to
+  eliminate the blocking thread entirely). Research (10-RESEARCH.md) verified the master fd
+  IS exposable via `MasterPty::as_raw_fd()`, BUT `O_NONBLOCK` is a *shared* open-file-
+  description property — setting it forces a retry-on-`EAGAIN` rewrite of the currently-
+  correct W2 writer loop (`UnixMasterWriter` dups the same fd). The user's original AsyncFd
+  rationale was Windows compatibility, which is handled by the D-02 trait boundary (AsyncFd
+  is Unix-only regardless). Given the moot rationale and the extra writer blast radius, the
+  user chose self-pipe + poll. AsyncFd is NOT to be implemented this phase.
 
 ### Portability (D-02)
 - **D-02:** Implement the interrupt behind a **small trait / abstraction boundary** (an
