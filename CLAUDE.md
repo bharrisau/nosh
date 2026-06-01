@@ -209,6 +209,16 @@ gsd-sdk query resolve-model gsd-planner   # → {"model": "opus", "profile": "ba
 - When wrapping a GSD skill (e.g. `gsd:plan-phase`) in an `Agent`, let the skill resolve its own subagents' models — do **not** inject a blanket model override into the wrapper prompt (it can downgrade the planner off opus).
 - Profile is changed via `/gsd:set-profile` / `/gsd:settings`; never silently override it.
 
+### Autonomous loop: drive workflows inline, don't reload Skills
+
+In a multi-phase loop (`/gsd:autonomous`, repeated `plan-phase`/`execute-phase`), do **not** re-invoke the per-phase Skill wrappers (`gsd:plan-phase`, `gsd:execute-phase`, `gsd:code-review`, `gsd:code-review-fix`) once you've read that workflow's `.md` this session. Each Skill call re-injects the **same** ~34–38k-token workflow document — pure waste across phases (~80–100k tokens/phase). Once a workflow is in context, drive its gate sequence **directly** with the `gsd-sdk` queries and subagent spawns the workflow specifies.
+
+Preserve these two behaviours exactly — they are why the wrappers existed:
+- **Resolve the model via `gsd-sdk`, per agent, before spawning, and pass `model=` explicitly.** The `init.*` queries already return the resolved tiers — `init.plan-phase` → `researcher_model`/`planner_model`/`checker_model`; `init.execute-phase` → `executor_model`/`verifier_model`. Use those values (don't hardcode); they honor the profile + `model_overrides` (e.g. `gsd-verifier` → opus). See [GSD agent model selection] above and [GSD verification: separate pass, on opus] below.
+- **Spawn the correct plugin subagent type** — the namespaced ids: `gsd:gsd-planner`, `gsd:gsd-plan-checker`, `gsd:gsd-phase-researcher`, `gsd:gsd-pattern-mapper`, `gsd:gsd-executor`, `gsd:gsd-verifier`, `gsd:gsd-code-reviewer`, `gsd:gsd-code-fixer`. Never fall back to `general-purpose`.
+
+Still follow every workflow gate faithfully (the Skill text is the spec, you're just not re-paying to reload it): init → research/pattern-map → plan → plan-checker (+revision loop) → coverage gates → `state.planned-phase`; then per wave: executor(s) → merge/cleanup → post-merge build+test → tracking; then code-review → fix → **opus** verifier → `phase.complete`. **Load a skill once** if you hit a workflow shape not yet read this session (e.g. `gsd:ui-phase`, or the milestone-lifecycle `audit-milestone`/`complete-milestone`/`cleanup`).
+
 ### GSD verification: separate pass, on opus
 
 Verification runs as an **independent pass on opus**, never collapsed inline into the (sonnet) executor — a peer grading a peer rubber-stamps subtle bugs (happened in three consecutive M3 phases; opus re-verify caught a real bug each time).
