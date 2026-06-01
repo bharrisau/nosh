@@ -330,8 +330,17 @@ impl TerminalState {
 
     /// Read a cell at the given (row, col) position.
     ///
-    /// Returns a reference to the cell, or a reference to a default cell if
-    /// the coordinates are out of bounds (bounds-safe, never panics).
+    /// Returns a reference to the cell at `(row, col)` if the coordinates are
+    /// in-bounds, or a **shared `&'static Cell`** (a global default cell, value
+    /// `Cell::default()`) if they are out of bounds.
+    ///
+    /// **Phase 13 callers: do NOT store the returned reference across grid mutations
+    /// (resize/advance/scroll) or compare pointer identity.** The out-of-bounds path
+    /// returns a `'static` reference to a constant global sentinel, NOT a reference
+    /// into the grid. If `cell()` returns the static default, it will still read as
+    /// `' '` / no attributes / no color on subsequent dereferences — but it does NOT
+    /// reflect any future in-bounds write to that coordinate. Copy the fields you
+    /// need (`cell.ch`, `cell.fg`, etc.) rather than holding the reference.
     pub fn cell(&self, row: u16, col: u16) -> &Cell {
         static DEFAULT_CELL: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
         let default = DEFAULT_CELL.get_or_init(Cell::default);
