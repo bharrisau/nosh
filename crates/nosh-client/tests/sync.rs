@@ -313,29 +313,30 @@ async fn sync03_datagrams_flow_after_resume() {
     // ── Step 5: Drain the replayed PtyData frames until idle ──────────────────────
     //
     // The server replays buffered PtyData frames synchronously before starting the
-    // live select! loop. We drain until no new frame arrives for ~600ms (three
-    // idle windows of 200ms each), then continue. The connection and streams STAY
-    // open — only the replay burst is consumed, not the entire session.
-    let mut idle_strikes = 0u32;
+    // live select! loop. We drain until a wall-clock deadline expires (600ms
+    // total) with no new frame arriving, then continue.
+    //
+    // WR-04 fix: use a single wall-clock deadline instead of cancelling
+    // read_message inside timeout() on each iteration. Cancelling read_message
+    // mid-way through a length-prefixed frame leaves the RecvStream at an
+    // inconsistent parse position — the next call reads body bytes as a new
+    // message header. The wall-clock deadline approach ensures we only break AFTER
+    // a complete read_message future has resolved (or the deadline fires while
+    // read_message is not in flight — it fires at the top of the loop after the
+    // previous message was fully consumed).
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(600);
     loop {
-        match tokio::time::timeout(
-            Duration::from_millis(200),
-            nosh_proto::read_message(&mut recv2),
-        )
-        .await
-        {
+        let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break; // deadline reached between frames (read_message is not in flight)
+        }
+        match tokio::time::timeout(remaining, nosh_proto::read_message(&mut recv2)).await {
             Ok(Ok(nosh_proto::Message::PtyData { .. })) => {
-                idle_strikes = 0; // reset on each replayed chunk
+                // Replayed chunk received; keep draining.
             }
-            Ok(Ok(_)) => {}  // ignore other control frames
+            Ok(Ok(_)) => {} // ignore other control frames
             Ok(Err(_)) => break, // stream closed — replay done
-            Err(_) => {
-                // timeout: no frame in this window
-                idle_strikes += 1;
-                if idle_strikes >= 3 {
-                    break; // replay burst is exhausted (3 consecutive idle windows)
-                }
-            }
+            Err(_) => break,     // deadline expired after a complete frame boundary
         }
     }
 
