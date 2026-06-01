@@ -4,12 +4,12 @@ milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: planning
 stopped_at: Phase 15 context gathered
-last_updated: "2026-06-01T22:38:44.859Z"
-last_activity: 2026-06-01
+last_updated: "2026-06-01T23:09:40.025Z"
+last_activity: 2026-06-01 -- Phase 15 planning complete
 progress:
   total_phases: 9
   completed_phases: 5
-  total_plans: 11
+  total_plans: 14
   completed_plans: 11
   percent: 56
 ---
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-06-01)
 Phase: 16
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-06-01
+Last activity: 2026-06-01 -- Phase 15 planning complete
 
 ```
 Progress: [██████████] 100%
