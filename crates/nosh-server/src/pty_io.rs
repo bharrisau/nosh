@@ -207,7 +207,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// D-04 completion-barrier test: N create→orphan cycles must each exit the
-    /// reader thread deterministically.
+    /// reader thread deterministically via the shutdown pipe, NOT via PTY EOF.
+    ///
+    /// CRITICAL INVARIANT: `sess` (MasterPty) and `_writer` are kept alive for
+    /// the entire lifetime of each spawned join task. The master PTY fd is NOT
+    /// dropped before `signal_shutdown()` fires. This means the reader thread
+    /// can only exit via the shutdown pipe byte — PTY EOF is impossible while the
+    /// master is open. If `signal_shutdown()` were a no-op, all N readers would
+    /// park in `poll()` indefinitely and the test would FAIL (timeout → panic).
     ///
     /// PRIMARY assertion: `exit_count == N` — every reader thread exited.
     /// SECONDARY (safety net only, not the pass criterion): the barrier is reached
@@ -227,7 +234,7 @@ mod tests {
             // Open a real /bin/sh PTY session.
             let passwd = crate::session::lookup_self(Some("/bin/sh"));
             let identity = nosh_auth::NoshPublicKey::from_raw([0x42u8; 32]);
-            let (sess, reader, _writer) =
+            let (sess, reader, writer) =
                 crate::session::open(&passwd, "xterm", 80, 24, &[], identity)
                     .expect("session::open /bin/sh");
 
@@ -244,18 +251,30 @@ mod tests {
             let handle = start_interruptible_reader(master_raw_fd, reader, out_tx)
                 .expect("start_interruptible_reader");
 
-            // Drop the session and writer so the PTY slave-side fd is closed (this
-            // also avoids a PTY EOF race interfering with the shutdown test).
-            drop(sess);
+            // IMPORTANT: Do NOT drop sess or writer here. Keep the master PTY open
+            // so the reader is blocked in poll() and can ONLY be woken by the
+            // shutdown pipe. Dropping sess before signal_shutdown() would close the
+            // master fd, causing PTY EOF — the reader would exit via EOF rather than
+            // the pipe, and this test would pass even if signal_shutdown() were a
+            // complete no-op (the exact "wrong-but-green" failure the D-04 verifier
+            // probe identified). Both are moved into the async task below and
+            // dropped only AFTER the reader thread exits.
 
-            // Spawn a task that awaits the join and increments the counter.
+            // Spawn a task that signals shutdown (while master is still open),
+            // awaits the reader thread, then drops the session resources.
             let counter = exit_count.clone();
             let join = handle.join;
             let write_fd = handle.shutdown_tx;
             tokio::spawn(async move {
-                // Signal shutdown, then await the reader thread.
+                // Signal shutdown while sess and writer are still alive (master open).
+                // The reader is parked in poll([master, pipe]); writing the pipe byte
+                // makes fds[1] readable → reader breaks and exits.
                 let _ = nix::unistd::write(&write_fd, b"x");
                 let _ = join.await;
+                // Reader has exited. Now it is safe to drop the session resources.
+                // Explicit drops for clarity — they would happen at end of scope anyway.
+                drop(writer);
+                drop(sess);
                 counter.fetch_add(1, Ordering::Release);
             });
 
@@ -280,7 +299,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // PRIMARY assertion (D-04): every reader thread exited.
+        // PRIMARY assertion (D-04): every reader thread exited via the shutdown pipe.
         assert_eq!(
             exit_count.load(Ordering::Acquire),
             N,
