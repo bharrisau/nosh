@@ -108,7 +108,10 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   2. Screen rendered from datagrams matches raw PTY output visually — an end-to-end test confirms the confirmed-state rendering produces the same visible characters as the reliable-stream path
   3. The `SequencedOutputBuffer` `highest_applied` counter continues to advance from `PtyData` on the reliable stream — the cold-reattach `Ack` mechanism is not broken by the new display path
   4. `ConnectionLossOverlay` exists as a stub (no-op) in `ClientScreen` — the render path is wired for it even before it activates
-**Plans**: TBD
+**Plans**: 3 plans
+- [ ] 14-01-PLAN.md — ClientScreen compositor: local Cell + Overlay/ConnectionLossOverlay stub, monotonic apply (D-14-05), dual-grid resize, minimal-ANSI render_to_stdout (Wave 1)
+- [ ] 14-02-PLAN.md — Wire into run_pump: conn.read_datagram() arm (apply→render→epoch-ack), PtyData display removal keeping highest_applied, reset on reattach (Wave 2)
+- [ ] 14-03-PLAN.md — End-to-end tests: grid-comparison vs server TerminalState + live datagram render integration test (Wave 3)
 
 ### Phase 15: Client Predictor — Speculative Overlay
 **Goal**: The client speculatively echoes locally-typed input ahead of server confirmation — printable characters, backspace, left/right cursor motion — with conservative fallback and adaptive RTT-based activation, never rendering worse than no prediction
@@ -174,7 +177,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 11. Datagram Wire Protocol | 1/1 | Complete    | 2026-06-01 |
 | 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
 | 13. Server Datagram Sender | 3/3 | Complete    | 2026-06-01 |
-| 14. Client Predictor — Confirmed Rendering | 0/? | Not started | - |
+| 14. Client Predictor — Confirmed Rendering | 0/3 | Planned | - |
 | 15. Client Predictor — Speculative Overlay | 0/? | Not started | - |
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | Not started | - |
 | 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
