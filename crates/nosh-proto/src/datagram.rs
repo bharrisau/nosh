@@ -701,16 +701,36 @@ mod tests {
 
     /// Heterogeneous continue-past-rejection guard (BLOCKER 1):
     /// One full 80-char row (large) at row 0 (cursor row), plus 23 single-char
-    /// runs on rows 1–23. The cap is chosen so the large row nearly fills the
-    /// budget but at least some single-char runs still fit.
+    /// runs on rows 1–23. The cap is sized so the large row is **fully deferred**
+    /// (even the split path cannot include any prefix), but the small single-char
+    /// runs each fit individually after the large run is skipped.
     ///
     /// A break-on-first-rejection bug would stop after the large row is rejected
-    /// and return an empty (or only-header) payload, causing this test to FAIL.
+    /// and return a header-only payload (no "x" runs), causing this test to FAIL.
     /// The correct continue-past-rejection implementation keeps iterating and
-    /// picks up the small single-char runs that fit.
+    /// picks up the small single-char runs that fit after the large one is skipped.
+    ///
+    /// Sizing rationale (empirically verified — CR-02 fix):
+    ///   Measured sizes at epoch=3, cols=80, rows=24, cursor=(0,0):
+    ///     header-only body = 6 bytes (postcard varint encoding)
+    ///     header + large run (80-char "a") = 92 bytes → large run contributes 86 bytes
+    ///     header + small run (1-char "x") = 13 bytes → small run contributes 7 bytes
+    ///     RUN_HEADER_OVERHEAD = 12 bytes (worst-case varint for all run fields)
+    ///
+    ///   cap=19 → body_cap=18:
+    ///     large run whole-run check: 92 >= 18 → REJECTED
+    ///     split path: remaining = body_cap - header_size - 12 = 18 - 6 - 12 = 0
+    ///                 → remaining == 0 → large run FULLY DEFERRED (no split, no chars added)
+    ///     small runs: 13 < 18 → ACCEPTED (fill loop continues past rejection)
+    ///     second small run: 13 + 7 = 20 >= 18 → rejected; only 1 "x" run fits per packet
+    ///
+    ///   Under break-on-first-rejection (injecting `break;` at rejection site):
+    ///     large run fails → break → 0 "x" runs → test FAILS (correctly red)
+    ///   Under correct continue-past-rejection:
+    ///     large run fails → continue → 1 "x" run accepted → test PASSES (correctly green)
     #[test]
     fn heterogeneous_continue_past_rejection() {
-        // The large run (80 chars, ~86 bytes encoded).
+        // The large run (80 chars; measured header+run=92 bytes at these field values).
         let large_run = DiffRun {
             row: 0,
             start_col: 0,
@@ -719,7 +739,7 @@ mod tests {
             bg: 0,
             chars: "a".repeat(80),
         };
-        // 23 single-char runs on rows 1–23 (~13 bytes each encoded).
+        // 23 single-char runs on rows 1–23 (measured header+run=13 bytes each).
         let small_runs: Vec<DiffRun> = (1u16..24)
             .map(|row| DiffRun {
                 row,
@@ -742,12 +762,12 @@ mod tests {
             runs: all_runs,
         };
 
-        // Cap sized so the large 80-char row at row 0 nearly fills the budget
-        // but at least one small run fits. Header ~6 bytes + large run ~86 bytes
-        // = ~92 bytes body; we need cap > 93 (tag+body) so at least one small
-        // run (~13 bytes) fits too. Use cap = 120: body_cap = 119,
-        // large row body = ~92, leaving ~27 bytes for a small run (~13 bytes).
-        let cap = 120;
+        // cap=19 (body_cap=18): large run body 92 >> 18 → whole-run rejected AND
+        // split cannot fire (remaining = 18-6-12 = 0 → no budget for split prefix).
+        // Large run is fully deferred; continue → small "x" runs (size 13 < 18) are accepted.
+        // Break-on-first-rejection returns 0 "x" runs → test FAILS (correctly red under bug).
+        // Correct continue implementation returns at least 1 "x" run → test PASSES.
+        let cap = 19;
         let (encoded, deferred) = encode_datagram(&diff, cap).expect("encode_datagram");
 
         // Confirm the payload respects the cap.
@@ -757,9 +777,14 @@ mod tests {
             encoded.len(),
             cap
         );
+        // Confirm the large run was fully deferred (not even partially split).
+        assert!(
+            deferred.iter().any(|r| r.chars.len() > 1),
+            "large 80-char run must be in deferred list (not encoded) at cap=19"
+        );
 
         // Decode and confirm at least one single-char "x" run made it in.
-        // (This is the continue-past-rejection guard.)
+        // (This is the continue-past-rejection guard — fails under break-on-first-rejection.)
         let decoded = decode_datagram(&encoded).expect("decode_datagram");
         let has_small_run = decoded.runs.iter().any(|r| r.chars == "x");
         assert!(
@@ -769,6 +794,14 @@ mod tests {
              decoded.runs = {:?}, deferred.len() = {}",
             decoded.runs,
             deferred.len()
+        );
+        // Also assert the large run was not included in the payload (it was deferred entirely).
+        let has_large_run = decoded.runs.iter().any(|r| r.chars.len() > 1);
+        assert!(
+            !has_large_run,
+            "large 80-char run must not appear in encoded payload at cap=19. \
+             decoded.runs = {:?}",
+            decoded.runs
         );
     }
 
