@@ -55,7 +55,9 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
   1. Dropping/orphaning a session reliably stops the PTY reader within one polling interval — no threads accumulate when sessions are created and dropped in a loop
   2. The server's blocking thread count (tokio blocking pool) stays bounded and does not grow after repeated session orphan cycles under load
   3. `cargo test` continues to pass with the new PTY reader implementation; no regressions in existing session tests
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 10-01-PLAN.md — Interruptible PTY reader foundation: pty_io trait boundary + Unix self-pipe/nix::poll impl, master_raw_fd accessors, nix poll feature
+- [ ] 10-02-PLAN.md — Wire interruptible reader into both pumps, await reader exit before orphan (D-03), remove abort() no-op, D-04 completion-barrier test
 
 ### Phase 11: Datagram Wire Protocol
 **Goal**: A sparse, size-bounded terminal-diff wire format exists in nosh-proto — the shared interface that every subsequent server and client component builds on
@@ -163,7 +165,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 | 7. Connection Migration Validation | — | Shipped | 2026-05-30 |
 | 8. Windows Client | — | Shipped | 2026-05-30 |
 | 9. Windows Client Polish & Hardening | — | Shipped | 2026-05-30 |
-| 10. PTY Reader Race Fix | 0/? | Not started | - |
+| 10. PTY Reader Race Fix | 0/2 | Not started | - |
 | 11. Datagram Wire Protocol | 0/? | Not started | - |
 | 12. Server Terminal State Model | 0/? | Not started | - |
 | 13. Server Datagram Sender | 0/? | Not started | - |
