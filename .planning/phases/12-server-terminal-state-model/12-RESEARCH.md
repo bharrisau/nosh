@@ -69,10 +69,13 @@ parameter in `csi_dispatch` carries the `b'?'` byte for DEC private mode sequenc
 `&[u16]` slices (parameter + subparameters); the simple numeric value for a mode like `?25` is in
 the first element of the first `params.iter().next()` slice.
 
-The Phase 11 `DiffRun` struct already has `fg: u8` and `bg: u8` (both `u8`, value `0` = default
-terminal color). This matches the "SGR 256-color = one u8 index" model. `CellStyle` is a `u8`
-bitflags newtype with BOLD/ITALIC/UNDERLINE/REVERSE defined. The `TerminalState` cell style
-struct should use exactly these types to allow Phase 13 diff extraction with zero conversion.
+The Phase 11 `DiffRun` struct (as fixed AFTER the first draft of this research) has
+`fg: Option<u8>` and `bg: Option<u8>`, where `None` = the terminal's default color and `Some(n)`
+= explicit palette index `n` (0..=255). Crucially `Some(0)` (explicit black) is DISTINCT from
+`None` (default). `CellStyle` is a `u8` bitflags newtype with BOLD/ITALIC/UNDERLINE/REVERSE
+defined. The `TerminalState` cell style struct must use exactly these types — `Cell.fg`/`bg` as
+`Option<u8>` — to allow Phase 13 diff extraction with zero conversion AND to preserve the
+default-vs-explicit (including explicit black) distinction end-to-end.
 
 **Primary recommendation:** Implement `TerminalState` in a new file
 `crates/nosh-server/src/terminal.rs`, integrate via `SessionSlot::push_output_and_parse`, and
@@ -309,18 +312,21 @@ motion, `0` should be treated as `1` (standard VT behavior).
 
 ## Pattern 3: SGR Mapping to CellStyle / fg / bg
 
-Phase 11 `DiffRun` uses:
+Phase 11 `DiffRun` (current source) uses:
 - `style: CellStyle(u8)` — BOLD (0x01), ITALIC (0x02), UNDERLINE (0x04), REVERSE (0x08)
-- `fg: u8` — 256-color foreground index; `0` = default terminal color
-- `bg: u8` — 256-color background index; `0` = default terminal color
+- `fg: Option<u8>` — `None` = terminal-default foreground; `Some(n)` = palette index `n` (0..=255)
+- `bg: Option<u8>` — `None` = terminal-default background; `Some(n)` = palette index `n` (0..=255)
 
-[VERIFIED: `crates/nosh-proto/src/datagram.rs` lines 86-114 — current source read directly]
+`Some(0)` is explicit palette index 0 (black) and is DISTINCT from `None` (terminal default).
+
+[VERIFIED: `crates/nosh-proto/src/datagram.rs` lines 93-120 — current source read directly 2026-06-01;
+fg/bg confirmed `Option<u8>`]
 
 **SGR parameter → cell attribute mapping:**
 
 | SGR param | Effect |
 |-----------|--------|
-| 0 | Reset all — style=0, fg=0, bg=0 |
+| 0 | Reset all — style=NONE, fg=None, bg=None |
 | 1 | Bold → `CellStyle::BOLD` |
 | 3 | Italic → `CellStyle::ITALIC` |
 | 4 | Underline → `CellStyle::UNDERLINE` |
@@ -329,20 +335,21 @@ Phase 11 `DiffRun` uses:
 | 23 | Italic off |
 | 24 | Underline off |
 | 27 | Reverse off |
-| 30–37 | Standard fg colors → map to 256-color indices 0–7 |
-| 38; 5; n | 256-color fg → `fg = n as u8` |
-| 39 | Default fg → `fg = 0` |
-| 40–47 | Standard bg colors → map to 256-color indices 0–7 |
-| 48; 5; n | 256-color bg → `bg = n as u8` |
-| 49 | Default bg → `bg = 0` |
-| 90–97 | Bright fg → map to 256-color indices 8–15 |
-| 100–107 | Bright bg → map to 256-color indices 8–15 |
+| 30–37 | Standard fg colors → `fg = Some(idx)` where idx = param-30 (0..=7) |
+| 38; 5; n | 256-color fg → `fg = Some(n as u8)` |
+| 39 | Default fg → `fg = None` (terminal default; NOT Some(0)) |
+| 40–47 | Standard bg colors → `bg = Some(idx)` where idx = param-40 (0..=7) |
+| 48; 5; n | 256-color bg → `bg = Some(n as u8)` |
+| 49 | Default bg → `bg = None` (terminal default; NOT Some(0)) |
+| 90–97 | Bright fg → `fg = Some(idx)` where idx = param-90+8 (8..=15) |
+| 100–107 | Bright bg → `bg = Some(idx)` where idx = param-100+8 (8..=15) |
 
 [ASSUMED — SGR standard; verify in unit tests]
 
-**Important:** `CellStyle` uses `0` for default (no color); this is also the `DiffRun.fg`/`.bg`
-default. The model's `Cell` type must match exactly so Phase 13 diff extraction has zero
-conversion overhead.
+**Important:** `Cell.fg`/`bg` MUST be `Option<u8>` matching `DiffRun.fg`/`bg` exactly so Phase 13
+diff extraction has zero conversion overhead. `None` is the terminal-default sentinel — NEVER
+store an explicit `Some(0)` to mean "default". `Some(0)` is a real, distinct value (explicit
+black); the default-vs-explicit distinction must survive into Phase 13.
 
 **SGR subparameters:** `CSI 38 ; 5 ; n m` — vte passes `38` as `params[0][0]`, `5` as
 `params[1][0]`, `n` as `params[2][0]`. The implementation must walk the parameter list across
@@ -418,15 +425,17 @@ pub struct Cell {
     pub ch: char,
     /// SGR attributes — same type as DiffRun.style.
     pub style: CellStyle,
-    /// 256-color fg index; 0 = default terminal color (same as DiffRun.fg).
-    pub fg: u8,
-    /// 256-color bg index; 0 = default terminal color (same as DiffRun.bg).
-    pub bg: u8,
+    /// fg palette index; None = terminal-default color, Some(n) = palette index n
+    /// (incl. Some(0) = explicit black). SAME type as DiffRun.fg.
+    pub fg: Option<u8>,
+    /// bg palette index; None = terminal-default color, Some(n) = palette index n
+    /// (incl. Some(0) = explicit black). SAME type as DiffRun.bg.
+    pub bg: Option<u8>,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { ch: ' ', style: CellStyle(CellStyle::NONE), fg: 0, bg: 0 }
+        Cell { ch: ' ', style: CellStyle(CellStyle::NONE), fg: None, bg: None }
     }
 }
 ```
@@ -554,12 +563,14 @@ The model should treat `0` as `1` for cursor motion commands.
 then `let n = n.max(1) as i32;`.
 **Warning sign:** Tests with bare `CSI A` (no count) show cursor not moving.
 
-### Pitfall 4: SGR 0 (reset) must clear fg/bg back to 0
+### Pitfall 4: SGR 0 (reset) must clear fg/bg back to None
 **What goes wrong:** After a color sequence, `CSI 0 m` or bare `CSI m` (no params = SGR 0)
-must reset fg AND bg to 0 (default). Only resetting the style bits leaves stale color.
+must reset fg AND bg to `None` (terminal default). Only resetting the style bits leaves stale
+color.
 **Why it happens:** Partial SGR reset implementations forget the color fields.
 **How to avoid:** Treat no-params SGR as SGR 0; handle `0` param explicitly: set style=NONE,
-fg=0, bg=0 before processing any other params in the sequence.
+fg=None, bg=None before processing any other params in the sequence. Never reset to `Some(0)`
+(that would be explicit black, not default).
 
 ### Pitfall 5: ED 3 (erase display + scrollback) must not panic
 **What goes wrong:** `CSI 3 J` (erase display and scrollback) should clear scrollback. If
@@ -575,7 +586,7 @@ three separate parameters (not subparameters), so `params.iter()` yields three s
 **Why it happens:** Subparameters (colon-separated in modern SGR) use `extend()`; old-style
 semicolons use `push()`. Most terminals still emit semicolon-separated `38;5;n`.
 **How to avoid:** Walk `params.iter()` as a stateful sequence; when you see `38`, grab the
-NEXT two params (check `5`, then read color index). Same for `48`.
+NEXT two params (check `5`, then read color index → `fg = Some(n as u8)`). Same for `48`.
 **Warning sign:** Colors not applying after `ESC[38;5;nnn m` in tests.
 
 ### Pitfall 7: OSC 52 vs OSC 0 wrong `params[0]` check
@@ -644,7 +655,7 @@ impl vte::Perform for TerminalState {
             'H' | 'f' => { /* cursor position (CUP) — 1-based → 0-based */ }
             'J' => { /* erase in display */ }
             'K' => { /* erase in line */ }
-            'm' => { /* SGR — walk params */ }
+            'm' => { /* SGR — walk params; fg/bg are Option<u8>, None=default Some(n)=palette */ }
             _ => { /* scope fence: other CSI, ignore */ }
         }
     }
@@ -660,7 +671,7 @@ impl vte::Perform for TerminalState {
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
-            b'c' => { /* RIS: full reset — clear grid, reset cursor, reset modes */ }
+            b'c' => { /* RIS: full reset — clear grid, reset cursor, reset modes, fg/bg=None */ }
             _ => { /* scope fence */ }
         }
     }
@@ -746,6 +757,31 @@ mod tests {
         assert_eq!(a.style.0 & CellStyle::BOLD, CellStyle::BOLD);
         assert_eq!(b.style.0, CellStyle::NONE);
     }
+
+    #[test]
+    fn default_color_is_none_not_some_zero() {
+        let mut state = ts(80, 24);
+        state.advance(b"a");                 // default-color write
+        assert_eq!(state.cell(0, 0).fg, None);   // default, NOT Some(0)
+        assert_eq!(state.cell(0, 0).bg, None);
+    }
+
+    #[test]
+    fn explicit_black_is_some_zero_distinct_from_default() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b[30mB");         // SGR 30 → explicit black fg
+        assert_eq!(state.cell(0, 0).fg, Some(0)); // explicit black, distinct from None
+        // and resetting returns to default None
+        state.advance(b"\x1b[39mC");         // SGR 39 → default fg
+        assert_eq!(state.cell(0, 1).fg, None);
+    }
+
+    #[test]
+    fn sgr_256_color_fg() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b[38;5;201mZ");
+        assert_eq!(state.cell(0, 0).fg, Some(201));
+    }
 }
 ```
 
@@ -769,14 +805,14 @@ mod tests {
 | # | Claim | Section | Risk if Wrong |
 |---|-------|---------|---------------|
 | A1 | Default param value for omitted CSI parameters is `0` (not `1`) in vte 0.15.0 | Pattern 2 / Pitfall 3 | Cursor motion with omitted count does wrong delta; test would catch |
-| A2 | SGR 30–37 maps to 256-color indices 0–7 (standard ANSI color mapping) | Pattern 3 | Colors wrong; unit test would catch |
+| A2 | SGR 30–37 maps to palette indices 0–7 as `Some(idx)` (standard ANSI color mapping) | Pattern 3 | Colors wrong; unit test would catch |
 | A3 | `std::mem::take` on `vte::Parser` produces a correctly-initialized (blank-state) parser suitable for temporary use as borrowing split | Pattern 6 (advance impl) | Parser state would be lost; verify by confirming `Parser: Default` resets state |
 | A4 | SGR `38;5;n` uses three separate Params items (not subparams) in real terminal output | Pattern 3 / Pitfall 6 | 256-color fg/bg parsing broken; unit test with `\x1b[38;5;201m` would catch |
 | A5 | `CSI 3 J` (erase display + scrollback) passes param `3` in `params[0][0]` | Pitfall 5 | Misidentified as standard ED case; test would catch |
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **`Parser::Default` reset behavior (A3)**
    - What we know: `Parser` derives `Default`; `std::mem::take` replaces with `Default::default()`.
@@ -798,6 +834,9 @@ mod tests {
      its own? `nosh-server` already depends on `nosh-proto`, so the import is legal.
    - Recommendation: Reuse `nosh_proto::datagram::CursorPos` directly — avoids type conversion
      at Phase 13 diff extraction time.
+   - **RESOLVED:** Plan 12-01 imports and reuses `nosh_proto::datagram::CursorPos` directly
+     (Task 1 action + acceptance criterion grepping for `nosh_proto::datagram`). Same applies
+     to `CellStyle`, and `Cell.fg`/`bg` mirror `DiffRun`'s `Option<u8>` for zero conversion.
 
 3. **Scrollback interaction with resize (D-12-03 Claude's discretion)**
    - What we know: D-12-03 says no reflow. Scrollback lines have their original column count.
@@ -805,6 +844,10 @@ mod tests {
    - Recommendation: Keep scrollback lines as-is (original column count preserved). The
      Phase 13 diff path operates only on the visible viewport, so scrollback line width
      mismatch has no immediate impact.
+   - **RESOLVED:** Plan 12-02 Task 1 specifies `TerminalState::resize` resizes grid dimensions
+     only (truncate/extend rows to `cols` with default cells; on shrink top rows scroll into
+     scrollback; NO reflow per D-12-03). Scrollback lines are kept as-is (original column count
+     preserved); the Phase 13 viewport-only diff path is unaffected.
 
 ---
 
@@ -835,7 +878,7 @@ OSC 52 (clipboard-write) is detected only — no forwarding or clipboard access 
 - `docs.rs/vte/0.15.0/src/vte/lib.rs.html` — Perform trait signatures (lines 761–826), Parser struct (lines 54–70), `advance` method (lines 108–128)
 - `docs.rs/vte/0.15.0/vte/struct.Params.html` — Params API (iter → &[u16] slices)
 - `docs.rs/vte/0.15.0/src/vte/params.rs.html` — Params internals (MAX_PARAMS=32, push/extend, ParamsIter)
-- `crates/nosh-proto/src/datagram.rs` (read directly) — `CellStyle`, `DiffRun.fg/bg: u8`, `CursorPos` types confirmed
+- `crates/nosh-proto/src/datagram.rs` (read directly 2026-06-01) — `CellStyle`, `DiffRun.fg/bg: Option<u8>`, `CursorPos` types confirmed
 - `crates/nosh-server/src/registry.rs` (read directly) — `SessionSlot::push_output` signature, `SequencedOutputBuffer` pattern
 - `crates/nosh-server/src/server.rs` (read directly) — 3 `push_output` callsites at lines ~414, ~504, ~786 confirmed
 - `crates.io cargo search vte` — version 0.15.0 confirmed as current
@@ -846,7 +889,7 @@ OSC 52 (clipboard-write) is detected only — no forwarding or clipboard access 
 - VT100/ECMA-48 standard (via source analysis) — OSC parameter separator is `;`, confirming `params[0]=b"52"` for OSC 52
 
 ### Tertiary (LOW confidence — training knowledge, marked ASSUMED)
-- SGR color mapping (30–37 → ANSI 0–7; 38;5;n → 256-color index) — standard but not re-verified
+- SGR color mapping (30–37 → Some(0..=7); 38;5;n → Some(n)) — standard but not re-verified
 - Default param value behavior for omitted CSI params — standard but A1 flagged
 
 ---
@@ -857,9 +900,10 @@ OSC 52 (clipboard-write) is detected only — no forwarding or clipboard access 
 - vte 0.15.0 Perform API: HIGH — verified directly from docs.rs source
 - CSI intermediate/params dispatch model: HIGH — verified from docs.rs source
 - OSC dispatch structure: HIGH — verified from source; corroborated by VT standard
-- Phase 11 CellStyle/DiffRun types: HIGH — read from current source
+- Phase 11 CellStyle/DiffRun types: HIGH — read from current source (fg/bg are Option<u8>)
 - SGR mapping: MEDIUM — standard knowledge, flagged as ASSUMED
 - Borrow-split pattern via mem::take: MEDIUM — well-known Rust pattern, A3 documents the verification step
 
 **Research date:** 2026-06-01
 **Valid until:** 2026-09-01 (vte 0.15.x API is stable; OSC/CSI protocol is immutable)
+</content>
