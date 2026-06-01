@@ -168,6 +168,19 @@ impl Session {
         self.master.try_clone_reader().context("clone pty reader for reattach")
     }
 
+    /// The PTY master fd as a raw integer, for use with `nix::poll` in the
+    /// interruptible reader (`pty_io`). Returns `None` if the `MasterPty`
+    /// implementation does not expose a raw fd (non-Unix platforms).
+    ///
+    /// **CALLER INVARIANT:** Copy the returned `i32` value out while holding the
+    /// session lock, then release the lock BEFORE passing the value into any
+    /// `spawn_blocking` or async context. Never hold the session `Mutex` across a
+    /// `poll()` or `.await` (Pitfall 2 — lock held across blocking I/O).
+    #[cfg(unix)]
+    pub fn master_raw_fd(&self) -> Option<i32> {
+        self.master.as_raw_fd()
+    }
+
     /// SIGHUP the shell (best effort). Pair with [`reap_child`] to guarantee no
     /// zombie/orphan remains (SESS-10).
     pub fn sighup(&self) {

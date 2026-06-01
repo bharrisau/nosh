@@ -291,6 +291,16 @@ impl SessionSlot {
             .try_clone_reader()
     }
 
+    /// The PTY master fd as a raw integer (delegation to `Session::master_raw_fd`).
+    /// Acquires the session lock briefly, copies the `i32` value, and releases the
+    /// lock. The caller MUST NOT hold the lock across any `spawn_blocking` or async
+    /// context (Pitfall 2). Used by the server pump to extract the fd for the
+    /// interruptible reader in `pty_io`.
+    #[cfg(unix)]
+    pub fn master_raw_fd(&self) -> Option<i32> {
+        self.session.lock().unwrap().master_raw_fd()
+    }
+
     /// Update `last_active` to now. Call cheaply while the client is attached
     /// (D-03). Coarse-grained updates are fine.
     pub fn touch(&self) {
