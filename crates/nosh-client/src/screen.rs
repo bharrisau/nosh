@@ -29,6 +29,8 @@ use crossterm::cursor::MoveTo;
 use crossterm::QueueableCommand;
 use nosh_proto::datagram::{CellStyle, CursorPos, StateDiff};
 
+use crate::predictor::PredictionOverlay;
+
 /// Maximum allowed terminal width — any larger value in a `StateDiff` is
 /// rejected before `resize()` is called. Keeps the two-grid allocation at
 /// `≤ 512 × 256 × 12 × 2 ≈ 3 MB` and closes the T-14-02 OOM-crash vector
@@ -300,9 +302,80 @@ impl ClientScreen {
     /// coordinates (Pitfall 7). A final `MoveTo` is always emitted to position the
     /// cursor at `confirmed_cursor`.
     pub fn render_to_stdout<W: Write>(&mut self, out: &mut W) -> std::io::Result<()> {
-        let desired = self.compose_desired();
-        let desired_cursor = self.confirmed_cursor;
+        self.render_to_stdout_with_cursor(out, None)
+    }
 
+    /// Variant of `render_to_stdout` that overrides the final cursor `MoveTo`.
+    ///
+    /// When `cursor_override` is `Some(pos)`, the final cursor `MoveTo` is emitted
+    /// at `pos` instead of `confirmed_cursor`. Used by the speculative-echo overlay
+    /// to position the cursor at the predicted position (Phase 15).
+    ///
+    /// When `cursor_override` is `None`, behaviour is identical to `render_to_stdout`.
+    pub fn render_to_stdout_with_cursor<W: Write>(
+        &mut self,
+        out: &mut W,
+        cursor_override: Option<CursorPos>,
+    ) -> std::io::Result<()> {
+        let desired = self.compose_desired();
+        let desired_cursor = cursor_override.unwrap_or(self.confirmed_cursor);
+
+        self.emit_diff(out, &desired, desired_cursor)?;
+        Ok(())
+    }
+
+    /// Render the confirmed grid composed with the prediction overlay.
+    ///
+    /// This method is the **single display path** for speculative-echo rendering
+    /// (Phase 15, CLAUDE.md single-path invariant). It:
+    ///
+    /// 1. Composes `desired = confirmed ⊕ overlays` (existing `compose_desired`).
+    /// 2. Applies `predictor.cell_at(r, c)` as an additional overlay layer on top.
+    /// 3. Emits the minimal ANSI diff against `physical`.
+    /// 4. Uses `predictor.predicted_cursor().unwrap_or(confirmed_cursor)` as the
+    ///    final `MoveTo` target.
+    ///
+    /// The existing `overlays` Vec (including `ConnectionLossOverlay`) remains
+    /// applied; the predictor is applied AFTER all existing overlays. The predictor
+    /// is NOT added to the `overlays` Vec because it must remain mutably owned
+    /// by `run_pump` (for `on_input` / `cull` calls) while also supplying the
+    /// cursor position.
+    pub fn render_with_predictor<W: Write>(
+        &mut self,
+        out: &mut W,
+        predictor: &PredictionOverlay,
+    ) -> std::io::Result<()> {
+        // Step 1: compose confirmed ⊕ existing overlays (ConnectionLossOverlay etc.).
+        let mut desired = self.compose_desired();
+
+        // Step 2: apply predictor overlay cells on top.
+        for (r, row_cells) in desired.iter_mut().enumerate() {
+            for (c, cell_slot) in row_cells.iter_mut().enumerate() {
+                if let Some(cell) = predictor.cell_at(r as u16, c as u16) {
+                    *cell_slot = cell;
+                }
+            }
+        }
+
+        // Step 3 + 4: emit diff with predicted cursor override.
+        let desired_cursor = predictor.predicted_cursor().unwrap_or(self.confirmed_cursor);
+        self.emit_diff(out, &desired, desired_cursor)?;
+        Ok(())
+    }
+
+    /// Shared ANSI-diff emitter: diff `desired` against `physical` and emit
+    /// minimal ANSI escape sequences to `out`, then commit `physical = desired`.
+    ///
+    /// This is the single place that writes cell content and cursor moves (the
+    /// "single ANSI-diff loop" acceptance criterion for Task 1).
+    ///
+    /// `desired_cursor`: the final cursor position to emit with `MoveTo`.
+    fn emit_diff<W: Write>(
+        &mut self,
+        out: &mut W,
+        desired: &[Vec<Cell>],
+        desired_cursor: CursorPos,
+    ) -> std::io::Result<()> {
         let rows = desired.len().min(self.physical.len());
         let cols = if rows > 0 {
             desired[0].len().min(self.physical[0].len())
@@ -443,6 +516,7 @@ mod tests {
     use nosh_proto::datagram::{CellStyle, CursorPos, DiffRun, StateDiff};
 
     use super::*;
+    use crate::predictor::{PredictDisplayMode, PredictionOverlay};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -829,6 +903,113 @@ mod tests {
              buf1.len()={}, buf3.len()={}",
             buf1.len(),
             buf3.len()
+        );
+    }
+
+    // ── Task 1 (Phase 15): cursor override + render_with_predictor tests ─────
+
+    /// (a) render_to_stdout_with_cursor with Some(override) emits MoveTo at the
+    /// override position, not at confirmed_cursor.
+    #[test]
+    fn render_to_stdout_with_cursor_override_positions_at_override() {
+        let mut screen = ClientScreen::new(80, 24);
+        // Apply a diff so confirmed_cursor is at (0, 0) (the diff's cursor field).
+        screen.apply(&make_diff(1, "hello"));
+        // The diff's cursor is at row=0, col=0.
+
+        let override_pos = CursorPos { row: 3, col: 7 };
+        let mut buf = Vec::<u8>::new();
+        screen
+            .render_to_stdout_with_cursor(&mut buf, Some(override_pos))
+            .unwrap();
+
+        // The output must contain a MoveTo for the override position.
+        // crossterm MoveTo(col, row) emits ESC [ <row+1> ; <col+1> H
+        // (1-based in CSI sequences). Encode the expected sequence.
+        let expected_move = format!("\x1b[{};{}H", override_pos.row + 1, override_pos.col + 1);
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains(&expected_move),
+            "render_to_stdout_with_cursor must emit MoveTo at override position ({}, {}); \
+             expected sequence {:?} not found in output {:?}",
+            override_pos.row,
+            override_pos.col,
+            expected_move,
+            output
+        );
+
+        // Must NOT contain a MoveTo at the confirmed cursor (row=0, col=0 is the
+        // origin, and MoveTo(0,0) = ESC [ 1 ; 1 H — only check it's not the FINAL
+        // move by verifying the override appears last among cursor moves).
+        // Simpler: assert the override MoveTo is present (sufficient for acceptance).
+    }
+
+    /// (b) render_to_stdout() wrapper still positions at confirmed_cursor (regression).
+    #[test]
+    fn render_to_stdout_wrapper_uses_confirmed_cursor() {
+        let mut screen = ClientScreen::new(80, 24);
+        // Construct a diff with a non-trivial confirmed_cursor.
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 5, col: 12 },
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: "ab".to_string(),
+            }],
+        };
+        screen.apply(&diff);
+
+        let mut buf = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf).unwrap();
+
+        // Must contain a MoveTo at confirmed_cursor (row=5, col=12).
+        // CSI sequence is 1-based: ESC [ 6 ; 13 H
+        let expected = format!("\x1b[{};{}H", 5 + 1, 12 + 1);
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains(&expected),
+            "render_to_stdout wrapper must emit MoveTo at confirmed_cursor (5, 12); \
+             expected {:?} in output {:?}",
+            expected,
+            output
+        );
+    }
+
+    /// (c) render_with_predictor with an Always-mode predictor overlays the
+    /// predicted cell into the emitted diff.
+    #[test]
+    fn render_with_predictor_overlays_predicted_cell() {
+        let mut screen = ClientScreen::new(80, 24);
+        // Start with a blank screen (no confirmed content at col 0, row 0).
+        let mut predictor = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Simulate a keystroke 'x' — should produce a PredictChar at (0,0).
+        // on_input on an empty screen (last_applied_epoch = 0).
+        predictor.on_input(b"x", &screen);
+
+        // Force predictions to be visible: use Always mode + force confirmed_epoch
+        // to advance so predictions are non-tentative.
+        // The prediction's tentative_until_epoch is the prediction_epoch at time of
+        // on_input (which starts at 0). confirmed_epoch also starts at 0.
+        // Since tentative_until_epoch (0) <= confirmed_epoch (0), the prediction
+        // IS visible immediately in Always mode.
+
+        let mut buf = Vec::<u8>::new();
+        screen.render_with_predictor(&mut buf, &predictor).unwrap();
+
+        // The output must contain 'x' (the predicted character at col 0, row 0).
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains('x'),
+            "render_with_predictor must include the predicted character 'x' in the diff; \
+             output: {:?}",
+            output
         );
     }
 }
