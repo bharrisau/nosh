@@ -3,8 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: planning
-last_updated: "2026-06-01T00:00:00.000Z"
-last_activity: 2026-06-01
+stopped_at: Phase 10 context gathered
+last_updated: "2026-06-01T07:57:59.580Z"
+last_activity: 2026-06-01 — v1.2 roadmap created (Phases 10-18)
 progress:
   total_phases: 9
   completed_phases: 0
@@ -127,9 +128,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-01
-Stopped at: Roadmap defined — v1.2 Phases 10-18 written
-Resume file: .planning/ROADMAP.md
+Last session: 2026-06-01T07:57:59.562Z
+Stopped at: Phase 10 context gathered
+Resume file: .planning/phases/10-pty-reader-race-fix/10-CONTEXT.md
 
 ## Operator Next Steps
 
