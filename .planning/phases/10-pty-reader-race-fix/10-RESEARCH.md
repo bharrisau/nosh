@@ -574,22 +574,16 @@ async fn pty_reader_exits_on_orphan_completion_barrier() {
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **AsyncFd vs. self-pipe as primary implementation**
-   - What we know: Both are feasible. AsyncFd eliminates blocking threads entirely; self-pipe keeps one blocking thread but makes it interruptible. AsyncFd requires O_NONBLOCK writer fix; self-pipe does not.
-   - What's unclear: Whether the project values zero blocking threads for readers highly enough to justify the writer fix complexity.
-   - Recommendation: **Use self-pipe for Phase 10** (matches HARDEN-01 spec, simpler, zero writer risk). AsyncFd can be retrofitted if zero-blocking-thread is a future priority. Document the AsyncFd path as a possible future upgrade in the trait boundary design.
+All three resolved by the locked decisions in `10-CONTEXT.md` (D-01..D-04). Marked here for plan-checker Dimension 11.
 
-2. **Session::master_raw_fd() method**
-   - What we know: `session.master.as_raw_fd()` is available via the MasterPty trait. But `Session::master` is private — callers must use a public method.
-   - What's unclear: Whether to add `Session::master_raw_fd() -> i32` to `session.rs` or whether `SessionSlot` should expose it directly.
-   - Recommendation: Add `Session::master_raw_fd() -> Option<i32>` to `session.rs` (accessed through the session mutex), and add `SessionSlot::master_raw_fd() -> i32` that locks and calls through. This is the minimum surface to expose the fd without leaking the private `master` field.
+1. **AsyncFd vs. self-pipe as primary implementation** — **RESOLVED:** self-pipe + `nix::poll` (CONTEXT.md D-01). The user accepted the research recommendation; AsyncFd is explicitly NOT implemented this phase (its O_NONBLOCK writer side-effect is avoided). AsyncFd remains a documented future upgrade behind the D-02 trait boundary.
+   - Original analysis: Both feasible. AsyncFd eliminates blocking threads but requires an O_NONBLOCK writer retry-on-EAGAIN fix; self-pipe keeps one interruptible blocking thread, writer untouched.
 
-3. **try_clone_reader() vs. using master fd directly for reads**
-   - What we know: The blocking reader currently uses `try_clone_reader()` which returns `Box<dyn Read + Send>` — a dup of the master fd. For the self-pipe path, the actual `Read::read()` is still called on this reader; `nix::poll()` uses the raw master fd just to detect readability. Both are needed.
-   - What's unclear: Whether to pass both (raw master fd for poll, reader clone for read) into the blocking thread, or use only the raw fd with `libc::read()` directly.
-   - Recommendation: Pass both: raw master fd for `nix::poll()` readability detection, `Box<dyn Read + Send>` for the actual `Read::read()` call. This preserves the EIO→EOF translation in `PtyFd::read()` and keeps the portable-pty abstraction.
+2. **Session::master_raw_fd() method** — **RESOLVED:** add `Session::master_raw_fd() -> Option<i32>` (through the session mutex) AND `SessionSlot::master_raw_fd()` delegating to it (CONTEXT.md D-03; mirrors the `clone_pty_reader` delegation at registry.rs:287-292). Minimum surface that avoids leaking the private `master` field.
+
+3. **try_clone_reader() vs. master fd directly for reads** — **RESOLVED:** pass BOTH into the blocking thread — raw master fd for `nix::poll()` readability detection, `Box<dyn Read + Send>` (from `try_clone_reader()`) for the actual `Read::read()`. Preserves the EIO→EOF translation in `PtyFd::read()` and the portable-pty abstraction.
 
 ---
 
