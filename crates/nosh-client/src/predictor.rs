@@ -217,6 +217,11 @@ impl PredictionOverlay {
         self.prediction_epoch
     }
 
+    /// Return the number of pending predictions (test + assertion surface).
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Return the predicted cursor position, if predictions are currently displayed
     /// and at least one non-tentative active prediction exists.
     ///
@@ -298,11 +303,15 @@ impl PredictionOverlay {
                 self.predicted_cursor.col = end_col;
             }
             InputAction::EpochReset | InputAction::BulkSuppressed => {
-                self.become_tentative();
+                // Reset clears all pending predictions AND increments prediction_epoch,
+                // ensuring no stale speculative state remains visible after a control
+                // sequence (Ctrl-C, ESC, Tab, Enter, cursor-addressing, bulk input).
+                self.reset();
             }
             InputAction::BracketedPasteStart => {
                 self.in_bracketed_paste = true;
-                self.become_tentative();
+                // Reset ensures no stale predictions from before paste start are visible.
+                self.reset();
             }
             InputAction::BracketedPasteEnd => {
                 self.in_bracketed_paste = false;
