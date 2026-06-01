@@ -292,7 +292,7 @@ async fn run_migration_test() {
                     panic!(
                         "D-03 FAIL: transport error during migration test: {other:?}; \
                          sequence so far: {:?}",
-                        &sequence
+                        sequence
                     );
                 }
             }

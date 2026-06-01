@@ -293,6 +293,7 @@ pub async fn concurrent_roundtrip(conn: &quinn::Connection) -> anyhow::Result<()
 ///   - ensures ENABLE_PROCESSED_INPUT is cleared so Ctrl-C arrives as 0x03
 ///   - sets ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout so server ANSI renders
 ///   - saves both original modes and restores them in Drop before disable_raw_mode
+///
 /// (STATE.md 2026-05-30 finding: Phase 8 D-02 partial gap — VT input not enabled)
 pub struct RawModeGuard {
     /// Original stdin console mode (Windows only; saves original for restore in Drop).

@@ -19,7 +19,7 @@
 //! Resize handling is `#[cfg]`-split via [`platform::ResizeWatcher`]:
 //! - Unix: SIGWINCH → debounce → `Message::Resize`
 //! - Windows: poll `crossterm::terminal::size()` (~300ms) → debounce → `Message::Resize`
-//! Both paths preserve the ~40 ms coalescing and the authoritative `terminal::size()` re-read.
+//!   Both paths preserve the ~40 ms coalescing and the authoritative `terminal::size()` re-read.
 //!
 //! The reconnect-window quit uses the cross-platform `platform::quit_signal()`
 //! (backed by `tokio::signal::ctrl_c`).
@@ -349,7 +349,7 @@ fn resolve_identity(args: &Args) -> anyhow::Result<ClientIdentity> {
         let socket = std::env::var_os("SSH_AUTH_SOCK")
             .map(PathBuf::from)
             .context("SSH_AUTH_SOCK not set — start an ssh-agent and add your key, or use --identity-file")?;
-        return ClientIdentity::from_agent(socket, args.identity.as_deref());
+        ClientIdentity::from_agent(socket, args.identity.as_deref())
     }
 
     // Branch 3: Windows — no ssh-agent available; default to %USERPROFILE%\.ssh\id_ed25519.
@@ -668,10 +668,10 @@ async fn run_pump(
                             // ~. escape: quit locally without forwarding.
                             return Ok(PumpOutcome::UserQuit);
                         }
-                        if !result.bytes_to_forward.is_empty() {
-                            if client::send_input(send, &result.bytes_to_forward).await.is_err() {
-                                return Ok(PumpOutcome::TransportDrop);
-                            }
+                        if !result.bytes_to_forward.is_empty()
+                            && client::send_input(send, &result.bytes_to_forward).await.is_err()
+                        {
+                            return Ok(PumpOutcome::TransportDrop);
                         }
                     }
                     Err(_) => return Ok(PumpOutcome::UserQuit),
