@@ -28,9 +28,11 @@ A single QUIC connection on UDP/443 can carry a live interactive shell, authenti
 
 Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+PTY architecture on Linux; v1.1 added the differentiators that justify nosh over plain SSH — roaming-tolerant session persistence (migration + 1-RTT cold reattach) and a native Windows client.
 
-**Carried tech debt (weigh at M4 start):** PTY reader-zombie race (Phase 6, latent — `spawn_blocking`+`abort()` can't interrupt a blocked `read()`; worth a `/gsd:debug` pass before relying on reattach under load); Windows cross-compile CI gate exists but has never run (no git remote configured — wire one); `WSAEMSGSIZE` quinn_udp warning on Windows (deferred; connection works).
+**Carried tech debt (weigh at M4 start):** ~~PTY reader-zombie race (Phase 6, latent — `spawn_blocking`+`abort()` can't interrupt a blocked `read()`)~~ **CLEARED in v1.2 Phase 10** — interruptible reader (self-pipe + nix::poll) with deterministic exit via D-04 completion-barrier test. Windows cross-compile CI gate exists but has never run (no git remote configured — wire one); `WSAEMSGSIZE` quinn_udp warning on Windows (deferred; connection works).
 
-**Next milestone:** v1.2 (M4) — **scoped, defining requirements.** Predictive local echo (full SSP-style, datagram state sync) is the headline; bundled with daily-driver hardening (clears the carried tech debt above), QoL UX (connection-loss notifications + research-selected wins), and a security design pass. See INIT.md §10.
+**Phase 10 complete (2026-06-01):** PTY reader-zombie race resolved. Both `server.rs` output-pump sites converted to `crate::pty_io::start_interruptible_reader`; both `TransportLost` arms now await reader exit before `registry.orphan()`. `cargo test` green (25/25).
+
+**Current milestone:** v1.2 (M4) — **in progress.** Phase 10 (daily-driver hardening #1) done. Next: Phase 11 (datagram wire protocol) — datagram state sync foundation.
 
 ## Requirements
 
@@ -62,7 +64,7 @@ Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+P
 <!-- v1.2 (M4) scope — being decomposed into REQUIREMENTS.md / ROADMAP.md. -->
 
 - Predictive local echo: datagram state sync carrying terminal diffs + full SSP-style speculative local echo (confirmation tracking, unconfirmed rendering, prediction epochs, conservative fallback)
-- Daily-driver hardening: fix PTY reader-zombie race; wire git remote + run Windows cross-compile CI; resolve `WSAEMSGSIZE` warning
+- Daily-driver hardening: ~~fix PTY reader-zombie race~~ (✓ Phase 10); wire git remote + run Windows cross-compile CI; resolve `WSAEMSGSIZE` warning
 - QoL UX: connection-loss notifications (reconnecting + abort instructions) + research-selected QoL wins
 - Security design pass: threat-model review + security design doc
 
