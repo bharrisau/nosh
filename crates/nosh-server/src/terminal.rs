@@ -743,9 +743,18 @@ impl TerminalState {
                     // Grab the next param — should be `5` (256-color) or `2` (24-bit)
                     if let Some(next) = iter.next() {
                         if next[0] == 5 {
-                            // 256-color: grab the color index
+                            // 256-color: grab the color index.
+                            // WR-02: validate range before cast. color_param[0] is u16;
+                            // `as u8` would silently truncate values > 255 (e.g.
+                            // CSI 38;5;300m → 300 mod 256 = 44, wrong palette index).
+                            // Only accept valid 256-color indices (0..=255).
                             if let Some(color_param) = iter.next() {
-                                self.sgr.fg = Some(color_param[0] as u8);
+                                if color_param[0] <= 255 {
+                                    self.sgr.fg = Some(color_param[0] as u8);
+                                }
+                                // Out-of-range index: ignore the SGR (no color set).
+                                // This matches the "ignore invalid parameter" behavior
+                                // recommended by the VT specification.
                             }
                         } else if next[0] == 2 {
                             // 24-bit / truecolor (r;g;b): scope-fenced — not applied,
@@ -763,8 +772,12 @@ impl TerminalState {
                 48 => {
                     if let Some(next) = iter.next() {
                         if next[0] == 5 {
+                            // WR-02: same range validation as fg (48;5;n).
                             if let Some(color_param) = iter.next() {
-                                self.sgr.bg = Some(color_param[0] as u8);
+                                if color_param[0] <= 255 {
+                                    self.sgr.bg = Some(color_param[0] as u8);
+                                }
+                                // Out-of-range: ignore (no color set).
                             }
                         } else if next[0] == 2 {
                             // 24-bit background: drain r;g;b to prevent misinterpretation.
@@ -1337,6 +1350,64 @@ mod tests {
             cell.style.0 & CellStyle::BOLD,
             CellStyle::BOLD,
             "BOLD must survive after SGR 48;2;0;0;0 (truecolor bg drain must not fire SGR 0)"
+        );
+    }
+
+    // ── WR-02 regression: 256-color index range validation ───────────────────
+
+    /// WR-02 regression: `CSI 38;5;255m` (max valid index) must set fg=Some(255).
+    #[test]
+    fn sgr_256_color_fg_boundary_255_accepted() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b[38;5;255mZ");
+        assert_eq!(
+            state.cell(0, 0).fg,
+            Some(255),
+            "index 255 (max valid) must be accepted as fg=Some(255)"
+        );
+    }
+
+    /// WR-02 regression: `CSI 38;5;256m` (first out-of-range index) must not set fg.
+    ///
+    /// Before the fix, `256u16 as u8` truncated to 0, silently setting fg=Some(0)
+    /// (explicit black) instead of leaving the color unchanged. After the fix, the
+    /// out-of-range index is rejected and fg remains None (default).
+    #[test]
+    fn sgr_256_color_fg_out_of_range_256_rejected() {
+        let mut state = ts(80, 24);
+        // fg starts as None (default); send an out-of-range index.
+        state.advance(b"\x1b[38;5;256mZ");
+        assert_eq!(
+            state.cell(0, 0).fg,
+            None,
+            "index 256 (out of 256-color range) must be rejected; fg must remain None"
+        );
+    }
+
+    /// WR-02 regression: `CSI 38;5;300m` (truncation victim) must not set fg.
+    ///
+    /// 300u16 as u8 = 44 (300 mod 256). Before the fix, fg was silently set to
+    /// Some(44). After the fix, the out-of-range index is rejected.
+    #[test]
+    fn sgr_256_color_fg_out_of_range_300_rejected() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b[38;5;300mZ");
+        assert_eq!(
+            state.cell(0, 0).fg,
+            None,
+            "index 300 (would truncate to 44) must be rejected; fg must remain None"
+        );
+    }
+
+    /// WR-02 regression: `CSI 48;5;256m` (bg, first out-of-range) must not set bg.
+    #[test]
+    fn sgr_256_color_bg_out_of_range_256_rejected() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b[48;5;256mZ");
+        assert_eq!(
+            state.cell(0, 0).bg,
+            None,
+            "bg index 256 (out of 256-color range) must be rejected; bg must remain None"
         );
     }
 
