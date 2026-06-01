@@ -17,14 +17,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::Bytes;
 use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
 use rustls::pki_types::CertificateDer;
 use nosh_proto::Message;
+use nosh_proto::datagram::{
+    encode_datagram, decode_epoch_ack, StateDiff, DiffRun, MIN_CAP, MAX_RUNS,
+};
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use tokio::sync::mpsc;
 
 use crate::registry::SessionRegistry;
 use crate::session;
+use crate::terminal::Cell;
 
 /// Pre-auth DoS limits for the accept loop (decision D-13 / FOOTGUN-3).
 #[derive(Clone, Copy, Debug)]
@@ -181,6 +186,150 @@ enum SessionEnd {
     /// A send/recv error or a read error — the transport was lost unexpectedly.
     /// The session must be ORPHANED, NOT torn down (D-01/D-02, Pitfall #7).
     TransportLost,
+}
+
+// ── Phase 13: diff-tick helpers ───────────────────────────────────────────────
+
+/// Compute changed-cell runs by scanning `current` against `baseline`.
+///
+/// An empty `baseline` (or a baseline shorter than `current`) treats all cells
+/// in the uncovered region as changed — this implements the D-13-01b "empty
+/// baseline = full screen" keyframe for cold-reattach.
+///
+/// The scanner breaks a run when the cell's style/fg/bg changes (not on the
+/// first unchanged cell), so adjacent cells with identical attributes are merged
+/// into one run even if some are unchanged.  This trades slightly larger runs for
+/// fewer fragments, which is acceptable under the acked-epoch self-correcting
+/// model.
+fn compute_diff_runs(
+    current: &[Vec<Cell>],
+    baseline: &[Vec<Cell>],
+) -> Vec<DiffRun> {
+    let mut runs: Vec<DiffRun> = Vec::new();
+    for (row_idx, current_row) in current.iter().enumerate() {
+        let row = row_idx as u16;
+        let baseline_row: &[Cell] = baseline
+            .get(row_idx)
+            .map(|r| r.as_slice())
+            .unwrap_or(&[]);
+
+        let mut col = 0u16;
+        while (col as usize) < current_row.len() {
+            let c = col as usize;
+            let cell = &current_row[c];
+            let base = baseline_row.get(c);
+            // Skip unchanged cells (same cell at baseline position).
+            if base.map(|b| b == cell).unwrap_or(false) {
+                col += 1;
+                continue;
+            }
+            // Start a new run at this changed cell.
+            let start_col = col;
+            let style = cell.style;
+            let fg = cell.fg;
+            let bg = cell.bg;
+            let mut chars = String::new();
+            // Extend run while style/fg/bg are consistent.
+            while (col as usize) < current_row.len() {
+                let cc = col as usize;
+                let c2 = &current_row[cc];
+                if c2.style != style || c2.fg != fg || c2.bg != bg {
+                    break; // style change: end run here
+                }
+                chars.push(c2.ch);
+                col += 1;
+            }
+            if !chars.is_empty() {
+                runs.push(DiffRun { row, start_col, style, fg, bg, chars });
+            }
+        }
+    }
+    runs
+}
+
+/// Result of a single diff-tick computation.
+struct DiffTickResult {
+    /// Encoded datagram payload ready for `conn.send_datagram`.
+    payload: Bytes,
+    /// The snapshot that was diffed against (the *current* grid — becomes
+    /// `last_sent_snapshot` after a successful send).
+    sent_cells: Vec<Vec<Cell>>,
+    /// Runs deferred from `encode_datagram` because they didn't fit in the cap;
+    /// must be prepended to the next tick's run list (Anti-Pattern: deferred
+    /// runs go FIRST to maintain cursor-proximate priority).
+    deferred: Vec<DiffRun>,
+}
+
+/// Build one coalesced `StateDiff` datagram for the current tick.
+///
+/// Returns `Some(DiffTickResult)` when a datagram should be sent, `None` to
+/// skip the tick silently (grid unchanged + client caught up, or encoding
+/// failed, or cap too small).
+///
+/// # Lock discipline
+///
+/// Snapshots `TerminalState` via `slot.with_terminal_state(...)` (brief lock,
+/// released before any `.await`). Does NOT perform any `.await` itself — the
+/// caller sends the returned payload asynchronously.
+fn build_state_diff(
+    slot: &crate::registry::SessionSlot,
+    current_epoch: &mut u64,
+    last_acked_epoch: u64,
+    last_acked_snapshot: &[Vec<Cell>],
+    last_sent_snapshot: &[Vec<Cell>],
+    pending_deferred: Vec<DiffRun>,
+    cap: usize,
+) -> Option<DiffTickResult> {
+    if cap < MIN_CAP {
+        return None;
+    }
+
+    // Snapshot terminal state under the lock (released when closure returns).
+    // NEVER perform any async operation inside this closure (Pitfall 1 / Anti-Pattern #2).
+    let (cols, rows, cursor, cells) = slot.with_terminal_state(|ts| {
+        let (cols, rows) = ts.size();
+        let cursor = ts.cursor();
+        let cells: Vec<Vec<Cell>> = ts
+            .viewport_rows()
+            .map(|(_, row)| row.to_vec())
+            .collect();
+        (cols, rows, cursor, cells)
+    });
+
+    // D-13-02a: skip if grid unchanged AND client is caught up.
+    if cells == last_acked_snapshot && last_acked_epoch >= *current_epoch {
+        return None;
+    }
+
+    // Epoch management (Open Question 2): increment at tick time when the grid
+    // changed since the last *sent* snapshot (not per-chunk).
+    if cells != last_sent_snapshot {
+        *current_epoch += 1;
+    }
+
+    // Compute changed runs vs the last-acked baseline.
+    let fresh_runs = compute_diff_runs(&cells, last_acked_snapshot);
+
+    // Deferred runs from the previous tick go FIRST so encode_datagram
+    // re-prioritises cursor-proximate content (Anti-Pattern: deferred FIRST).
+    let mut all_runs: Vec<DiffRun> = pending_deferred;
+    all_runs.extend(fresh_runs);
+
+    // Pitfall 3: cap the deferred queue to MAX_RUNS to prevent unbounded growth.
+    if all_runs.len() > MAX_RUNS {
+        let drop = all_runs.len() - MAX_RUNS;
+        all_runs.drain(..drop);
+    }
+
+    let diff = StateDiff { epoch: *current_epoch, cols, rows, cursor, runs: all_runs };
+    match encode_datagram(&diff, cap) {
+        Ok((payload, deferred)) => Some(DiffTickResult {
+            payload,
+            sent_cells: cells,
+            deferred,
+        }),
+        Err(_) => None, // encoding failed: skip this tick
+    }
 }
 
 /// Handle one connection: after auth, drive a real PTY login-shell session over
@@ -398,6 +547,21 @@ async fn run_session(
     let mut migration_poll = tokio::time::interval(Duration::from_millis(500));
     migration_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // SYNC-03: 16 ms diff-interval ticker for coalesced StateDiff datagram emission.
+    // D-13-02: one diff per tick (not per PTY chunk); MissedTickBehavior::Skip
+    // prevents tick accumulation under a slow tick.
+    let mut diff_interval = tokio::time::interval(Duration::from_millis(16));
+    diff_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // D-13-03: fresh sessions signal ResumeComplete immediately (no replay window).
+    let resume_complete = true;
+    // Per-connection datagram state (Open Question 3: task-local, resets on reattach).
+    let mut current_epoch: u64 = 0;
+    let mut last_acked_epoch: u64 = 0;
+    // D-13-01b: empty baseline → first diff is naturally the full screen.
+    let mut last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
+    let mut last_sent_snapshot: Vec<Vec<Cell>> = Vec::new();
+    let mut pending_deferred: Vec<DiffRun> = Vec::new();
+
     let session_end: SessionEnd = loop {
         tokio::select! {
             // Shell exited: capture the code and tell the client.
@@ -441,6 +605,61 @@ async fn run_session(
                         "connection migrated"
                     );
                     last_seen_addr = cur;
+                }
+            }
+            // SYNC-03: diff-interval tick — emit one coalesced StateDiff datagram.
+            // D-13-02: one diff per tick, not per PTY chunk.
+            // D-13-03: gate on resume_complete (always true for run_session).
+            _ = diff_interval.tick() => {
+                if !resume_complete {
+                    continue;
+                }
+                let cap = match conn.max_datagram_size() {
+                    Some(c) if c >= MIN_CAP => c,
+                    _ => continue, // datagrams not negotiated or cap too small — skip silently
+                };
+                let deferred = std::mem::take(&mut pending_deferred);
+                if let Some(result) = build_state_diff(
+                    &slot,
+                    &mut current_epoch,
+                    last_acked_epoch,
+                    &last_acked_snapshot,
+                    &last_sent_snapshot,
+                    deferred,
+                    cap,
+                ) {
+                    last_sent_snapshot = result.sent_cells;
+                    pending_deferred = result.deferred;
+                    if let Err(e) = conn.send_datagram(result.payload) {
+                        use quinn::SendDatagramError::*;
+                        match e {
+                            TooLarge => {} // encode_datagram guarantees this is unreachable; treat as skip
+                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
+                            ConnectionLost(_) => break SessionEnd::TransportLost,
+                        }
+                    }
+                }
+            }
+            // SYNC-03: epoch-ack arm — advance the last-acked baseline.
+            // D-13-01: only advance (never regress) the baseline on a newer epoch.
+            // Pitfall 2: stale/dup acks must not overwrite a newer baseline.
+            datagram = conn.read_datagram() => {
+                match datagram {
+                    Ok(bytes) => {
+                        match decode_epoch_ack(&bytes) {
+                            Ok(acked) if acked > last_acked_epoch => {
+                                last_acked_epoch = acked;
+                                // Snapshot the current grid as the new acked baseline.
+                                // Brief lock — released before any .await (Pitfall 1).
+                                last_acked_snapshot = slot.with_terminal_state(|ts| {
+                                    ts.viewport_rows().map(|(_, row)| row.to_vec()).collect()
+                                });
+                            }
+                            Ok(_) => {} // older/dup ack: ignore (never regress baseline)
+                            Err(_) => {} // malformed: ignore (self-correcting, T-13-07)
+                        }
+                    }
+                    Err(_) => break SessionEnd::TransportLost,
                 }
             }
             // Client → server frames.
