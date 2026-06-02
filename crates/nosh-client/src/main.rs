@@ -50,6 +50,45 @@ const ACK_INTERVAL: Duration = Duration::from_millis(750);
 const BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
+/// Resolve when the user requests quit during a pre-session connect/reconnect
+/// backoff wait (BUG-B).
+///
+/// Two independent quit paths, whichever fires first:
+///   1. `platform::quit_signal()` — tokio `ctrl_c` (SIGINT on Unix; on Windows
+///      this only fires when ENABLE_PROCESSED_INPUT is set, which raw mode clears,
+///      so it is effectively a Unix-only / non-raw safety net here).
+///   2. Reading STDIN for the byte `0x03` (Ctrl-C → ETX, the form raw-mode Windows
+///      actually delivers) or the SSH-style `~.` escape. This is the path that
+///      makes Ctrl-C work in the connect window on native Windows.
+///
+/// `~.` is matched as a simple two-byte tail anywhere in a read batch — sufficient
+/// for the pre-session window where the user is just trying to bail out (the full
+/// line-start escape state machine only runs once a session is active).
+async fn quit_during_backoff(stdin: &mut tokio::io::Stdin) {
+    let mut buf = [0u8; 256];
+    tokio::select! {
+        _ = platform::quit_signal() => {}
+        // Read stdin; treat EOF, Ctrl-C (0x03), or a `~.` sequence as a quit request.
+        res = stdin.read(&mut buf) => {
+            match res {
+                Ok(0) => {} // EOF on stdin → quit
+                Ok(n) => {
+                    let bytes = &buf[..n];
+                    let wants_quit = bytes.contains(&0x03) // Ctrl-C / ETX
+                        || bytes.windows(2).any(|w| w == b"~."); // SSH-style ~. escape
+                    if !wants_quit {
+                        // Not a quit request (e.g. stray keystroke while connecting):
+                        // swallow it and stay pending so the backoff sleep can elapse.
+                        std::future::pending::<()>().await;
+                    }
+                    // else: fall through → resolve (quit).
+                }
+                Err(_) => {} // stdin read error → treat as quit (cannot read input)
+            }
+        }
+    }
+}
+
 // ── SSH-style escape state machine ────────────────────────────────────────────
 //
 // This implements the OpenSSH client escape mechanism. It sits BETWEEN the
@@ -462,6 +501,17 @@ async fn main() -> anyhow::Result<()> {
     // Platform-abstracted resize watcher. Unix: SIGWINCH; Windows: terminal::size() polling.
     let mut resize = platform::ResizeWatcher::new().context("install resize handler")?;
 
+    // BUG-B: pre-session abort path. While we are in the connect/reconnect backoff
+    // window (no session yet), the only previous escape was `platform::quit_signal()`
+    // (tokio ctrl_c). On Windows, raw mode CLEARS ENABLE_PROCESSED_INPUT so Ctrl-C
+    // is delivered as the byte 0x03 on STDIN — it does NOT raise the console
+    // CTRL_C_EVENT that tokio's ctrl_c() listens for, so quit_signal() never fires
+    // and the user is stuck in a looping/failing connect. To fix this we ALSO read
+    // stdin for 0x03 (ETX) and the SSH-style `~.` escape during every backoff wait.
+    // The stdin handle is created once here (the pump loop creates its own; only one
+    // reader is active at a time because the supervisor and run_pump never overlap).
+    let mut stdin_quit = tokio::io::stdin();
+
     // Outer reconnect supervisor loop (D-10).
     loop {
         // Build a fresh endpoint and connection for this attempt.
@@ -469,10 +519,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("make_endpoint failed: {e}");
-                // Wait with backoff, honouring quit signal.
+                // Wait with backoff, honouring quit signal (BUG-B: stdin Ctrl-C/~. too).
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = platform::quit_signal() => {
+                    _ = quit_during_backoff(&mut stdin_quit) => {
                         eprintln!("\r\nnosh: quit\r");
                         break;
                     }
@@ -489,7 +539,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("\r\nnosh: reconnecting…\r");
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = platform::quit_signal() => {
+                    _ = quit_during_backoff(&mut stdin_quit) => {
                         eprintln!("\r\nnosh: quit\r");
                         break;
                     }
@@ -545,10 +595,10 @@ async fn main() -> anyhow::Result<()> {
             }
             PumpOutcome::TransportDrop => {
                 eprintln!("\r\nnosh: reconnecting…\r");
-                // Backoff before retry.
+                // Backoff before retry (BUG-B: stdin Ctrl-C/~. also aborts here).
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = platform::quit_signal() => {
+                    _ = quit_during_backoff(&mut stdin_quit) => {
                         // Explicit quit during reconnect window (D-11 escape path).
                         eprintln!("\r\nnosh: quit\r");
                         break;
