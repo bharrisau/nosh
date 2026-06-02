@@ -71,7 +71,20 @@ impl ResizeWatcher {
 
         #[cfg(windows)]
         {
-            let last_size = crossterm::terminal::size().unwrap_or((80, 24));
+            // BUG-G (Windows ConPTY startup size-sync lag): do NOT seed last_size from
+            // the startup `terminal::size()` reading. On Windows that first reading can
+            // be a stale default (≈80×24) before ConPTY has synced the real window dims
+            // (GetConsoleScreenBufferInfo lags the host until the first console event).
+            // Seeding last_size with the stale value means the poll would only fire once
+            // the OS reports a DIFFERENT size — which may never happen without a physical
+            // resize, so the wrong initial size would persist (the reported symptom).
+            //
+            // Instead seed with a sentinel `(0, 0)` that can never equal a real terminal
+            // size. The first poll that reads a plausible size therefore reports a resize,
+            // and the pump's resize-debounce path re-reads the authoritative size and sends
+            // a corrective `Resize`. Paired with the one-shot post-open re-measure in
+            // run_pump, this self-heals the startup size without a user resize.
+            let last_size = (0u16, 0u16);
             let mut poll =
                 tokio::time::interval(std::time::Duration::from_millis(300));
             // Skip (don't burst) if we fall behind; first tick fires immediately

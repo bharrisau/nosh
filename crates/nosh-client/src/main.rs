@@ -825,9 +825,52 @@ async fn run_pump(
     // target "nosh::predict" — no character content is emitted (T-15-08).
     let mut predict_enqueue_times: std::collections::HashMap<u64, Instant> =
         std::collections::HashMap::new();
+
+    // BUG-G (Windows-specific): ConPTY startup size-sync lag.
+    //
+    // On Windows, the very first `crossterm::terminal::size()` (which reads
+    // `GetConsoleScreenBufferInfo`) can report a stale default (≈80×24) at process
+    // startup, BEFORE the conhost/Windows-Terminal ConPTY host has synchronised the
+    // real window dimensions into the pseudoconsole. The size sent in the initial
+    // `SessionOpen` (measured once at startup in `main`) is therefore wrong, so the
+    // remote PTY opens tiny — vim renders as a small square at the top-left — until
+    // the user physically resizes the window (which then sends a correct `Resize`).
+    //
+    // On Unix, `terminal::size()` reads `TIOCGWINSZ` which is reliable at startup,
+    // so this never happens — hence the fix is `#[cfg(windows)]`-gated and the Unix
+    // path is left completely unchanged.
+    //
+    // Fix: a single one-shot timer (~400 ms after the pump starts) re-reads the
+    // authoritative `terminal::size()` and, if it differs from the dimensions this
+    // session was opened with, sends one corrective `Resize`. If the size was already
+    // correct, the dims match and no Resize is sent (no-op). This reuses the exact
+    // `send_resize` → server `Resize` handler path that the working manual-resize
+    // already exercises. It fires once: after firing, `recheck_size` is set to a
+    // pending() future so the arm never wakes again.
+    // `session_open_dims` is only read by the Windows arm; suppress the unused
+    // warning on non-Windows (where the arm body is compiled out).
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    let session_open_dims = (cols, rows);
+    // On Windows: armed ~400 ms ahead. On other platforms: never armed (None) so the
+    // one-shot future is always pending() and the arm is an inert no-op.
+    #[cfg(windows)]
+    let mut size_recheck_deadline: Option<tokio::time::Instant> =
+        Some(tokio::time::Instant::now() + Duration::from_millis(400));
+    #[cfg(not(windows))]
+    let size_recheck_deadline: Option<tokio::time::Instant> = None;
+
     let exit_code;
 
     loop {
+        // BUG-G one-shot (Windows): resolve at the recheck deadline, else pending.
+        // On non-Windows the deadline is always None so this is permanently pending.
+        let size_recheck = async {
+            match size_recheck_deadline {
+                Some(d) => tokio::time::sleep_until(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         let resize_sleep = async {
             match resize_deadline {
                 Some(d) => tokio::time::sleep_until(d).await,
@@ -1148,6 +1191,29 @@ async fn run_pump(
                 resize_deadline = None;
                 if let Ok((c, r)) = crossterm::terminal::size() {
                     let _ = client::send_resize(send, c, r).await;
+                }
+            }
+            // BUG-G (Windows-only): one-shot post-open size re-measure to correct
+            // the ConPTY startup size-sync lag. Fires once ~400 ms after the pump
+            // starts; sends a corrective Resize only if the authoritative size now
+            // differs from the dimensions the session was opened with. Disarms itself.
+            // On non-Windows this arm is permanently pending (deadline is None) and
+            // the body compiles out, so it is a true no-op.
+            _ = size_recheck => {
+                #[cfg(windows)]
+                {
+                    // Disarm: never fire again for this session.
+                    size_recheck_deadline = None;
+                    if let Ok((c, r)) = crossterm::terminal::size() {
+                        if (c, r) != session_open_dims {
+                            tracing::debug!(
+                                opened = ?session_open_dims,
+                                now = ?(c, r),
+                                "BUG-G: correcting ConPTY startup size via post-open Resize"
+                            );
+                            let _ = client::send_resize(send, c, r).await;
+                        }
+                    }
                 }
             }
             // Periodic Ack (D-08): send only when highest_applied advanced.
