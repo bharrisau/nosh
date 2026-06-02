@@ -761,8 +761,21 @@ async fn run_pump(
                                 // Re-emit OSC 52 clipboard WRITE to the local terminal.
                                 // Write-only by construction (T-16-05): the read/query form
                                 // was dropped server-side in Plan 16-01, D-16-01a.
-                                let sel = String::from_utf8_lossy(&selection);
-                                let b64 = String::from_utf8_lossy(&data);
+                                //
+                                // WR-01: Defensively strip ESC (\x1b) and BEL (\x07) from
+                                // both sel and b64 before interpolation. The server-side
+                                // osc_dispatch rejects malformed selection bytes, but this
+                                // client-side strip is a defense-in-depth measure: a premature
+                                // BEL terminator in selection would close the OSC sequence early
+                                // and allow the remainder to be interpreted as raw terminal bytes.
+                                let sel: String = String::from_utf8_lossy(&selection)
+                                    .chars()
+                                    .filter(|&c| c != '\x07' && c != '\x1b')
+                                    .collect();
+                                let b64: String = String::from_utf8_lossy(&data)
+                                    .chars()
+                                    .filter(|&c| c != '\x07' && c != '\x1b')
+                                    .collect();
                                 let osc52 = format!("\x1b]52;{sel};{b64}\x07");
                                 let _ = stdout.write_all(osc52.as_bytes()).await;
                                 let _ = stdout.flush().await;

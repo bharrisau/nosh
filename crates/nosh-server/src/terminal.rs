@@ -709,6 +709,13 @@ impl vte::Perform for TerminalState {
                 }
 
                 let selection = params.get(1).copied().unwrap_or(b"c");
+                // WR-01: Reject selection containing ESC (\x1b) or BEL (\x07) bytes.
+                // A malicious server process could embed a premature BEL terminator in
+                // `selection` to inject arbitrary OSC sequences into the client's local
+                // terminal. Drop the entire OSC 52 frame if selection is malformed.
+                if selection.iter().any(|&b| b == b'\x1b' || b == b'\x07') {
+                    return; // drop malformed OSC 52 — injection attempt
+                }
                 // D-16-01c / CR-03: truncate data to OSC_52_MAX_BYTES before storing.
                 // This re-mitigates the CR-03 DoS risk now that vte std is re-enabled.
                 let capped_data = &data[..data.len().min(OSC_52_MAX_BYTES)];
