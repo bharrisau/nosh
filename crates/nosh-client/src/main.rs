@@ -33,6 +33,7 @@ use clap::Parser;
 use nosh_client::client::{self, ClientIdentity, ReattachOutcome};
 use nosh_client::platform;
 use nosh_client::predictor::{PredictDisplayMode, PredictionOverlay};
+use nosh_client::screen::ConnectionLossOverlay;
 use nosh_proto::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -652,6 +653,11 @@ async fn run_pump(
     // Mutably owned here so both stdin arm (on_input) and datagram arm (cull)
     // can drive it, and render_with_predictor receives it by shared ref.
     let mut predictor = PredictionOverlay::new(predict_mode, cols, rows);
+    // Connection-loss overlay (Phase 16, QOL-01).
+    // Mutably owned here (mirroring predictor) so the silence timer and datagram
+    // arm can activate/clear it; render_with_predictor receives it by shared ref.
+    // Starts inactive — activated by the silence timer in Task 2.
+    let loss_overlay = ConnectionLossOverlay::new(cols);
     // Latency instrumentation (D-17-02a): map from prediction_epoch → enqueue Instant.
     // Used to measure predicted-keystroke-time vs confirming-datagram-time for
     // Phase 17 Windows predictive echo validation. Logged at debug level under
@@ -747,7 +753,7 @@ async fn run_pump(
                                 // Pitfall 1: render_with_predictor requires std::io::Write (NOT
                                 // tokio::io::AsyncWrite). Buffer to Vec<u8>, then async flush.
                                 let mut buf: Vec<u8> = Vec::new();
-                                screen.render_with_predictor(&mut buf, &predictor).unwrap_or_else(|e| {
+                                screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
                                     tracing::warn!("render_with_predictor error: {e}");
                                 });
                                 if !buf.is_empty() {
@@ -811,7 +817,7 @@ async fn run_pump(
                             // All display goes through ClientScreen::render_with_predictor
                             // (T-15-07: single display path, no second stdout writer).
                             let mut buf: Vec<u8> = Vec::new();
-                            screen.render_with_predictor(&mut buf, &predictor).unwrap_or_else(|e| {
+                            screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
                                 tracing::warn!("render_with_predictor error: {e}");
                             });
                             if !buf.is_empty() {

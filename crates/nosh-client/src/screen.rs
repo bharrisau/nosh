@@ -83,15 +83,59 @@ pub trait Overlay {
     fn cell_at(&self, row: u16, col: u16) -> Option<Cell>;
 }
 
-/// No-op connection-loss overlay stub (D-14-01a, Phase 14).
+/// Connection-loss overlay (D-14-01a, Phase 16).
 ///
-/// Phase 16 activates this: when no datagram arrives for >5 s, overlays a
-/// one-line banner at the bottom of the screen.
-pub struct ConnectionLossOverlay;
+/// When `active` is true and no datagram has arrived for >5 s, overlays a
+/// row-0 reverse-video banner with a live elapsed-seconds counter and the
+/// `~.` disconnect hint (Mosh convention). Activated / cleared by `run_pump`.
+pub struct ConnectionLossOverlay {
+    /// True when the overlay banner should be shown.
+    pub active: bool,
+    /// `Instant` of the last received datagram — used to compute elapsed secs.
+    pub last_contact: std::time::Instant,
+    /// Terminal width (columns) — used to pad the banner to full width.
+    pub cols: u16,
+}
+
+impl ConnectionLossOverlay {
+    /// Create a new, inactive overlay.  `last_contact` is set to `Instant::now()`
+    /// (safe initial value — the timer in `run_pump` will overwrite it on activation).
+    pub fn new(cols: u16) -> Self {
+        ConnectionLossOverlay {
+            active: false,
+            last_contact: std::time::Instant::now(),
+            cols,
+        }
+    }
+}
 
 impl Overlay for ConnectionLossOverlay {
-    fn cell_at(&self, _row: u16, _col: u16) -> Option<Cell> {
-        None // no-op this phase
+    /// Return `None` unless `active && row == 0`.
+    ///
+    /// When active, builds a banner like:
+    /// `nosh: reconnecting — last contact 7s ago. Press ~. to disconnect.`
+    /// padded with spaces to `cols` width, rendered in reverse-video (SGR 7).
+    fn cell_at(&self, row: u16, col: u16) -> Option<Cell> {
+        if !self.active || row != 0 {
+            return None;
+        }
+        let elapsed = self.last_contact.elapsed().as_secs();
+        let banner = format!(
+            "nosh: reconnecting \u{2014} last contact {elapsed}s ago. Press ~. to disconnect."
+        );
+        // Space-pad to terminal width.
+        let padded: Vec<char> = banner
+            .chars()
+            .chain(std::iter::repeat(' '))
+            .take(self.cols as usize)
+            .collect();
+        let ch = padded.get(col as usize).copied().unwrap_or(' ');
+        Some(Cell {
+            ch,
+            style: CellStyle(CellStyle::REVERSE),
+            fg: None,
+            bg: None,
+        })
     }
 }
 
@@ -125,8 +169,9 @@ impl ClientScreen {
     /// Create a new `ClientScreen` with the given terminal dimensions.
     ///
     /// Both `confirmed` and `physical` grids are initialised to default cells.
-    /// The `ConnectionLossOverlay` no-op stub is pre-loaded into the overlay
-    /// stack so Phase 16 can activate it without restructuring.
+    /// `ConnectionLossOverlay` is no longer in the overlay Vec — it is hoisted
+    /// to `run_pump` (mutably owned, mirroring `PredictionOverlay`) so Phase 16
+    /// can activate it without requiring interior mutability (Pitfall 3).
     pub fn new(cols: u16, rows: u16) -> Self {
         ClientScreen {
             cols,
@@ -136,7 +181,7 @@ impl ClientScreen {
             physical: Self::make_grid(cols, rows),
             physical_cursor: CursorPos { row: 0, col: 0 },
             last_applied_epoch: 0, // server starts at 1 → first diff always applies (Pitfall 6)
-            overlays: vec![Box::new(ConnectionLossOverlay)],
+            overlays: vec![],
         }
     }
 
@@ -324,31 +369,41 @@ impl ClientScreen {
         Ok(())
     }
 
-    /// Render the confirmed grid composed with the prediction overlay.
+    /// Render the confirmed grid composed with the loss overlay and the prediction overlay.
     ///
     /// This method is the **single display path** for speculative-echo rendering
-    /// (Phase 15, CLAUDE.md single-path invariant). It:
+    /// (Phase 15/16, CLAUDE.md single-path invariant). It:
     ///
     /// 1. Composes `desired = confirmed ⊕ overlays` (existing `compose_desired`).
-    /// 2. Applies `predictor.cell_at(r, c)` as an additional overlay layer on top.
-    /// 3. Emits the minimal ANSI diff against `physical`.
-    /// 4. Uses `predictor.predicted_cursor().unwrap_or(confirmed_cursor)` as the
+    /// 2. Applies `loss.cell_at(r, c)` as the next overlay layer (row-0 banner when active).
+    /// 3. Applies `predictor.cell_at(r, c)` on top of the loss overlay.
+    /// 4. Emits the minimal ANSI diff against `physical`.
+    /// 5. Uses `predictor.predicted_cursor().unwrap_or(confirmed_cursor)` as the
     ///    final `MoveTo` target.
     ///
-    /// The existing `overlays` Vec (including `ConnectionLossOverlay`) remains
-    /// applied; the predictor is applied AFTER all existing overlays. The predictor
-    /// is NOT added to the `overlays` Vec because it must remain mutably owned
-    /// by `run_pump` (for `on_input` / `cull` calls) while also supplying the
-    /// cursor position.
+    /// Both `loss` and `predictor` are NOT in the `overlays` Vec — they are mutably
+    /// owned by `run_pump` (for activation / `on_input` / `cull` calls). The predictor
+    /// renders on top of the loss banner so speculative echo overrides the banner chars
+    /// when the user types (edge-case tolerance — banner is row 0, echo is row 0+ cursor).
     pub fn render_with_predictor<W: Write>(
         &mut self,
         out: &mut W,
         predictor: &PredictionOverlay,
+        loss: &ConnectionLossOverlay,
     ) -> std::io::Result<()> {
-        // Step 1: compose confirmed ⊕ existing overlays (ConnectionLossOverlay etc.).
+        // Step 1: compose confirmed ⊕ existing overlays (none in Phase 16 overlays Vec).
         let mut desired = self.compose_desired();
 
-        // Step 2: apply predictor overlay cells on top.
+        // Step 2: apply the connection-loss banner overlay (row 0, reverse-video).
+        for (r, row_cells) in desired.iter_mut().enumerate() {
+            for (c, cell_slot) in row_cells.iter_mut().enumerate() {
+                if let Some(cell) = loss.cell_at(r as u16, c as u16) {
+                    *cell_slot = cell;
+                }
+            }
+        }
+
+        // Step 3: apply predictor overlay cells on top.
         for (r, row_cells) in desired.iter_mut().enumerate() {
             for (c, cell_slot) in row_cells.iter_mut().enumerate() {
                 if let Some(cell) = predictor.cell_at(r as u16, c as u16) {
@@ -357,7 +412,7 @@ impl ClientScreen {
             }
         }
 
-        // Step 3 + 4: emit diff with predicted cursor override.
+        // Step 4 + 5: emit diff with predicted cursor override.
         let desired_cursor = predictor.predicted_cursor().unwrap_or(self.confirmed_cursor);
         self.emit_diff(out, &desired, desired_cursor)?;
         Ok(())
@@ -793,12 +848,43 @@ mod tests {
     }
 
     #[test]
-    fn connection_loss_overlay_is_noop() {
-        let overlay = ConnectionLossOverlay;
-        // Must return None for all coordinates.
-        assert!(overlay.cell_at(0, 0).is_none());
-        assert!(overlay.cell_at(23, 79).is_none());
-        assert!(overlay.cell_at(999, 999).is_none());
+    fn connection_loss_overlay_inactive_returns_none() {
+        // Inactive overlay must return None for all coordinates (no-op).
+        let overlay = ConnectionLossOverlay::new(80);
+        assert!(!overlay.active, "overlay must start inactive");
+        assert!(overlay.cell_at(0, 0).is_none(), "inactive: row 0 col 0 must be None");
+        assert!(overlay.cell_at(0, 79).is_none(), "inactive: row 0 col 79 must be None");
+        assert!(overlay.cell_at(23, 79).is_none(), "inactive: row 23 col 79 must be None");
+        assert!(overlay.cell_at(999, 999).is_none(), "inactive: OOB must be None");
+    }
+
+    #[test]
+    fn connection_loss_overlay_active_renders_row0() {
+        // Active overlay must render row 0 in REVERSE style; other rows return None.
+        let mut overlay = ConnectionLossOverlay::new(80);
+        overlay.active = true;
+        // Row 0, col 0 must be Some with REVERSE style.
+        let cell = overlay.cell_at(0, 0).expect("active overlay must return Some at row 0, col 0");
+        assert_eq!(cell.style.0 & CellStyle::REVERSE, CellStyle::REVERSE, "banner must use REVERSE style");
+        assert!(cell.fg.is_none(), "banner fg must be None (terminal default)");
+        assert!(cell.bg.is_none(), "banner bg must be None (terminal default)");
+        // Row 1 must return None (banner is row-0 only).
+        assert!(overlay.cell_at(1, 0).is_none(), "active overlay must return None for rows != 0");
+        assert!(overlay.cell_at(23, 79).is_none(), "active overlay must return None for row 23");
+    }
+
+    #[test]
+    fn connection_loss_overlay_banner_contains_tilde_dot() {
+        // The banner text MUST advertise ~. (D-16-03a).
+        let mut overlay = ConnectionLossOverlay::new(80);
+        overlay.active = true;
+        // Collect row-0 characters.
+        let banner: String = (0..80u16).filter_map(|c| overlay.cell_at(0, c).map(|cell| cell.ch)).collect();
+        assert!(
+            banner.contains("~."),
+            "banner must advertise ~. disconnect hint (D-16-03a); banner: {:?}",
+            banner
+        );
     }
 
     // ── Task 2: render / idempotency / SGR / reset_physical tests ────────────
@@ -996,6 +1082,7 @@ mod tests {
         let mut screen = ClientScreen::new(80, 24);
         // Start with a blank screen (no confirmed content at col 0, row 0).
         let mut predictor = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+        let loss = ConnectionLossOverlay::new(80); // inactive
 
         // Simulate a keystroke 'x' — should produce a PredictChar at (0,0).
         // on_input on an empty screen (last_applied_epoch = 0).
@@ -1008,7 +1095,7 @@ mod tests {
         predictor.cull(&screen, 0, 5); // clears awaiting_first_cull
 
         let mut buf = Vec::<u8>::new();
-        screen.render_with_predictor(&mut buf, &predictor).unwrap();
+        screen.render_with_predictor(&mut buf, &predictor, &loss).unwrap();
 
         // The output must contain 'x' (the predicted character at col 0, row 0).
         let output = String::from_utf8_lossy(&buf);
