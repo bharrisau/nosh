@@ -42,7 +42,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 - [x] **Phase 14: Client Predictor — Confirmed Rendering** — ClientScreen renders confirmed terminal state from datagrams; ConnectionLossOverlay stub; all display through single render path (completed 2026-06-01)
 - [x] **Phase 15: Client Predictor — Speculative Overlay** — Full SSP-style prediction engine: epoch tracking, conservative fallback, underline rendering, adaptive RTT mode, wide-char handling (completed 2026-06-02)
 - [x] **Phase 16: QoL Feature Pack + Windows CI Gate** — Connection-loss banner, OSC 52 clipboard, terminal title, --predict flags; Windows CI job runs + WSAEMSGSIZE suppressed (completed 2026-06-02)
-- [ ] **Phase 17: Windows-Host Predictive Echo Validation** — Predictive echo confirmed on native Windows client; live validation sign-off (run on Windows host)
+- [x] **Phase 17: Windows-Host Predictive Echo Validation** — Predictive echo confirmed on native Windows client; live validation sign-off (run on Windows host) (completed 2026-06-02)
 - [ ] **Phase 18: Security Design Pass** — Threat-model doc + TOFU fingerprint prompt implementation
 
 ## Phase Details
@@ -196,7 +196,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 17-01-PLAN.md — Author and operator-sign-off docs/windows-echo-test.md: live Windows-client predictive-echo + roaming validation against a Linux server over a real network
+- [x] 17-01-PLAN.md — Author and operator-sign-off docs/windows-echo-test.md: live Windows-client predictive-echo + roaming validation against a Linux server over a real network
 **Note: Run on Windows host** — halt Linux execution before this phase; resume from a Windows machine.
 
 ### Phase 18: Security Design Pass
@@ -231,7 +231,7 @@ Plans:
 | 14. Client Predictor — Confirmed Rendering | 3/3 | Complete    | 2026-06-01 |
 | 15. Client Predictor — Speculative Overlay | 3/3 | Complete    | 2026-06-02 |
 | 16. QoL Feature Pack + Windows CI Gate | 3/3 | Complete   | 2026-06-02 |
-| 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
+| 17. Windows-Host Predictive Echo Validation | 1/1 | Complete   | 2026-06-02 |
 | 18. Security Design Pass | 0/? | Not started | - |
 
 ## Backlog
