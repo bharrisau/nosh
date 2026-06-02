@@ -50,6 +50,49 @@ const ACK_INTERVAL: Duration = Duration::from_millis(750);
 const BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
+/// Classify a `client::connect()` failure as a PERMANENT (fatal) error that must
+/// abort immediately, vs. a transient one that should be retried with backoff
+/// (BUG-A — host-key mismatch infinite-retry fix).
+///
+/// Fatal = security-critical or configuration errors where retrying can never
+/// succeed and silently looping would hide a security violation:
+///   - host-key mismatch (TOFU `known_hosts` pin violation — MITM indicator),
+///   - client key rejected / unauthorized (not in `authorized_keys`),
+///   - bad / encrypted / unparseable identity key, missing key material.
+///
+/// Transient = network-level conditions that may recover (timeout, unreachable,
+/// connection reset, ALPN renegotiation hiccups) — these retry.
+///
+/// rustls surfaces the custom verifier `Error::General`/`InvalidCertificate`
+/// strings inside quinn's `ConnectionError::TransportError` → anyhow chain, so
+/// we match on the rendered error text of the whole chain (the verifier message
+/// is `host key mismatch for ...`). TLS alerts for a rejected client cert render
+/// as `certificate required`/`access denied`/`bad certificate`/`unknown ca`.
+fn is_fatal_connect_error(e: &anyhow::Error) -> bool {
+    // Render the full error chain (anyhow `{:#}` includes `.context()` causes and
+    // the rustls/quinn source error text).
+    let msg = format!("{e:#}").to_ascii_lowercase();
+    const FATAL_MARKERS: &[&str] = &[
+        // Our HostKeyVerifier mismatch message (verifier.rs).
+        "host key mismatch",
+        // rustls TLS alerts for client-cert rejection (server-side AuthorizedKeysVerifier
+        // rejects → handshake fails with one of these alert descriptions).
+        "certificate required",
+        "access denied",
+        "bad certificate",
+        "certificate unknown",
+        "unknown ca",
+        "decrypt error",
+        "handshake failure",
+        // Local identity-key problems (resolve_identity / FileSigner) that can never
+        // be fixed by retrying the connection.
+        "encrypted",
+        "not ed25519",
+        "passphrase",
+    ];
+    FATAL_MARKERS.iter().any(|m| msg.contains(m))
+}
+
 /// Resolve when the user requests quit during a pre-session connect/reconnect
 /// backoff wait (BUG-B).
 ///
@@ -535,6 +578,25 @@ async fn main() -> anyhow::Result<()> {
         let conn = match client::connect(&endpoint, server_addr, &args.host, connect_timeout).await {
             Ok(c) => c,
             Err(e) => {
+                // BUG-A: a host-key mismatch (TOFU known_hosts pin violation) or a
+                // client-key/identity rejection is a PERMANENT, security-critical
+                // failure. Retrying can never succeed and silently looping would
+                // hide a possible MITM. Abort immediately with a terminal-visible
+                // error and a non-zero exit code — do NOT enter the backoff loop.
+                if is_fatal_connect_error(&e) {
+                    tracing::error!("fatal connect error (not retrying): {e:#}");
+                    // Surface the cause on the terminal in raw mode (\r\n line ends).
+                    eprintln!("\r\nnosh: connection aborted — {e:#}\r");
+                    eprintln!(
+                        "\r\nnosh: this is a permanent failure (host-key mismatch or key \
+                         rejected); not reconnecting. If you intentionally rotated the server \
+                         host key, remove the stale line for '{}' from your known_hosts file.\r",
+                        args.host
+                    );
+                    endpoint.close(0u32.into(), b"fatal connect error");
+                    exit_code = 1;
+                    break;
+                }
                 tracing::warn!("connect failed: {e}");
                 eprintln!("\r\nnosh: reconnecting…\r");
                 tokio::select! {
