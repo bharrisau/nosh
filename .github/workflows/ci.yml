@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    name: cargo test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+
+  build-windows:
+    name: cargo build nosh-client (Windows MSVC, HARDEN-02)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Windows client
+        # Only nosh-client: nosh-server has portable-pty + nix (Unix-only).
+        # nosh-auth is built transitively as a dep of nosh-client.
+        #
+        # windows-latest (Windows Server 2022) has MSVC Build Tools pre-installed;
+        # no MinGW or apt-get step needed.
+        #
+        # ring 0.17.x ships precompiled x86_64-windows asm objects; no NASM needed
+        # for MSVC (contrast with the retired windows-cross.yml GNU path).
+        #
+        # cargo build (NOT cargo check) is intentional (D-16-04): a real build
+        # catches linker and ABI issues that cargo check cannot detect. The job
+        # fails the run on any compile error — this is the "not false-green"
+        # requirement for HARDEN-02.
+        #
+        # D-16-04b: The green Actions run confirming HARDEN-02 is satisfied is a
+        # HUMAN verification item. The user must push to GitHub and confirm both
+        # jobs (linux + build-windows) are green in the Actions tab. This cannot
+        # be machine-verified from the build sandbox.
+        run: cargo build --locked --target x86_64-pc-windows-msvc -p nosh-client
