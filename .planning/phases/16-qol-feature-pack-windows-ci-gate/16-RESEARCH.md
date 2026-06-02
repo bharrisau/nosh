@@ -701,22 +701,25 @@ use crossterm::clipboard::CopyToClipboard;
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Approach (a) vs. (b) for OSC accumulation cap (D-16-01c)**
    - What we know: approach (b) is simpler and the transient risk is bounded by OS pipe buffers; approach (a) is more robust but requires a raw-byte pre-processor.
    - What's unclear: whether any real-world clipboard content (e.g. neovim yanking a 100KB file) would exceed 64 KiB in base64 form (~75 KB base64 for 56 KB raw). If so, OSC 52 would silently truncate large pastes.
    - Recommendation: Implement approach (b) with `OSC_52_MAX_BYTES = 65536`. Document the limit. Add a Phase 17 open item to consider approach (a) if large-clipboard use cases are reported.
+   - **RESOLVED:** Approach (b) chosen — re-enable vte `std` and enforce `OSC_52_MAX_BYTES = 65536` (and `MAX_TITLE_BYTES = 1024`) in `osc_dispatch` (Plan 16-01 Task 2). The transient buffer is bounded by the OS pipe buffer; the explicit cap re-mitigates the CR-03 DoS. Large-clipboard (>64 KiB) handling is deferred to Phase 17 per the recommendation.
 
 2. **ConnectionLossOverlay in overlays Vec vs. separate parameter**
    - What we know: `PredictionOverlay` is already passed separately to `render_with_predictor`. The `overlays` Vec currently only holds the no-op `ConnectionLossOverlay`.
    - What's unclear: whether removing `ConnectionLossOverlay` from `overlays` and passing it separately simplifies or complicates the `ClientScreen` API surface.
    - Recommendation: Follow the `PredictionOverlay` pattern. Both overlays passed explicitly. The `overlays: Vec<Box<dyn Overlay>>` Vec in `ClientScreen` can be removed (or kept empty for future use).
+   - **RESOLVED:** Follow the `PredictionOverlay` external-mutation pattern — hoist `ConnectionLossOverlay` out of the `overlays` Vec (`overlays: vec![]`) and pass it by shared ref into the extended `render_with_predictor(out, predictor, &loss)`; owned mutably in `run_pump` (Plan 16-02 Tasks 1–2). Simplest path; matches the established predictor seam.
 
 3. **--status title vs. RTT in a different location**
    - What we know: terminal title is the safest place (does not steal a terminal row; works across terminal emulators).
    - What's unclear: whether the user expects a persistent RTT indicator even when the remote app sets its own title.
    - Recommendation: Use the terminal title. Document in `--help` that `--status` replaces OSC 0/2 title propagation. (This is a known tradeoff per D-16-05.)
+   - **RESOLVED:** `--status` surfaces SRTT via the terminal title (OSC 0/2), emitted out-of-band after each datagram (Plan 16-02 Task 2). When `--status` is active, forwarded OSC 0/2 titles are suppressed so the RTT title takes precedence (Pitfall 5). Tradeoff documented in `--help` per D-16-05.
 
 ---
 

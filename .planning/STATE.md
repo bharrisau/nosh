@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
-status: ready_to_plan
-stopped_at: Phase 15 complete (3/3) — ready to discuss Phase 16
-last_updated: 2026-06-02T00:42:41.668Z
-last_activity: 2026-06-02 -- Phase 15 all 3 plans complete (D-15-04 adversarial tests passing)
+status: planning
+stopped_at: Phase 15 context gathered
+last_updated: "2026-06-02T01:20:06.480Z"
+last_activity: 2026-06-02 -- Phase 16 planning complete
 progress:
   total_phases: 9
   completed_phases: 6
-  total_plans: 14
+  total_plans: 17
   completed_plans: 14
   percent: 67
 ---
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-06-01)
 Phase: 16
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-06-02
+Last activity: 2026-06-02 -- Phase 16 planning complete
 
 ```
 Progress: [█████████░] 86%
