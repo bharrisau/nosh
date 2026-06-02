@@ -178,7 +178,7 @@ Plans:
 
 - [x] 16-01-PLAN.md — Server OSC passthrough: Message::TerminalControl proto variant, osc_dispatch read-gate + bounded caps, vte std re-enable, drain methods, forwarding
 - [ ] 16-02-PLAN.md — Client integration: OSC 52/0/2 re-emit, ConnectionLossOverlay activation + >5s silence timer, --status RTT title, WSAEMSGSIZE Windows filter
-- [ ] 16-03-PLAN.md — Windows CI gate: native ci.yml (Linux + windows-latest MSVC), retire windows-cross.yml (HARDEN-02 green-run is human sign-off)
+- [x] 16-03-PLAN.md — Windows CI gate: native ci.yml (Linux + windows-latest MSVC), retire windows-cross.yml (HARDEN-02 green-run is human sign-off)
 
 ### Phase 17: Windows-Host Predictive Echo Validation
 
@@ -227,7 +227,7 @@ Plans:
 | 13. Server Datagram Sender | 3/3 | Complete    | 2026-06-01 |
 | 14. Client Predictor — Confirmed Rendering | 3/3 | Complete    | 2026-06-01 |
 | 15. Client Predictor — Speculative Overlay | 3/3 | Complete    | 2026-06-02 |
-| 16. QoL Feature Pack + Windows CI Gate | 1/3 | In progress | 2026-06-02 |
+| 16. QoL Feature Pack + Windows CI Gate | 2/3 | In Progress|  |
 | 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
 | 18. Security Design Pass | 0/? | Not started | - |
 
