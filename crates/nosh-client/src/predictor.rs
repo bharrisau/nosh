@@ -179,16 +179,17 @@ pub struct PredictionOverlay {
     in_bracketed_paste: bool,
     /// Current predicted cursor position.
     predicted_cursor: CursorPos,
+    /// True when the user has issued local cursor motion (←/→/Home/End/Ctrl-A/
+    /// Ctrl-E) that diverges `predicted_cursor` from the confirmed cursor WITHOUT
+    /// enqueuing a printable prediction (BUG-D symptom 3). When set, the predicted
+    /// cursor is rendered (and is NOT snapped back to the confirmed cursor by
+    /// `sync_cursor_from_confirmed`) so left/right motion is visibly speculated.
+    /// Cleared on epoch reset and on confirming sync once pending is empty.
+    cursor_motion_pending: bool,
     /// Terminal column count.
     term_cols: u16,
     /// Terminal row count.
     term_rows: u16,
-    /// True when predictions have been enqueued but `cull()` has not yet run for
-    /// this epoch. Used by PREDICT-04 one-frame noecho protection: `cell_at` returns
-    /// `None` for the current epoch's predictions until at least one `cull()` call has
-    /// run, preventing the brief window where a password char could be rendered before
-    /// the noecho mismatch is detected (CR-03 fix).
-    awaiting_first_cull: bool,
 }
 
 impl PredictionOverlay {
@@ -203,9 +204,9 @@ impl PredictionOverlay {
             flagging: false,
             in_bracketed_paste: false,
             predicted_cursor: CursorPos { row: 0, col: 0 },
+            cursor_motion_pending: false,
             term_cols: cols,
             term_rows: rows,
-            awaiting_first_cull: false,
         }
     }
 
@@ -230,17 +231,19 @@ impl PredictionOverlay {
     ///
     /// Must be called in the datagram arm after `cull()` so that new predictions
     /// land on the correct row (the confirmed cursor row), not the hard-zeroed row 0.
-    /// Only syncs when `pending` is empty — a safe sync point where the predictor
-    /// has no speculative position to preserve.
     ///
-    /// Also clears `awaiting_first_cull` — the one-frame noecho protection flag —
-    /// because the datagram arm has now run through cull() at least once.
+    /// Only syncs when `pending` is empty AND there is no outstanding local cursor
+    /// motion (`cursor_motion_pending`). Snapping to the confirmed cursor while the
+    /// user has speculatively moved left/right (←/→/Home/End) but the server has not
+    /// yet confirmed the motion would clobber the predicted caret on every datagram —
+    /// the "arrow keys don't move / overwrite mode" symptom (BUG-D symptom 3). The
+    /// confirming datagram for the motion arrives with the cursor already at the
+    /// predicted column, so once that lands the next sync (with motion cleared) is a
+    /// no-op anyway.
     pub fn sync_cursor_from_confirmed(&mut self, confirmed: CursorPos) {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && !self.cursor_motion_pending {
             self.predicted_cursor = confirmed;
         }
-        // A cull() has now run for this epoch — safe to render non-tentative predictions.
-        self.awaiting_first_cull = false;
     }
 
     /// Update the terminal dimensions used for right-edge and row-bounds checks (WR-01 fix).
@@ -261,15 +264,16 @@ impl PredictionOverlay {
         if !self.should_display() {
             return None;
         }
-        // CR-03 / PREDICT-04: suppress cursor override until cull() has run.
-        if self.awaiting_first_cull {
-            return None;
-        }
-        let has_visible = self
-            .pending
-            .iter()
-            .any(|p| !self.is_tentative(p));
-        if has_visible {
+        // The predicted caret is emitted when EITHER:
+        //   - at least one non-tentative pending char prediction exists (printable
+        //     echo advanced the caret), OR
+        //   - the user issued local cursor motion (←/→/Home/End/Ctrl-A/Ctrl-E) that
+        //     has not yet been confirmed (BUG-D symptom 3 — pure motion enqueues no
+        //     pending cell, so without this branch the caret never moved).
+        // Both are gated by the tentative/epoch machinery elsewhere; motion is only
+        // pending within a live (non-reset) epoch.
+        let has_visible = self.pending.iter().any(|p| !self.is_tentative(p));
+        if has_visible || self.cursor_motion_pending {
             Some(self.predicted_cursor)
         } else {
             None
@@ -298,13 +302,16 @@ impl PredictionOverlay {
                     self.become_tentative();
                     return;
                 }
-                // CR-03 / PREDICT-04: if this is the first prediction in a fresh window
-                // (pending was empty before this keystroke), set the awaiting_first_cull
-                // flag. This prevents the prediction from being rendered until cull() has
-                // run at least once, closing the one-frame noecho exposure window.
-                if self.pending.is_empty() {
-                    self.awaiting_first_cull = true;
-                }
+                // BUG-D: noecho suppression is provided by the tentative-epoch machinery
+                // (a prediction with tentative_until_epoch > confirmed_epoch is hidden by
+                // is_tentative()/cell_at()). After the Enter that precedes any password
+                // prompt (read -s / ssh / sudo), the epoch is reset → become_tentative →
+                // predictions are tentative and hidden. The previous `awaiting_first_cull`
+                // flag ADDITIONALLY hid the first non-tentative prediction of every fresh
+                // epoch until a confirming datagram arrived — which suppressed the headline
+                // predictive-echo for the common echoing-shell case (space/char not shown,
+                // caret not advancing until the next keystroke). That over-suppression is
+                // removed; the tentative mechanism remains the structural noecho guard.
                 let epoch_required = screen.last_applied_epoch() + 1;
                 let tentative_until_epoch = self.prediction_epoch;
                 self.pending.push_back(PendingPrediction {
@@ -316,6 +323,9 @@ impl PredictionOverlay {
                     tentative_until_epoch,
                 });
                 self.predicted_cursor.col = col + col_width;
+                // A printable prediction is now the source of the visible caret; any
+                // prior pure-motion divergence is subsumed by this pending cell.
+                self.cursor_motion_pending = false;
             }
             InputAction::PredictBackspace => {
                 // CR-02 fix: remove the prediction at the vacated column so it no
@@ -326,32 +336,35 @@ impl PredictionOverlay {
                     let row = self.predicted_cursor.row;
                     self.pending.retain(|p| !(p.row == row && p.col == vacated_col));
                     self.predicted_cursor.col = vacated_col;
-                    // If backspace emptied pending, also clear awaiting_first_cull —
-                    // there is nothing to suppress and the cursor position is now
-                    // safe to display again.
-                    if self.pending.is_empty() {
-                        self.awaiting_first_cull = false;
-                    }
+                    // Backspace is a leftward cursor motion: keep the predicted caret
+                    // displayed even if pending is now empty (BUG-D symptom 3 sibling).
+                    self.cursor_motion_pending = true;
                 }
             }
             InputAction::PredictCursorLeft => {
                 if self.predicted_cursor.col > 0 {
                     self.predicted_cursor.col -= 1;
                 }
+                // Pure motion enqueues no pending cell; mark so predicted_cursor() emits
+                // the moved caret and sync_cursor_from_confirmed does not snap it back.
+                self.cursor_motion_pending = true;
             }
             InputAction::PredictCursorRight => {
                 if self.predicted_cursor.col + 1 < self.term_cols {
                     self.predicted_cursor.col += 1;
                 }
+                self.cursor_motion_pending = true;
             }
             InputAction::PredictLineStart => {
                 self.predicted_cursor.col = 0;
+                self.cursor_motion_pending = true;
             }
             InputAction::PredictLineEnd => {
                 // Scan confirmed row right-to-left for last non-blank cell (Open Question 3).
                 let row = self.predicted_cursor.row;
                 let end_col = self.find_line_end(row, screen);
                 self.predicted_cursor.col = end_col;
+                self.cursor_motion_pending = true;
             }
             InputAction::EpochReset | InputAction::BulkSuppressed => {
                 // Reset clears all pending predictions AND increments prediction_epoch,
@@ -382,13 +395,6 @@ impl PredictionOverlay {
     /// - `rtt_ms`: current smoothed RTT from `conn.rtt().as_millis()`.
     pub fn cull(&mut self, screen: &ClientScreen, new_epoch: u64, rtt_ms: u64) {
         self.update_rtt_thresholds(rtt_ms);
-
-        // CR-03 / PREDICT-04: cull() has now run for this epoch. Clear the
-        // awaiting_first_cull flag so subsequent renders may show predictions.
-        // Note: if a non-tentative mismatch triggers reset() below, reset() will
-        // re-set awaiting_first_cull = true, correctly requiring another cull() before
-        // the next batch of predictions becomes visible.
-        self.awaiting_first_cull = false;
 
         // Collect indices of predictions to remove (confirmed or no-credit).
         // On a non-tentative mismatch: full reset and early return (Pitfall 1).
@@ -487,10 +493,10 @@ impl PredictionOverlay {
     pub fn reset(&mut self) {
         self.pending.clear();
         self.become_tentative();
-        // After a reset, the next prediction will be in a fresh epoch. Set
-        // awaiting_first_cull so the first keystroke after a reset is also
-        // protected by the one-frame noecho guard (CR-03 / PREDICT-04).
-        self.awaiting_first_cull = true;
+        // A reset (Enter / ESC / Tab / Ctrl-C / cursor-addressing / bulk) clears any
+        // outstanding local cursor motion: the new epoch is tentative (hidden) until
+        // the server confirms, so no speculative caret should be shown (BUG-D).
+        self.cursor_motion_pending = false;
     }
 
     /// Remove all predictions with the given `tentative_until_epoch`.
@@ -561,24 +567,22 @@ impl Overlay for PredictionOverlay {
     ///
     /// Returns `None` when:
     /// - Display is disabled (`should_display()` is false), or
-    /// - No non-tentative prediction exists at `(row, col)`, or
-    /// - `awaiting_first_cull` is true (PREDICT-03/04 one-frame noecho protection).
+    /// - No non-tentative prediction exists at `(row, col)`.
     ///
-    /// The `awaiting_first_cull` guard closes the PREDICT-04 one-frame exposure
-    /// window: when a fresh prediction epoch begins, no prediction is rendered until
-    /// `cull()` has confirmed at least one datagram for this epoch. This prevents a
-    /// password character from being written to stdout before the noecho mismatch
-    /// is structurally detected.
+    /// Noecho suppression (PREDICT-04) is provided structurally by the tentative
+    /// epoch mechanism: `is_tentative(pred)` returns true whenever
+    /// `tentative_until_epoch > confirmed_epoch`, which holds for every prediction
+    /// made after an epoch reset (e.g. the Enter that precedes a `read -s` / `ssh` /
+    /// `sudo` password prompt) until the server confirms an echoed character. While
+    /// the server suppresses echo, `confirmed_epoch` never advances, so all such
+    /// predictions remain tentative (hidden) — proven by the `noecho_suppression`
+    /// unit test and the live `noecho_read_dash_s_zero_predicted_chars` integration
+    /// test.
     ///
     /// Returns `Some(Cell)` with `UNDERLINE` style when `flagging` is true (RTT
     /// above FLAG_TRIGGER_HIGH_MS), plain style otherwise.
     fn cell_at(&self, row: u16, col: u16) -> Option<Cell> {
         if !self.should_display() {
-            return None;
-        }
-        // CR-03 / PREDICT-04: suppress ALL predictions until cull() has run for
-        // this epoch. This is the structural one-frame noecho protection.
-        if self.awaiting_first_cull {
             return None;
         }
         for pred in &self.pending {
@@ -1574,44 +1578,165 @@ mod tests {
         );
     }
 
-    /// CR-03 regression: first keystroke of a new epoch is NOT rendered until cull() runs.
+    /// BUG-D: a printable prediction in a NON-tentative epoch is shown IMMEDIATELY on
+    /// keystroke (no waiting for a confirming datagram). This is the headline
+    /// predictive-echo behaviour: the typed char and the advanced caret appear at once.
     ///
-    /// Before the fix, `on_input` → `render_with_predictor` could show a prediction
-    /// to stdout before any `cull()` had detected a noecho mismatch — a one-frame
-    /// exposure window for passwords. After the fix, `awaiting_first_cull=true` suppresses
-    /// `cell_at` until cull() runs (PREDICT-03/04).
+    /// (This replaces the old CR-03 `awaiting_first_cull` test, which asserted the
+    /// prediction was hidden until cull() ran — that over-suppression broke the
+    /// headline feature for the common echoing-shell case. Noecho safety is now proven
+    /// by `bug_d_noecho_after_reset_is_hidden` below and the live integration test.)
     #[test]
-    fn cr03_noecho_first_keystroke_not_rendered_before_cull() {
+    fn bug_d_printable_visible_immediately_on_keystroke() {
         let screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
 
-        // Type 'a' — fresh epoch, awaiting_first_cull=true.
+        // Type 'a' on a fresh, non-tentative epoch (confirmed_epoch == prediction_epoch == 0).
         overlay.on_input(b"a", &screen);
 
-        // BEFORE cull(), cell_at must return None (no one-frame render).
+        // The predicted char must be visible WITHOUT any cull()/datagram first.
+        let cell = overlay.cell_at(0, 0);
         assert!(
-            overlay.cell_at(0, 0).is_none(),
-            "PREDICT-04 violation: cell_at(0,0) returned Some BEFORE cull() ran — \
-             first keystroke of a fresh epoch must not be rendered until cull() confirms \
-             the prediction or detects noecho (CR-03 one-frame noecho protection)"
+            cell.is_some(),
+            "BUG-D: cell_at(0,0) must return Some immediately after typing 'a' (predictive \
+             echo must not wait for a confirming datagram)"
         );
+        assert_eq!(cell.unwrap().ch, 'a', "predicted cell must contain 'a'");
+
+        // The predicted caret must have advanced to col 1 immediately.
+        let cur = overlay.predicted_cursor();
+        assert!(
+            cur.is_some(),
+            "BUG-D: predicted_cursor() must be Some immediately after a printable keystroke"
+        );
+        assert_eq!(cur.unwrap().col, 1, "BUG-D: caret must advance to col 1 after typing 'a'");
+    }
+
+    /// BUG-D: SPACE is a printable prediction and must advance the caret immediately
+    /// (the user reported space did not show / advance until the next char).
+    #[test]
+    fn bug_d_space_advances_caret_immediately() {
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        overlay.on_input(b"a", &screen);
+        overlay.on_input(b" ", &screen); // space
+        assert_eq!(
+            overlay.predicted_cursor().map(|c| c.col),
+            Some(2),
+            "BUG-D: caret must advance to col 2 after 'a' then space (space is predicted)"
+        );
+        // The space prediction is enqueued at col 1.
+        assert!(
+            overlay.pending.iter().any(|p| p.col == 1 && p.predicted_ch == ' '),
+            "BUG-D: a space prediction must be enqueued at col 1"
+        );
+    }
+
+    /// BUG-D security preservation: after an epoch reset (the Enter that precedes a
+    /// `read -s` / `ssh` / `sudo` password prompt), predictions are TENTATIVE and
+    /// therefore hidden until the server confirms an echoed char. Removing
+    /// `awaiting_first_cull` must NOT weaken this.
+    #[test]
+    fn bug_d_noecho_after_reset_is_hidden() {
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Simulate the Enter that submits the command that triggers a noecho prompt.
+        overlay.on_input(b"\r", &screen); // EpochReset → become_tentative
+        assert!(overlay.confirmed_epoch() < overlay.prediction_epoch());
+
+        // Now type password chars — they are tentative (tentative_until_epoch > confirmed).
+        overlay.on_input(b"s", &screen);
+        overlay.on_input(b"e", &screen);
+
+        for col in 0..5u16 {
+            assert!(
+                overlay.cell_at(0, col).is_none(),
+                "BUG-D security: password char prediction at col {col} must be HIDDEN \
+                 (tentative epoch) — noecho suppression must hold without awaiting_first_cull"
+            );
+        }
         assert!(
             overlay.predicted_cursor().is_none(),
-            "predicted_cursor() must be None before cull() runs for a fresh epoch (CR-03)"
+            "BUG-D security: predicted_cursor() must be None for tentative-only predictions"
+        );
+    }
+
+    /// BUG-D symptom 3: left/right arrow keys MOVE the predicted caret, and the
+    /// motion is NOT clobbered by a confirming datagram's sync_cursor_from_confirmed.
+    ///
+    /// Before the fix, pure cursor motion enqueued no pending cell, so
+    /// `predicted_cursor()` returned None (caret never moved), and even if it had,
+    /// `sync_cursor_from_confirmed` (called every datagram when pending is empty)
+    /// snapped the caret back to the confirmed column — the "arrows don't move /
+    /// overwrite mode" symptom.
+    #[test]
+    fn bug_d_arrow_motion_moves_caret_and_survives_sync() {
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Server places the cursor at col 5 (e.g. after "hello").
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 5 },
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                chars: "hello".to_string(),
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+            }],
+        };
+        screen.apply(&diff);
+        overlay.cull(&screen, 1, 50);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // caret at col 5
+
+        // Press LEFT arrow (CSI D). Caret must move to col 4 and be visible.
+        overlay.on_input(b"\x1b[D", &screen);
+        assert_eq!(
+            overlay.predicted_cursor().map(|c| c.col),
+            Some(4),
+            "BUG-D: left arrow must move predicted caret to col 4 (was at col 5)"
         );
 
-        // Simulate noecho: cull() with an empty datagram (server didn't echo 'a').
-        // The prediction will mismatch → reset() → pending cleared.
-        let diff_empty = make_diff_empty(1);
-        let mut screen2 = make_screen(80, 24);
-        screen2.apply(&diff_empty);
-        overlay.cull(&screen2, 1, 5);
+        // A confirming datagram arrives (cursor STILL at col 5 server-side, motion not yet
+        // applied). pending is empty, but cursor_motion_pending must protect the caret.
+        let diff2 = StateDiff {
+            epoch: 2,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 5 },
+            runs: vec![],
+        };
+        screen.apply(&diff2);
+        overlay.cull(&screen, 2, 50);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor());
 
-        // After cull detected noecho (mismatch → reset), cell_at must still return None.
+        assert_eq!(
+            overlay.predicted_cursor().map(|c| c.col),
+            Some(4),
+            "BUG-D: predicted caret at col 4 must SURVIVE a confirming datagram \
+             (sync must not snap it back to confirmed col 5 while motion is pending)"
+        );
+
+        // Press RIGHT arrow (CSI C) twice → col 6.
+        overlay.on_input(b"\x1b[C", &screen);
+        overlay.on_input(b"\x1b[C", &screen);
+        assert_eq!(
+            overlay.predicted_cursor().map(|c| c.col),
+            Some(6),
+            "BUG-D: two right arrows from col 4 must move predicted caret to col 6"
+        );
+
+        // Enter (epoch reset) clears motion → caret no longer overridden.
+        overlay.on_input(b"\r", &screen);
         assert!(
-            overlay.cell_at(0, 0).is_none(),
-            "after noecho cull, cell_at(0,0) must be None — \
-             structural noecho suppression must hold (PREDICT-04)"
+            overlay.predicted_cursor().is_none(),
+            "BUG-D: after Enter (reset), cursor_motion_pending must clear → predicted_cursor() None"
         );
     }
 
