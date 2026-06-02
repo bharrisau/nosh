@@ -15,7 +15,7 @@ Clear the carried tech debt so nosh is dependable enough to daily-drive. The PTY
 
 - [x] **HARDEN-01**: Orphaned/cleaned-up sessions cleanly terminate their PTY reader — a blocked `read()` is interruptible (self-pipe / `nix::poll` over `[PTY fd, shutdown pipe]`), so `abort()` actually stops the reader and the server's blocking-thread count stays bounded under repeated session orphan/drop
 - [x] **HARDEN-02**: The Windows cross-compile CI gate actually runs — a git remote is configured and a `windows-latest` job builds `nosh-client` for `x86_64-pc-windows-msvc` on every push (no false-green)
-- [ ] **HARDEN-03**: The `WSAEMSGSIZE` quinn_udp warning on Windows is resolved or deliberately suppressed (e.g. `quinn_udp=error` tracing filter), with the rationale recorded and the upstream issue referenced
+- [x] **HARDEN-03**: The `WSAEMSGSIZE` quinn_udp warning on Windows is resolved or deliberately suppressed (e.g. `quinn_udp=error` tracing filter), with the rationale recorded and the upstream issue referenced
 
 ### Datagram State Sync
 
@@ -41,10 +41,10 @@ The headline differentiator — full Mosh/SSP-style speculative echo. Conservati
 
 Day-to-day ergonomics for a roaming shell. All three escape-sequence features share the server-side "detect sequence in PTY output" mechanism.
 
-- [ ] **QOL-01**: When the link goes silent (no datagram for >5 s) the client shows an unobtrusive overlay (row 0) with an elapsed "last contact" counter and abort instructions (`Press ~. to disconnect`), which clears automatically when traffic resumes
-- [ ] **QOL-02**: Terminal output that sets the clipboard via OSC 52 is forwarded to the client (over the reliable stream, no MTU limit) and applied to the local clipboard — write-only (OSC 52 read is never honored)
-- [ ] **QOL-03**: Terminal-title sequences (OSC 0/2) from the remote shell propagate to the local terminal (not stripped), so the local tab reflects the remote context
-- [ ] **QOL-04**: The client can surface the measured round-trip time (e.g. in the terminal title via a `--status` option), reusing the SRTT already tracked for adaptive prediction
+- [x] **QOL-01**: When the link goes silent (no datagram for >5 s) the client shows an unobtrusive overlay (row 0) with an elapsed "last contact" counter and abort instructions (`Press ~. to disconnect`), which clears automatically when traffic resumes
+- [x] **QOL-02**: Terminal output that sets the clipboard via OSC 52 is forwarded to the client (over the reliable stream, no MTU limit) and applied to the local clipboard — write-only (OSC 52 read is never honored)
+- [x] **QOL-03**: Terminal-title sequences (OSC 0/2) from the remote shell propagate to the local terminal (not stripped), so the local tab reflects the remote context
+- [x] **QOL-04**: The client can surface the measured round-trip time (e.g. in the terminal title via a `--status` option), reusing the SRTT already tracked for adaptive prediction
 
 ### Security Design
 
@@ -90,7 +90,7 @@ Explicitly excluded for v1.2. Documented to prevent scope creep.
 |-------------|-------|--------|
 | HARDEN-01 | Phase 10 | Complete |
 | HARDEN-02 | Phase 16 | Complete |
-| HARDEN-03 | Phase 16 | Pending |
+| HARDEN-03 | Phase 16 | Complete |
 | SYNC-01 | Phase 11 | Complete |
 | SYNC-02 | Phase 12 | Complete |
 | SYNC-03 | Phase 13 | Complete |
@@ -101,10 +101,10 @@ Explicitly excluded for v1.2. Documented to prevent scope creep.
 | PREDICT-05 | Phase 15 | Complete |
 | PREDICT-06 | Phase 15 | Complete |
 | PREDICT-07 | Phase 17 | Pending |
-| QOL-01 | Phase 16 | Pending |
-| QOL-02 | Phase 16 | Pending |
-| QOL-03 | Phase 16 | Pending |
-| QOL-04 | Phase 16 | Pending |
+| QOL-01 | Phase 16 | Complete |
+| QOL-02 | Phase 16 | Complete |
+| QOL-03 | Phase 16 | Complete |
+| QOL-04 | Phase 16 | Complete |
 | SEC-01 | Phase 18 | Pending |
 | SEC-02 | Phase 18 | Pending |
 

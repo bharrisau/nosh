@@ -41,7 +41,7 @@ Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.plannin
 - [x] **Phase 13: Server Datagram Sender** — Wires TerminalState into run_session select! loop; coalesced diffs over QUIC datagrams; ResumeComplete gate (completed 2026-06-01)
 - [x] **Phase 14: Client Predictor — Confirmed Rendering** — ClientScreen renders confirmed terminal state from datagrams; ConnectionLossOverlay stub; all display through single render path (completed 2026-06-01)
 - [x] **Phase 15: Client Predictor — Speculative Overlay** — Full SSP-style prediction engine: epoch tracking, conservative fallback, underline rendering, adaptive RTT mode, wide-char handling (completed 2026-06-02)
-- [ ] **Phase 16: QoL Feature Pack + Windows CI Gate** — Connection-loss banner, OSC 52 clipboard, terminal title, --predict flags; Windows CI job runs + WSAEMSGSIZE suppressed
+- [x] **Phase 16: QoL Feature Pack + Windows CI Gate** — Connection-loss banner, OSC 52 clipboard, terminal title, --predict flags; Windows CI job runs + WSAEMSGSIZE suppressed (completed 2026-06-02)
 - [ ] **Phase 17: Windows-Host Predictive Echo Validation** — Predictive echo confirmed on native Windows client; live validation sign-off (run on Windows host)
 - [ ] **Phase 18: Security Design Pass** — Threat-model doc + TOFU fingerprint prompt implementation
 
@@ -177,7 +177,7 @@ Plans:
 **Plans**: 3 plans
 
 - [x] 16-01-PLAN.md — Server OSC passthrough: Message::TerminalControl proto variant, osc_dispatch read-gate + bounded caps, vte std re-enable, drain methods, forwarding
-- [ ] 16-02-PLAN.md — Client integration: OSC 52/0/2 re-emit, ConnectionLossOverlay activation + >5s silence timer, --status RTT title, WSAEMSGSIZE Windows filter
+- [x] 16-02-PLAN.md — Client integration: OSC 52/0/2 re-emit, ConnectionLossOverlay activation + >5s silence timer, --status RTT title, WSAEMSGSIZE Windows filter
 - [x] 16-03-PLAN.md — Windows CI gate: native ci.yml (Linux + windows-latest MSVC), retire windows-cross.yml (HARDEN-02 green-run is human sign-off)
 
 ### Phase 17: Windows-Host Predictive Echo Validation
@@ -227,7 +227,7 @@ Plans:
 | 13. Server Datagram Sender | 3/3 | Complete    | 2026-06-01 |
 | 14. Client Predictor — Confirmed Rendering | 3/3 | Complete    | 2026-06-01 |
 | 15. Client Predictor — Speculative Overlay | 3/3 | Complete    | 2026-06-02 |
-| 16. QoL Feature Pack + Windows CI Gate | 2/3 | In Progress|  |
+| 16. QoL Feature Pack + Windows CI Gate | 3/3 | Complete   | 2026-06-02 |
 | 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
 | 18. Security Design Pass | 0/? | Not started | - |
 
