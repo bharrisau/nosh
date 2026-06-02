@@ -193,7 +193,10 @@ Plans:
   3. Connection migration (network path change) works concurrently with predictive echo active — prediction epoch resets cleanly on migration without screen corruption
   4. A live Windows-host validation document (`docs/windows-echo-test.md`) is signed off by the operator, recording: auth, predicted echo, epoch reset on vim, noecho suppression, and roaming-with-prediction
 
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [ ] 17-01-PLAN.md — Author and operator-sign-off docs/windows-echo-test.md: live Windows-client predictive-echo + roaming validation against a Linux server over a real network
 **Note: Run on Windows host** — halt Linux execution before this phase; resume from a Windows machine.
 
 ### Phase 18: Security Design Pass
