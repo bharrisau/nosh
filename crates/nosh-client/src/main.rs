@@ -412,10 +412,23 @@ enum PumpOutcome {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // HARDEN-03 / D-16-04a: On Windows, quinn_udp emits a WARN for every datagram
+    // where the GRO receive path appends UDP_COALESCED_INFO metadata (WSAEMSGSIZE).
+    // The datagram is NOT lost — only the GRO metadata is affected. This is a
+    // known Windows-specific behaviour tracked upstream at quinn-rs/quinn#2041 (open).
+    // We suppress quinn_udp WARN (setting quinn_udp=error) on Windows only, leaving
+    // all other quinn connection/auth WARNs visible. The filter is quinn_udp=error,
+    // NOT quinn=error — the latter would silence genuine connection-level warnings.
+    #[cfg(target_os = "windows")]
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into())
+        .add_directive("quinn_udp=error".parse().unwrap());
+    #[cfg(not(target_os = "windows"))]
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
 

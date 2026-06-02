@@ -29,7 +29,7 @@ ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "s
 # reader corrupts VT byte sequences on Windows). 'events' is a default feature;
 # we drop 'event-stream' (and its futures dep) since we no longer read events.
 # DO NOT enable use-dev-tty: Unix-only, breaks the Windows build (crossterm #935).
-crossterm = { version = "0.29", features = ["events"] }
+crossterm = { version = "0.29", features = ["events", "osc52"] }
 dirs = "5"
 unicode-width = "0.2"
 
