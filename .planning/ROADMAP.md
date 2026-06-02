@@ -247,3 +247,13 @@ Parking lot for ideas not scheduled into a milestone yet (999.x). Promote via `/
 **Goal**: Prove a hostile/compromised server cannot extract sensitive local material from the client, cannot escape the terminal, and cannot succeed at MitM.
 **Scope**: Adversarial malicious-server test harness driving the real client. Verify: (a) no exfiltration of local secrets — OSC 52 clipboard *read* never honored (already a non-goal; prove it), no env-var/file/`SSH_AUTH_SOCK`/agent leakage; (b) no terminal escape via injected control sequences in datagram/stream payloads; (c) MitM resistance — TOFU/known_hosts pinning + the Phase 18 fingerprint-confirm hold, and a *changed* host key hard-fails. Confirms the Phase 18 TOFU work actually closes the MitM gap end-to-end.
 **Origin**: requested 2026-06-02 during M4.
+
+### Phase 999.3: Client terminal-rendering correctness pack (platform-agnostic; fix + test on Linux)
+**Goal**: Resolve the terminal-handling defects surfaced during Phase 17 live validation. All items reproduce on a Linux client — fix and test on Linux where the full test suite compiles.
+**Scope** (all flagged platform-agnostic):
+- **No clear-on-connect / blank cells not painted as spaces** → prior terminal content bleeds through on connect; Ctrl-L erases one line at a time instead of clearing the screen (BUG-H family). Root: `crates/nosh-client/src/screen.rs` full-framebuffer diff skips blank cells + no initial physical clear sent on connect; server ED/clear handling in `crates/nosh-server/src/terminal.rs`.
+- **Backspace can move the predicted caret past the prompt start** (BUG-E). Root: `predictor.rs` clamps at col 0 not prompt-start col (`PredictBackspace` / `PredictCursorLeft`).
+- **Enter after a `read -s` noecho prompt doesn't advance the line** (BUG-F). Root: post-noecho-epoch render relies on server StateDiff cursor; predicted caret may be stale after the noecho epoch ends.
+- **Typematic / fast-typing glitch in vim** — `BulkSuppressed` fires on >4-byte stdin batches in `predictor.rs`; threshold may be too aggressive for fast typists.
+- **D-17-02a latency instrumentation measures epoch-confirmation time** (inclusive of think-time), not per-keystroke RTT — too coarse for measured-timing evidence; consider per-keystroke timing hooks.
+**Origin**: surfaced during Phase 17 live validation 2026-06-02.

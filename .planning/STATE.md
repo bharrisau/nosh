@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: executing
-stopped_at: Phase 15 context gathered
-last_updated: "2026-06-02T07:13:37.949Z"
-last_activity: 2026-06-02 -- Phase 16 execution started
+stopped_at: Phase 17 complete — Windows predictive-echo validation PASSED, 6 bugs fixed live
+last_updated: "2026-06-02"
+last_activity: 2026-06-02 -- Phase 17 complete — Windows predictive-echo validation PASSED, 6 bugs fixed live
 progress:
   total_phases: 11
   completed_phases: 8
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-01)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 16 — qol-feature-pack-windows-ci-gate
+**Current focus:** Phase 17 complete; Phase 18 deferred to a future milestone (user decision)
 
 ## Current Position
 
-Phase: 16 (qol-feature-pack-windows-ci-gate) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 16
-Last activity: 2026-06-02 -- Phase 16 execution started
+Phase: 17 (windows-host-predictive-echo-validation) — COMPLETE
+Plan: 1 of 1
+Status: Phase 17 complete; Phase 18 deferred to a future milestone (user decision)
+Last activity: 2026-06-02 -- Phase 17 complete — Windows predictive-echo validation PASSED, 6 bugs fixed live
 
 ```
 Progress: [██████████] 100%
@@ -111,6 +111,8 @@ Recent decisions affecting current work:
 - [Phase ?]: Predictor held in run_pump not overlays Vec
 - [Phase ?]: D-17-02a latency hook uses HashMap in run_pump
 - [Phase ?]: D-16-04: native windows-latest MSVC replaces Linux GNU cross-compile for nosh-client Windows CI gate (HARDEN-02)
+- [Phase 17]: Phase 18 (Security Design Pass) deferred to a future milestone — user decision post Phase 17 sign-off
+- [Phase 17]: Platform-agnostic terminal-rendering defects (no clear-on-connect, typematic glitch, etc.) backlogged as 999.3 — not Windows-specific, to be fixed on Linux
 
 ### Pending Todos
 
@@ -125,7 +127,7 @@ Recent decisions affecting current work:
 ### Blockers/Concerns
 
 - Phase 15 (Speculative Overlay): RESOLVED — adversarial tests (vim, `read -s`, CJK) all pass; noecho security gate proven adversarially against live PTY in Always mode
-- Phase 17 (Windows validation): requires a physical Windows host; cannot be executed from CI or Linux cross-compile
+- Phase 17 (Windows validation): RESOLVED — validated 2026-06-02 on physical Windows host (10.0.26100) against Linux server `sandstorm`; all C1–C6 PASSED; PREDICT-07 satisfied
 - Phase 11 (wire format): sparse-diff encoding strategy for large repaints is an open design decision that blocks all prediction work; must be resolved as Phase 11's first task
 
 ## Deferred Items

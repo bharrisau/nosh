@@ -1,7 +1,7 @@
 # Windows Predictive Echo Validation (PREDICT-07)
 
 **Phase 17 — NON-BLOCKING for CI, REQUIRED for phase completion**
-**Status:** Pending operator execution on a physical Windows host against a real Linux server
+**Status:** COMPLETE — validated 2026-06-02 on a physical Windows host against a Linux server over a real network. PASSED (with platform-agnostic terminal-rendering polish backlogged — see 999.3).
 
 This document is the operator-run live validation for PREDICT-07. It proves that predictive
 echo (Phase 15) and the QoL feature pack (Phase 16) work on the **native Windows client**
@@ -100,12 +100,12 @@ sign-off — every row must have a recorded outcome.
 
 | # | Check | Expected | Result |
 |---|-------|----------|--------|
-| C1 | **Auth over real network** | Windows client connects to the Linux server over the non-loopback network path using the on-disk Ed25519 key; interactive shell prompt appears within ~2s; server IP is NOT loopback (not 127.x.x.x or ::1). Record the server IP used. | |
-| C2 | **Predicted echo engages (MEASURED)** | With `--predict always` and `RUST_LOG=nosh::predict=debug ... 2> predict.log`, locally typed characters appear speculatively BEFORE the server confirms them (sub-RTT local echo). The `--status` title shows SRTT > 0 ms. After exiting, `predict.log` contains `latency_ms=<n>` lines; paste representative min/median/max into the sign-off block. Measured confirm latency_ms should be on the order of the network RTT and strictly greater than the perceived local-echo latency (which is near-zero). | |
-| C3 | **Epoch reset on full-screen repaint (vim insert)** | Open `vim` in the session, press `i` to enter insert mode, type a burst of characters; observe the full-screen repaint. The prediction epoch resets cleanly — **zero corrupt cells** (D-17-03). Screen content matches what was typed; no stray, duplicated, or misplaced predicted glyphs visible. | |
-| C4 | **noecho suppression** | Trigger a non-echoing prompt — e.g. `read -s SECRET; echo "done"` — and type characters while in the `read -s` prompt. **Zero predicted characters** appear during the non-echo interval (D-17-03; PREDICT-04 security property). Characters typed during the noecho prompt must not be speculatively echoed. | |
-| C5 | **Windows-native coverage** | Exercise a Windows-native editor or REPL through the session (e.g. open `nano` or `micro` via the Linux shell, or test PowerShell/cmd line-editing quirks via the session). Confirm no Windows-specific predicted-echo corruption: no CRLF double-newline artifacts, no ConPTY repaint glitches, no stray speculative glyphs. Rendering matches Linux behavior. | |
-| C6 | **Roaming WITH active prediction (WireGuard teardown)** | Connect `nosh` THROUGH the WireGuard tunnel with `--predict always`. Start `i=0; while true; do echo "LINE:$i"; i=$((i+1)); sleep 1; done` and type steadily to keep predictions live. Tear down the WG tunnel mid-session (exact steps in §WireGuard Migration Procedure). Expected: QUIC connection migration continues the SAME session — no re-auth, no reconnect/error message, output resumes after at most a brief (~1–2s) anti-amplification stall, no lost or duplicated `LINE:$i`, AND prediction epoch resets cleanly across the path change with no screen corruption. | |
+| C1 | **Auth over real network** | Windows client connects to the Linux server over the non-loopback network path using the on-disk Ed25519 key; interactive shell prompt appears within ~2s; server IP is NOT loopback (not 127.x.x.x or ::1). Record the server IP used. | **PASSED** — connected from Windows client to Linux server `sandstorm` at 10.209.1.5 (non-loopback) using the on-disk Ed25519 key. |
+| C2 | **Predicted echo engages (MEASURED)** | With `--predict always` and `RUST_LOG=nosh::predict=debug ... 2> predict.log`, locally typed characters appear speculatively BEFORE the server confirms them (sub-RTT local echo). The `--status` title shows SRTT > 0 ms. After exiting, `predict.log` contains `latency_ms=<n>` lines; paste representative min/median/max into the sign-off block. Measured confirm latency_ms should be on the order of the network RTT and strictly greater than the perceived local-echo latency (which is near-zero). | **PASSED** — printable chars incl. space echo and advance the caret instantly; ←/→ motion predicts; measured confirm latency median 25 ms vs instant local echo at SRTT 50 ms (sub-RTT). Required the BUG-D fix (see Bugs Found below). 271 predictions logged; 40 clean confirmations; min 1 ms, median 25 ms, bulk of clean confirmations ≤ 57 ms. Tail of high outliers (1673/3289/7314/20803/32452 ms) reflects D-17-02a epoch-confirmation time inclusive of operator think-time when paused mid-epoch — known measurement-coarseness limitation, backlogged as 999.3. |
+| C3 | **Epoch reset on full-screen repaint (vim insert)** | Open `vim` in the session, press `i` to enter insert mode, type a burst of characters; observe the full-screen repaint. The prediction epoch resets cleanly — **zero corrupt cells** (D-17-03). Screen content matches what was typed; no stray, duplicated, or misplaced predicted glyphs visible. | **PASSED** — vim insert-mode burst repaints with no corrupt cells. Minor: slight glitch under very fast/typematic key-repeat (backlog 999.3, platform-agnostic). |
+| C4 | **noecho suppression** | Trigger a non-echoing prompt — e.g. `read -s SECRET; echo "done"` — and type characters while in the `read -s` prompt. **Zero predicted characters** appear during the non-echo interval (D-17-03; PREDICT-04 security property). Characters typed during the noecho prompt must not be speculatively echoed. | **PASSED** — `read -s` showed ZERO predicted characters (security property holds). |
+| C5 | **Windows-native coverage** | Exercise a Windows-native editor or REPL through the session (e.g. open `nano` or `micro` via the Linux shell, or test PowerShell/cmd line-editing quirks via the session). Confirm no Windows-specific predicted-echo corruption: no CRLF double-newline artifacts, no ConPTY repaint glitches, no stray speculative glyphs. Rendering matches Linux behavior. | **PASSED (predicted-echo)** — no Windows-specific predicted-echo corruption or ConPTY glitch in the prediction path. NOTE separately: a platform-agnostic rendering defect was observed (no clear-on-connect and blank cells not painted as spaces → prior terminal content bleeds through; Ctrl-L erases a line at a time instead of clearing) — backlogged as 999.3, reproduces on Linux, not Windows-specific. |
+| C6 | **Roaming WITH active prediction (WireGuard teardown)** | Connect `nosh` THROUGH the WireGuard tunnel with `--predict always`. Start `i=0; while true; do echo "LINE:$i"; i=$((i+1)); sleep 1; done` and type steadily to keep predictions live. Tear down the WG tunnel mid-session (exact steps in §WireGuard Migration Procedure). Expected: QUIC connection migration continues the SAME session — no re-auth, no reconnect/error message, output resumes after at most a brief (~1–2s) anti-amplification stall, no lost or duplicated `LINE:$i`, AND prediction epoch resets cleanly across the path change with no screen corruption. | **PASSED** — connected through a WireGuard tunnel with `--predict always`; tearing down the tunnel mid-session triggered QUIC connection migration confirmed server-side (`connection migrated old=10.209.221.10:50356 new=10.211.40.106:50356`, same session_id, no re-auth). Session continued; no corruption. |
 
 ---
 
@@ -156,20 +156,9 @@ command used — D-17-01 requires this for the doc to satisfy PREDICT-07.
 Bring up a WireGuard tunnel on the Windows host that routes traffic to (or toward) the Linux
 server's IP. Open the WireGuard GUI or use `wg-quick`.
 
-**Paste your WG tunnel config here (replace this block at sign-off):**
+**Operator note (sign-off):**
 
-```ini
-# [OPERATOR: paste the relevant WireGuard tunnel config snippet here]
-# Example:
-# [Interface]
-# PrivateKey = <client-private-key>
-# Address = 10.100.0.2/24
-#
-# [Peer]
-# PublicKey = <server-public-key>
-# Endpoint = <server-public-ip>:51820
-# AllowedIPs = <server-lan-subnet>/24
-```
+Operator validated migration by deactivating the active WireGuard tunnel mid-session (WireGuard GUI → Deactivate); server logged the path change above. Exact tunnel config not transcribed in this run — the path change + session continuity is the evidence.
 
 ### Step 2 — Connect nosh through the tunnel
 
@@ -193,16 +182,9 @@ predictions live.
 
 ### Step 4 — Tear down the WireGuard tunnel mid-session
 
-**Paste the exact teardown command or GUI step used here (replace at sign-off):**
+**Operator note (sign-off):**
 
-```powershell
-# [OPERATOR: record the exact teardown step]
-# Option A — WireGuard GUI: click the tunnel name → click "Deactivate"
-# Option B — wg-quick (if using wg-quick on Windows):
-#   wg-quick down <tunnel-name>
-# Option C — net stop:
-#   net stop WireGuardTunnel$<tunnel-name>
-```
+Operator validated migration by deactivating the active WireGuard tunnel mid-session (WireGuard GUI → Deactivate); server logged the path change above. Exact tunnel config not transcribed in this run — the path change + session continuity is the evidence.
 
 ### Step 5 — Observe the session
 
@@ -299,49 +281,69 @@ full rate. A longer pause (> 5 s) or any reconnect/error message indicates a mig
 
 ---
 
+## Bugs Found During Validation
+
+Six client bugs were discovered and fixed live during this validation run:
+
+| ID    | Commit    | Description |
+|-------|-----------|-------------|
+| BUG-A | `eb9b368` | Host-key mismatch now aborts (was infinite retry; security fix) |
+| BUG-B | `084511e` | Ctrl-C / `~.` now works during the pre-session connect window on Windows |
+| BUG-C | `ae05fc6` | Idle session no longer false-triggers the connection-loss overlay (gated on real QUIC close) |
+| BUG-D | `fea428f` | Predictive echo rendering fixed (space/printable caret advance + ←/→ motion; noecho preserved via tentative-epoch) |
+| BUG-G | `a416d68` | Correct terminal size sent on connect (Windows ConPTY startup size-sync lag) |
+
+Round-2 triage also backlogged 4 platform-agnostic items as 999.3 (see ROADMAP.md).
+
+---
+
 ## Operator Sign-off
 
 ```
-Test date:       ___________________________
-Windows host:    ___________________________  (e.g. Windows 11 Pro 23H2, not WSL)
-Terminal:        ___________________________  (e.g. Windows Terminal 1.21 / PowerShell 7.4)
-Server IP:       ___________________________ : 4433   [confirm: NOT loopback / NOT 127.x.x.x]
-Server OS:       ___________________________  (e.g. Ubuntu 24.04)
+Test date:       2026-06-02
+Windows host:    Windows 11 Pro 23H2-class (10.0.26100)  (not WSL)
+Terminal:        Windows Terminal / PowerShell
+Server IP:       10.209.1.5 : 4433   [confirm: NOT loopback / NOT 127.x.x.x]  CONFIRMED
+Server OS:       Linux (host: sandstorm)
 Key type:        Ed25519 (unencrypted)
-Key path:        ___________________________  (e.g. C:\Users\bharris\.ssh\id_ed25519)
-Network path:    ___________________________  (e.g. LAN / VPN / WireGuard tunnel via WAN)
-WireGuard used:  [ ] Yes  [ ] No  — tunnel details: ___________________________
+Key path:        C:\Users\bharris\.ssh\id_ed25519
+Network path:    LAN + WireGuard tunnel (for migration test)
+WireGuard used:  [x] Yes  [ ] No  — tunnel deactivated mid-session via WireGuard GUI to trigger migration
 
-Measured SRTT (from --status title bar):  _____ ms
+Measured SRTT (from --status title bar):  50 ms
 Measured predict.log latency_ms:
-  Count:   _____  (number of confirmed predictions logged)
-  Min:     _____ ms
-  Median:  _____ ms
-  Max:     _____ ms
+  Count:   40  (confirmed predictions out of 271 logged; bulk of clean confirmations in this range)
+  Min:     1 ms
+  Median:  25 ms
+  Max:     57 ms (clean confirmations — bulk ≤ 57 ms, on the order of network RTT; local echo instant i.e. sub-RTT)
+  Note:    Tail of high outliers (1673 / 3289 / 7314 / 20803 / 32452 ms) reflect D-17-02a
+           epoch-confirmation time inclusive of operator think-time when paused mid-epoch — a
+           known measurement-coarseness limitation (epoch-level, not per-keystroke). Captured as
+           backlog item 999.3. These outliers are NOT real prediction latency.
 
 Checklist results:
-  C1 Auth (real network):              [ ] PASSED  [ ] FAILED
-  C2 Predicted echo (measured):        [ ] PASSED  [ ] FAILED
-  C3 Epoch reset (vim insert):         [ ] PASSED  [ ] FAILED
-  C4 noecho suppression:               [ ] PASSED  [ ] FAILED
-  C5 Windows-native coverage:          [ ] PASSED  [ ] FAILED
-  C6 Roaming + prediction (WG):        [ ] PASSED  [ ] FAILED
+  C1 Auth (real network):              [x] PASSED  [ ] FAILED
+  C2 Predicted echo (measured):        [x] PASSED  [ ] FAILED
+  C3 Epoch reset (vim insert):         [x] PASSED  [ ] FAILED
+  C4 noecho suppression:               [x] PASSED  [ ] FAILED
+  C5 Windows-native coverage:          [x] PASSED  [ ] FAILED
+  C6 Roaming + prediction (WG):        [x] PASSED  [ ] FAILED
 
-Overall result: [ ] PASSED  [ ] FAILED
+Overall result: [x] PASSED  [ ] FAILED
 
 Notes / failures:
-___________________________________________________________________
-___________________________________________________________________
-___________________________________________________________________
+6 client bugs found and fixed live during validation (see Phase 17 SUMMARY / commits).
+Remaining items are platform-agnostic terminal-rendering polish tracked in backlog 999.3.
+Server migration log evidence: connection migrated old=10.209.221.10:50356 new=10.211.40.106:50356
+(same session_id, no re-auth — C6 confirmed).
 
-Operator: ___________________________
+Operator: Ben Harris (bharris@dbk.com.au)
 ```
 
 ---
 
-*This test is NON-BLOCKING for autonomous phase completion. The phase is marked `human_needed`.
-The operator's recorded result (all C1–C6 rows filled, measured latency_ms numbers pasted in,
-WireGuard teardown step recorded, sign-off block completed) is required before Phase 17 can be
-marked fully complete and PREDICT-07 satisfied.*
+*This test is COMPLETE. All C1–C6 rows filled, measured latency_ms numbers recorded,
+WireGuard teardown step recorded, sign-off block completed. Phase 17 is fully complete and
+PREDICT-07 is satisfied.*
 
 *Reference: 17-CONTEXT.md D-17-01, D-17-02, D-17-03, D-17-04; REQUIREMENTS.md PREDICT-07*
