@@ -382,7 +382,7 @@ impl RawModeGuard {
                 return Err(io::Error::last_os_error());
             }
 
-            return Ok(Self { orig_stdin_mode, orig_stdout_mode });
+            Ok(Self { orig_stdin_mode, orig_stdout_mode })
         }
 
         #[cfg(not(windows))]

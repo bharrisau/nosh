@@ -34,7 +34,7 @@ use nosh_client::client::{self, ClientIdentity, ReattachOutcome};
 use nosh_client::platform;
 use nosh_client::predictor::{PredictDisplayMode, PredictionOverlay};
 use nosh_client::screen::ConnectionLossOverlay;
-use nosh_proto::Message;
+use nosh_proto::{Message, TerminalControlPayload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// SIGWINCH / console-resize debounce window (~40 ms) — coalesces a window-drag
@@ -324,6 +324,14 @@ struct Args {
     /// testing). never: disable predictions entirely.
     #[arg(long, default_value = "adaptive")]
     predict: PredictDisplayMode,
+
+    /// Surface measured RTT (SRTT) in the terminal title via OSC 0/2 (QOL-04).
+    ///
+    /// When active, the title is set to `nosh: <N>ms` on every datagram received.
+    /// Forwarded OSC 0/2 title frames from the server are suppressed while --status
+    /// is active (the RTT title takes precedence — Pitfall 5).
+    #[arg(long)]
+    status: bool,
 }
 
 fn default_known_hosts() -> anyhow::Result<PathBuf> {
@@ -490,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
                 &mut resize,
                 &mut token,
                 args.predict,
+                args.status,
             )
             .await;
             reattach_result.unwrap_or(PumpOutcome::TransportDrop)
@@ -504,6 +513,7 @@ async fn main() -> anyhow::Result<()> {
                 &mut resize,
                 &mut token,
                 args.predict,
+                args.status,
             )
             .await;
             fresh_result.unwrap_or(PumpOutcome::TransportDrop)
@@ -554,6 +564,7 @@ async fn fresh_session(
     resize: &mut platform::ResizeWatcher,
     token_out: &mut Option<[u8; 16]>,
     predict_mode: PredictDisplayMode,
+    status: bool,
 ) -> anyhow::Result<PumpOutcome> {
     let (mut send, mut recv, tok) =
         client::open_session_with_token(conn, term, cols, rows, client::collect_client_env())
@@ -562,13 +573,14 @@ async fn fresh_session(
     // Fresh session starts at seq 0.
     *highest_applied = 0;
 
-    run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, 0, predict_mode).await
+    run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, 0, predict_mode, status).await
 }
 
 /// Run a reattach session. Updates `highest_applied` and `token_out` in-place.
 /// Returns `PumpOutcome::CleanExit(code)` if the session ended cleanly,
 /// `PumpOutcome::TransportDrop` if the link dropped again, or
 /// `PumpOutcome::UserQuit` if the user quit.
+#[allow(clippy::too_many_arguments)]
 async fn reattach_session(
     conn: &quinn::Connection,
     token: [u8; 16],
@@ -577,6 +589,7 @@ async fn reattach_session(
     resize: &mut platform::ResizeWatcher,
     token_out: &mut Option<[u8; 16]>,
     predict_mode: PredictDisplayMode,
+    status: bool,
 ) -> anyhow::Result<PumpOutcome> {
     let (mut send, mut recv) = conn.open_bi().await.context("open bi for reattach")?;
     client::send_reattach(&mut send, token, last_acked_seq).await?;
@@ -612,14 +625,14 @@ async fn reattach_session(
             // baseline to exactly what the server is sending.
             *highest_applied = replaying_from_seq;
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, *highest_applied, predict_mode).await
+            run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, *highest_applied, predict_mode, status).await
         }
     }
 }
 
 /// Core pump loop: render output, forward input, debounce resize, send periodic
 /// Ack. Returns the pump outcome.
-#[allow(clippy::too_many_arguments)] // 9 args are load-bearing: conn + streams + state + watcher + baseline + predict_mode
+#[allow(clippy::too_many_arguments)] // 10 args are load-bearing: conn + streams + state + watcher + baseline + predict_mode + status
 async fn run_pump(
     conn: &quinn::Connection,
     cols: u16,
@@ -630,6 +643,7 @@ async fn run_pump(
     resize: &mut platform::ResizeWatcher,
     _seq_baseline: u64,
     predict_mode: PredictDisplayMode,
+    status: bool,
 ) -> anyhow::Result<PumpOutcome> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -656,8 +670,16 @@ async fn run_pump(
     // Connection-loss overlay (Phase 16, QOL-01).
     // Mutably owned here (mirroring predictor) so the silence timer and datagram
     // arm can activate/clear it; render_with_predictor receives it by shared ref.
-    // Starts inactive — activated by the silence timer in Task 2.
-    let loss_overlay = ConnectionLossOverlay::new(cols);
+    let mut loss_overlay = ConnectionLossOverlay::new(cols);
+    // Tracks the tokio::time::Instant of the last received datagram.
+    // Used by the silence timer to set the activation threshold at last_datagram_time + 5s,
+    // and stored in loss_overlay.last_contact (as std::time::Instant) for elapsed display.
+    let mut last_datagram_time = tokio::time::Instant::now();
+    // Live elapsed-counter tick (QOL-01): when the loss overlay is active, this 1s
+    // interval drives a re-render so the "last contact Ns ago" counter increments live
+    // on screen (not frozen at activation). The arm is guarded by `if loss_overlay.active`
+    // so it is a no-op when the overlay is inactive (no spurious re-renders).
+    let mut loss_tick = tokio::time::interval(Duration::from_secs(1));
     // Latency instrumentation (D-17-02a): map from prediction_epoch → enqueue Instant.
     // Used to measure predicted-keystroke-time vs confirming-datagram-time for
     // Phase 17 Windows predictive echo validation. Logged at debug level under
@@ -674,8 +696,14 @@ async fn run_pump(
             }
         };
 
+        // Silence-detection future: sleeps until last_datagram_time + 5s, then fires.
+        // Uses the resize-deadline sleep_until-or-pending idiom: always resolves at
+        // last_datagram_time + 5s (even if already past), which re-arms cleanly each
+        // iteration after a datagram arrives (last_datagram_time is reset in datagram arm).
+        let silence_sleep = tokio::time::sleep_until(last_datagram_time + Duration::from_secs(5));
+
         tokio::select! {
-            // Server → client frames.
+            // Server → client reliable stream frames (QOL-02/03: TerminalControl re-emit).
             msg = nosh_proto::read_message(recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
@@ -696,6 +724,34 @@ async fn run_pump(
                         // SessionOpened was already consumed by open_session_with_token;
                         // if it arrives here it's unexpected — ignore.
                     }
+                    // Phase 16 / D-16-01: TerminalControl out-of-band re-emit.
+                    // OSC 52 / OSC 0/2 are control sequences that carry no cursor motion
+                    // and do not write cells — safe to interleave; tokio::select! arms
+                    // serialize so no byte-level interleaving with compositor renders.
+                    Ok(Message::TerminalControl(payload)) => {
+                        match payload {
+                            TerminalControlPayload::Clipboard { selection, data } => {
+                                // Re-emit OSC 52 clipboard WRITE to the local terminal.
+                                // Write-only by construction (T-16-05): the read/query form
+                                // was dropped server-side in Plan 16-01, D-16-01a.
+                                let sel = String::from_utf8_lossy(&selection);
+                                let b64 = String::from_utf8_lossy(&data);
+                                let osc52 = format!("\x1b]52;{sel};{b64}\x07");
+                                let _ = stdout.write_all(osc52.as_bytes()).await;
+                                let _ = stdout.flush().await;
+                            }
+                            TerminalControlPayload::Title { title } => {
+                                // Re-emit OSC 0/2 title only when --status is not active.
+                                // When --status is active, the RTT title in the datagram arm
+                                // takes precedence (Pitfall 5 — suppress forwarded title).
+                                if !status {
+                                    let osc02 = format!("\x1b]0;{title}\x07");
+                                    let _ = stdout.write_all(osc02.as_bytes()).await;
+                                    let _ = stdout.flush().await;
+                                }
+                            }
+                        }
+                    }
                     Ok(_) => {} // ignore other control frames
                     Err(e) => {
                         tracing::warn!("reliable stream error, triggering reconnect: {e}");
@@ -705,6 +761,7 @@ async fn run_pump(
             }
             // Datagram arm: receive StateDiff, apply to ClientScreen, cull predictions,
             // render display, emit datagram epoch-ack (D-14-02, D-14-03a).
+            // Also: update last_datagram_time; clear loss_overlay on resume; emit RTT title.
             // This is the SOLE display path (CLAUDE.md single screen-composition invariant).
             datagram = conn.read_datagram() => {
                 match datagram {
@@ -712,6 +769,13 @@ async fn run_pump(
                         if let Ok(diff) = nosh_proto::datagram::decode_datagram(&bytes) {
                             // T-14-06: monotonic epoch gate — stale/replayed diffs discarded.
                             if diff.epoch > screen.last_applied_epoch() {
+                                // QOL-01: reset silence timer on every fresh datagram.
+                                last_datagram_time = tokio::time::Instant::now();
+                                // Clear the loss overlay if it was active (connection resumed).
+                                if loss_overlay.active {
+                                    loss_overlay.active = false;
+                                }
+
                                 // WR-01: capture dims before apply so we can detect a resize.
                                 let (cols_before, rows_before) = screen.size();
                                 screen.apply(&diff);
@@ -765,6 +829,14 @@ async fn run_pump(
                                         screen.reset_physical();
                                     }
                                 }
+                                // QOL-04: --status RTT title (out-of-band, no cursor motion).
+                                // Best-effort: ignore error (control sequence, not display state;
+                                // no reset_physical — the compositor render above already completed).
+                                if status {
+                                    let title = format!("\x1b]0;nosh: {rtt_ms}ms\x07");
+                                    let _ = stdout.write_all(title.as_bytes()).await;
+                                    let _ = stdout.flush().await;
+                                }
                                 // D-14-03a: emit epoch-ack as DATAGRAM on the datagram channel
                                 // (TAG_CLIENT_EPOCH 0x02), DISTINCT from reliable-stream Ack{seq}
                                 // (Pitfall 3). Best-effort; ignore error (RESEARCH A6 / T-14-DoS).
@@ -780,6 +852,44 @@ async fn run_pump(
                         // Transport drop on datagram channel — mirror reliable-stream behavior.
                         tracing::warn!("datagram channel error, triggering reconnect: {e}");
                         return Ok(PumpOutcome::TransportDrop);
+                    }
+                }
+            }
+            // Silence detection (QOL-01): fires when no datagram arrives for >5 s.
+            // Activates the loss overlay and forces an immediate render so the banner
+            // appears exactly at the 5 s threshold (not frozen until next datagram).
+            _ = silence_sleep => {
+                loss_overlay.active = true;
+                loss_overlay.last_contact = last_datagram_time.into_std();
+                let mut buf: Vec<u8> = Vec::new();
+                screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
+                    tracing::warn!("render_with_predictor error (silence): {e}");
+                });
+                if !buf.is_empty() {
+                    if let Err(e) = stdout.write_all(&buf).await {
+                        tracing::warn!("stdout write_all failed (silence): {e} — forcing full repaint");
+                        screen.reset_physical();
+                    } else if let Err(e) = stdout.flush().await {
+                        tracing::warn!("stdout flush failed (silence): {e} — forcing full repaint");
+                        screen.reset_physical();
+                    }
+                }
+            }
+            // Live elapsed-counter tick (QOL-01): drives a 1s re-render while active
+            // so the "last contact Ns ago" seconds counter increments live on screen.
+            // Guard: only fires when loss_overlay.active to avoid spurious re-renders.
+            _ = loss_tick.tick(), if loss_overlay.active => {
+                let mut buf: Vec<u8> = Vec::new();
+                screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
+                    tracing::warn!("render_with_predictor error (loss_tick): {e}");
+                });
+                if !buf.is_empty() {
+                    if let Err(e) = stdout.write_all(&buf).await {
+                        tracing::warn!("stdout write_all failed (loss_tick): {e} — forcing full repaint");
+                        screen.reset_physical();
+                    } else if let Err(e) = stdout.flush().await {
+                        tracing::warn!("stdout flush failed (loss_tick): {e} — forcing full repaint");
+                        screen.reset_physical();
                     }
                 }
             }
