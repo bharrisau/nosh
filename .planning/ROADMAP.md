@@ -230,3 +230,17 @@ Plans:
 | 16. QoL Feature Pack + Windows CI Gate | 1/3 | In progress | 2026-06-02 |
 | 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
 | 18. Security Design Pass | 0/? | Not started | - |
+
+## Backlog
+
+Parking lot for ideas not scheduled into a milestone yet (999.x). Promote via `/gsd:review-backlog`.
+
+### Phase 999.1: Server attack-surface hardening (expose-to-internet readiness)
+**Goal**: Be confident the server's UDP/443 QUIC ingress is safe to expose raw to the public internet — via fuzzing and a focused security scan of everything reachable before/at authentication.
+**Scope**: `cargo-fuzz`/libFuzzer harnesses on the `nosh-proto` decoders (datagram `StateDiff`/`DiffRun`, reliable-stream `Message` postcard decode, OSC accumulation), plus a QUIC-packet fuzzer against the server socket (malformed/oversized/truncated packets). Audit half-open / unauthenticated connection memory caps, amplification potential, and pre-auth resource exhaustion (DoS hardening — CLAUDE.md invariant). Output: no panics/OOM/unbounded growth on hostile input; documented residual risk.
+**Origin**: requested 2026-06-02 during M4.
+
+### Phase 999.2: Client trust-boundary hardening (malicious-server resistance)
+**Goal**: Prove a hostile/compromised server cannot extract sensitive local material from the client, cannot escape the terminal, and cannot succeed at MitM.
+**Scope**: Adversarial malicious-server test harness driving the real client. Verify: (a) no exfiltration of local secrets — OSC 52 clipboard *read* never honored (already a non-goal; prove it), no env-var/file/`SSH_AUTH_SOCK`/agent leakage; (b) no terminal escape via injected control sequences in datagram/stream payloads; (c) MitM resistance — TOFU/known_hosts pinning + the Phase 18 fingerprint-confirm hold, and a *changed* host key hard-fails. Confirms the Phase 18 TOFU work actually closes the MitM gap end-to-end.
+**Origin**: requested 2026-06-02 during M4.
