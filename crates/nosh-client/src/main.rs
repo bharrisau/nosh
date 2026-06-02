@@ -905,20 +905,48 @@ async fn run_pump(
             // With the guard, once the overlay is active this arm becomes pending() and
             // only loss_tick.tick() drives the 1s re-renders (CR-01).
             _ = silence_sleep, if !loss_overlay.active => {
-                loss_overlay.active = true;
-                loss_overlay.last_contact = last_datagram_time.into_std();
-                let mut buf: Vec<u8> = Vec::new();
-                screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
-                    tracing::warn!("render_with_predictor error (silence): {e}");
-                });
-                if !buf.is_empty() {
-                    if let Err(e) = stdout.write_all(&buf).await {
-                        tracing::warn!("stdout write_all failed (silence): {e} — forcing full repaint");
-                        screen.reset_physical();
-                    } else if let Err(e) = stdout.flush().await {
-                        tracing::warn!("stdout flush failed (silence): {e} — forcing full repaint");
-                        screen.reset_physical();
+                // BUG-C: datagram silence is NOT connection loss. An idle but healthy
+                // interactive shell produces no state-sync datagrams, yet the QUIC
+                // connection stays alive via keep-alive PINGs (transport_config:
+                // KEEP_ALIVE=15s, MAX_IDLE_TIMEOUT=300s). Previously this arm activated
+                // the "reconnecting" overlay after a flat 5s of datagram silence, so the
+                // overlay falsely appeared whenever the user stopped typing.
+                //
+                // Gate the overlay on ACTUAL connection health instead of mere silence:
+                //   - conn.close_reason().is_some()  → the QUIC connection has closed /
+                //     the path failed / idle-timed-out (genuine loss).
+                // If the connection is still live (close_reason() == None), this is just
+                // an idle shell — do NOT show the overlay. Re-arm the silence timer for
+                // another interval so a LATER genuine loss is still detected promptly.
+                //
+                // Genuine loss is ALSO (and primarily) surfaced by the datagram/reliable
+                // -stream read arms returning Err → PumpOutcome::TransportDrop, which tears
+                // down the pump and shows "reconnecting…" in the supervisor. This overlay
+                // is the in-session banner for a path that has gone quiet AND is confirmed
+                // closed. C6 migration (which keeps close_reason() == None throughout) does
+                // NOT trip this — preserving the working migration path.
+                if conn.close_reason().is_some() {
+                    loss_overlay.active = true;
+                    loss_overlay.last_contact = last_datagram_time.into_std();
+                    let mut buf: Vec<u8> = Vec::new();
+                    screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
+                        tracing::warn!("render_with_predictor error (silence): {e}");
+                    });
+                    if !buf.is_empty() {
+                        if let Err(e) = stdout.write_all(&buf).await {
+                            tracing::warn!("stdout write_all failed (silence): {e} — forcing full repaint");
+                            screen.reset_physical();
+                        } else if let Err(e) = stdout.flush().await {
+                            tracing::warn!("stdout flush failed (silence): {e} — forcing full repaint");
+                            screen.reset_physical();
+                        }
                     }
+                } else {
+                    // Healthy idle connection: bump the silence baseline so the timer
+                    // re-arms for another interval instead of spinning on a past deadline.
+                    // No render — the overlay did not change, so emitting a cursor move
+                    // every 5s while the user is idle would be a spurious jiggle.
+                    last_datagram_time = tokio::time::Instant::now();
                 }
             }
             // Live elapsed-counter tick (QOL-01): drives a 1s re-render while active
