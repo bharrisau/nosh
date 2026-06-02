@@ -18,6 +18,8 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked -- -D warnings
 
   build-windows:
     name: cargo build nosh-client (Windows MSVC, HARDEN-02)
