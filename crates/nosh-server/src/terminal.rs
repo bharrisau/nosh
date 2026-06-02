@@ -46,6 +46,22 @@ use nosh_proto::datagram::{CellStyle, CursorPos};
 /// Oldest lines are dropped first (drop-oldest semantics, same as the byte buffer).
 const SCROLLBACK_LINE_CAP: usize = 10_000;
 
+/// Maximum bytes retained for an OSC 52 clipboard-write payload (D-16-01c / CR-03).
+///
+/// Applied in `osc_dispatch` BEFORE storing into `osc52_pending`. Any data field
+/// exceeding this cap is silently truncated. This re-mitigates the CR-03 DoS risk
+/// (previously handled by `default-features = false` which limited all OSC to 1024
+/// bytes via ArrayVec). Now that vte `std` is re-enabled, the transient vte buffer
+/// can grow large; this cap bounds the STORED value.
+pub const OSC_52_MAX_BYTES: usize = 65_536;
+
+/// Maximum bytes for an OSC 0/2 window title (D-16-01c / CR-03).
+///
+/// Applied in `osc_dispatch` BEFORE storing into `title`. Titles exceeding this
+/// cap are silently discarded. Bounding titles protects the server from DoS via
+/// an application emitting an unbounded OSC 2 title sequence.
+pub const MAX_TITLE_BYTES: usize = 1_024;
+
 // ── Cell ──────────────────────────────────────────────────────────────────────
 
 /// A single terminal cell.
@@ -371,6 +387,32 @@ impl TerminalState {
             .map(|(sel, data)| (sel.as_slice(), data.as_slice()))
     }
 
+    /// Drain the pending OSC 52 clipboard-write payload, returning it (if any) and
+    /// clearing the field (Option::take semantics — prevents double-forwarding).
+    ///
+    /// Used by Phase 16 forwarding: after `push_output_and_parse`, the session loop
+    /// calls this to collect any pending OSC 52 write for forwarding to the client
+    /// over the reliable stream as `Message::TerminalControl(Clipboard{..})`.
+    ///
+    /// Returns `None` if no OSC 52 write was pending, or if the pending value was
+    /// already drained by a prior call.
+    pub fn take_osc52(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.osc52_pending.take()
+    }
+
+    /// Drain the pending window title, returning it (if any) and clearing the field
+    /// (Option::take semantics — prevents double-forwarding).
+    ///
+    /// Used by Phase 16 forwarding: after `push_output_and_parse`, the session loop
+    /// calls this to collect any pending OSC 0/2 title for forwarding to the client
+    /// over the reliable stream as `Message::TerminalControl(Title{..})`.
+    ///
+    /// Returns `None` if no title was pending, or if the pending value was already
+    /// drained by a prior call.
+    pub fn take_title(&mut self) -> Option<String> {
+        self.title.take()
+    }
+
     /// Current terminal dimensions as `(cols, rows)`.
     pub fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
@@ -628,8 +670,11 @@ impl vte::Perform for TerminalState {
     /// Dispatch an OSC (Operating System Command) sequence.
     ///
     /// Handled:
-    /// - `0` / `2` — set terminal title (icon + window / window only)
-    /// - `52` — clipboard write (DETECTION ONLY, D-12-04; Phase 16 owns forwarding)
+    /// - `0` / `2` — set terminal title (icon + window / window only), capped at
+    ///   [`MAX_TITLE_BYTES`] (1024 bytes). Titles exceeding the cap are silently discarded.
+    /// - `52` — clipboard write (Phase 16 forwarding). The read/query form (`?`) is
+    ///   **silently dropped** here (D-16-01a / T-16-01 security gate). Write payloads are
+    ///   truncated to [`OSC_52_MAX_BYTES`] (65536) before storing (D-16-01c / CR-03).
     ///
     /// All other OSC codes are scope-fenced (ignored). `params[0]` is compared as a
     /// byte slice (e.g. `b"52"` is two bytes `[0x35, 0x32]`) — NOT as an integer
@@ -640,20 +685,34 @@ impl vte::Perform for TerminalState {
         }
         match params[0] {
             b"0" | b"2" => {
-                // Set terminal title (OSC 0: icon + window; OSC 2: window only)
+                // Set terminal title (OSC 0: icon + window; OSC 2: window only).
+                // D-16-01c / CR-03: only store titles within MAX_TITLE_BYTES to bound memory.
                 if let Some(title_bytes) = params.get(1) {
-                    if let Ok(title) = std::str::from_utf8(title_bytes) {
-                        self.title = Some(title.to_owned());
+                    if title_bytes.len() <= MAX_TITLE_BYTES {
+                        if let Ok(title) = std::str::from_utf8(title_bytes) {
+                            self.title = Some(title.to_owned());
+                        }
                     }
+                    // Titles exceeding MAX_TITLE_BYTES are silently discarded (anti-DoS).
                 }
             }
             b"52" => {
-                // OSC 52 clipboard-write: detect and store pending; do NOT forward.
-                // Actual clipboard passthrough is Phase 16 (D-12-04).
+                // OSC 52 clipboard passthrough (Phase 16, D-16-01).
                 // Scope fence: only parse into osc52_pending; no clipboard read/write/exec.
-                let selection = params.get(1).copied().unwrap_or(b"c");
                 let data = params.get(2).copied().unwrap_or(b"");
-                self.osc52_pending = Some((selection.to_vec(), data.to_vec()));
+
+                // D-16-01a / T-16-01 SECURITY GATE: silently drop the OSC 52 read/query form.
+                // The read form `OSC 52;c;?` must NEVER be stored or forwarded to the client —
+                // doing so would leak clipboard contents from the server. Drop unconditionally.
+                if data == b"?" {
+                    return;
+                }
+
+                let selection = params.get(1).copied().unwrap_or(b"c");
+                // D-16-01c / CR-03: truncate data to OSC_52_MAX_BYTES before storing.
+                // This re-mitigates the CR-03 DoS risk now that vte std is re-enabled.
+                let capped_data = &data[..data.len().min(OSC_52_MAX_BYTES)];
+                self.osc52_pending = Some((selection.to_vec(), capped_data.to_vec()));
             }
             _ => {
                 // Scope fence: all other OSC codes (e.g. OSC 7 working dir, OSC 8 hyperlinks,
@@ -1420,27 +1479,27 @@ mod tests {
         );
     }
 
-    // ── CR-03 regression: bounded OSC buffer via vte default-features=false ──
+    // ── CR-03 regression: bounded OSC via explicit caps in osc_dispatch (Phase 16) ──
 
     /// CR-03 regression: feeding a large OSC sequence must not panic or OOM.
     ///
-    /// With vte's "std" feature enabled (the previous configuration), `action_osc_put`
-    /// has no `is_full()` guard and accumulates OSC bytes in an unbounded `Vec<u8>`.
-    /// A single huge OSC sequence exhausts memory before `osc_dispatch` is called.
+    /// Phase 16 re-enables vte "std" (for large OSC 52 clipboard support) and
+    /// re-mitigates CR-03 via explicit caps applied in `osc_dispatch` BEFORE storing:
+    /// - MAX_TITLE_BYTES (1024): titles exceeding the cap are silently discarded.
+    /// - OSC_52_MAX_BYTES (65536): OSC 52 data is truncated to this cap before storing.
     ///
-    /// With `default-features = false`, vte uses `ArrayVec<u8, 1024>` and silently
-    /// drops bytes beyond 1024. This test verifies:
-    /// 1. Feeding a multi-MB OSC sequence does not panic or OOM.
-    /// 2. The title is either not set (truncated/dropped) or correctly bounded.
+    /// This test verifies:
+    /// 1. Feeding a multi-MB OSC 2 title sequence does not panic or OOM.
+    /// 2. The title is either not set (discarded as too large) or bounded by MAX_TITLE_BYTES.
     /// 3. Normal-sized OSC sequences still work after a large one.
     #[test]
     fn adversarial_large_osc_title_is_bounded_no_panic() {
         let mut state = ts(80, 24);
 
-        // Build a large OSC 2 title sequence: "\x1b]2;" + 10 MB of 'A' + "\x07"
-        // With std: vte would accumulate 10 MB in osc_raw → OOM.
-        // With no_std (default-features=false): vte caps at 1024 bytes, truncates silently.
-        let large_payload = vec![b'A'; 64 * 1024]; // 64 KiB is enough to test truncation
+        // Build a large OSC 2 title sequence: "\x1b]2;" + 64 KiB of 'A' + "\x07"
+        // With vte std + osc_dispatch cap: title exceeds MAX_TITLE_BYTES (1024) so it
+        // is silently discarded. No OOM risk since osc_dispatch gates before storing.
+        let large_payload = vec![b'A'; 64 * 1024]; // 64 KiB is enough to test cap
         let mut seq = Vec::new();
         seq.extend_from_slice(b"\x1b]2;");
         seq.extend_from_slice(&large_payload);
@@ -1449,39 +1508,40 @@ mod tests {
         // Must not panic or OOM.
         state.advance(&seq);
 
-        // The title must either be None (if truncation caused malformed UTF-8 or
-        // the sequence was rejected) or a string bounded by vte's 1024-byte OSC cap.
-        // It must NOT hold the full 64 KiB payload.
+        // The title must either be None (discarded as too large per MAX_TITLE_BYTES cap)
+        // or a string bounded by MAX_TITLE_BYTES. It must NOT hold the full 64 KiB payload.
         if let Some(title) = state.title() {
             assert!(
-                title.len() <= 1024,
-                "title must be bounded by vte's 1024-byte OSC cap, got {} bytes",
+                title.len() <= MAX_TITLE_BYTES,
+                "title must be bounded by MAX_TITLE_BYTES ({}), got {} bytes",
+                MAX_TITLE_BYTES,
                 title.len()
             );
         }
-        // No assertion on whether title is Some or None — vte may truncate the
-        // OSC params or reject the sequence; either is correct.
+        // No assertion on whether title is Some or None — title exceeds MAX_TITLE_BYTES
+        // so it should be discarded (None), but we accept Some with bounded len.
 
         // Normal-sized OSC sequences must still work after the large one.
         state.advance(b"\x1b]2;Normal Title\x07");
         assert_eq!(
             state.title(),
             Some("Normal Title"),
-            "normal OSC title must work after a large truncated one"
+            "normal OSC title must work after a large discarded one"
         );
     }
 
     /// CR-03 regression: feeding a large OSC 52 sequence must not OOM.
     ///
-    /// Without the fix, a large base64 clipboard payload would accumulate in
-    /// vte's unbounded osc_raw buffer. With the fix (no_std), vte caps at 1024
-    /// bytes, and osc52_pending either holds a truncated/empty payload or is None.
+    /// Phase 16 re-mitigates via OSC_52_MAX_BYTES (65536) cap in osc_dispatch.
+    /// With vte std re-enabled, osc_dispatch now receives the full (large) data,
+    /// but truncates it to OSC_52_MAX_BYTES before storing in osc52_pending.
     #[test]
     fn adversarial_large_osc52_is_bounded_no_panic() {
         let mut state = ts(80, 24);
 
-        // Build a large OSC 52 sequence: "\x1b]52;c;" + 64 KiB of base64 data + "\x07"
-        let large_b64 = vec![b'A'; 64 * 1024]; // simulated base64 payload
+        // Build a large OSC 52 sequence: "\x1b]52;c;" + 128 KiB of base64 data + "\x07"
+        // (128 KiB > OSC_52_MAX_BYTES = 64 KiB, so truncation occurs)
+        let large_b64 = vec![b'A'; 128 * 1024]; // simulated base64 payload, larger than cap
         let mut seq = Vec::new();
         seq.extend_from_slice(b"\x1b]52;c;");
         seq.extend_from_slice(&large_b64);
@@ -1490,21 +1550,94 @@ mod tests {
         // Must not panic or OOM.
         state.advance(&seq);
 
-        // osc52_pending must either be None or hold a bounded (≤ vte 1024-byte cap) payload.
+        // osc52_pending must either be None or hold a payload bounded by OSC_52_MAX_BYTES.
         if let Some((sel, data)) = state.osc52_pending() {
             assert!(
-                data.len() <= 1024,
-                "osc52_pending data must be bounded by vte's OSC cap, got {} bytes",
+                data.len() <= OSC_52_MAX_BYTES,
+                "osc52_pending data must be bounded by OSC_52_MAX_BYTES ({}), got {} bytes",
+                OSC_52_MAX_BYTES,
                 data.len()
             );
             let _ = sel; // selection bytes are small
         }
 
-        // Normal OSC 52 must still work.
+        // Normal OSC 52 must still work after a large one.
         state.advance(b"\x1b]52;c;SGVsbG8=\x07"); // "Hello" in base64
         let pending = state.osc52_pending();
         assert!(pending.is_some(), "normal OSC 52 must still be detected after large one");
         let (_, data) = pending.unwrap();
         assert_eq!(data, b"SGVsbG8=");
+    }
+
+    // ── Phase 16: OSC 52 security gate + drain method tests ──────────────────
+
+    /// D-16-01a / T-16-01: OSC 52 read/query form must be SILENTLY DROPPED.
+    ///
+    /// The read form `OSC 52;c;?` is a terminal clipboard query: the terminal
+    /// responds with its clipboard contents. The server must NEVER store or forward
+    /// this form — doing so would leak server clipboard contents to the client.
+    ///
+    /// Security gate: `if data == b"?" { return; }` in `osc_dispatch` BEFORE storing.
+    #[test]
+    fn osc52_read_form_is_silently_dropped() {
+        let mut state = ts(80, 24);
+        // Feed the OSC 52 read/query form (data field is "?").
+        state.advance(b"\x1b]52;c;?\x07");
+        // The read form must NEVER be stored — osc52_pending must be None.
+        assert!(
+            state.osc52_pending().is_none(),
+            "OSC 52 read/query form ('?') must be silently dropped — never stored (D-16-01a)"
+        );
+    }
+
+    /// OSC 52 write form is stored correctly.
+    #[test]
+    fn osc52_write_form_is_stored() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b]52;c;SGVsbG8=\x07");
+        let pending = state.osc52_pending();
+        assert!(pending.is_some(), "OSC 52 write form must be stored in osc52_pending");
+        let (sel, data) = pending.unwrap();
+        assert_eq!(sel, b"c", "selection must be 'c'");
+        assert_eq!(data, b"SGVsbG8=", "data must be the base64 payload");
+    }
+
+    /// take_osc52() drains osc52_pending and clears it (Option::take semantics).
+    #[test]
+    fn take_osc52_drains_and_clears() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b]52;c;SGVsbG8=\x07");
+        // First drain returns the payload.
+        let taken = state.take_osc52();
+        assert!(taken.is_some(), "take_osc52 must return Some after a write-form advance");
+        let (sel, data) = taken.unwrap();
+        assert_eq!(sel, b"c");
+        assert_eq!(data, b"SGVsbG8=");
+        // Second drain must return None (field was cleared).
+        assert!(
+            state.take_osc52().is_none(),
+            "take_osc52 must return None on second call (drain-once semantics)"
+        );
+        // osc52_pending() must also be None now.
+        assert!(state.osc52_pending().is_none(), "osc52_pending must be None after take_osc52");
+    }
+
+    /// take_title() drains the title field and clears it (Option::take semantics).
+    #[test]
+    fn take_title_drains_and_clears() {
+        let mut state = ts(80, 24);
+        state.advance(b"\x1b]2;My Title\x07");
+        // title() still shows the value before take.
+        assert_eq!(state.title(), Some("My Title"), "title must be set before take");
+        // take_title returns and clears.
+        let taken = state.take_title();
+        assert_eq!(taken.as_deref(), Some("My Title"), "take_title must return the title");
+        // After take, title() must be None.
+        assert!(state.title().is_none(), "title must be None after take_title");
+        // Second take must be None.
+        assert!(
+            state.take_title().is_none(),
+            "take_title must return None on second call (drain-once semantics)"
+        );
     }
 }

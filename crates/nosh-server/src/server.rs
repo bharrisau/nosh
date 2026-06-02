@@ -746,8 +746,11 @@ async fn run_session(
                     Ok(Message::SessionOpened { .. })
                     | Ok(Message::Reattach { .. })
                     | Ok(Message::ReattachOk { .. })
-                    | Ok(Message::ReattachErr) => {
-                        // Unexpected reattach control frames in a live session: treat as protocol error.
+                    | Ok(Message::ReattachErr)
+                    | Ok(Message::TerminalControl(_)) => {
+                        // Unexpected frames in a live session (server→client direction
+                        // only for TerminalControl; reattach frames are out of place here):
+                        // treat as protocol error.
                         break SessionEnd::ClientClosed;
                     }
                     Err(_) => {
