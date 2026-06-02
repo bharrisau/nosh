@@ -151,8 +151,6 @@ pub struct PendingPrediction {
     /// Predictions are tentative (hidden) when `tentative_until_epoch > confirmed_epoch`.
     /// Mapped from Mosh's `tentative_until_epoch`.
     pub tentative_until_epoch: u64,
-    /// True if this represents a cursor-only move (not a cell character prediction).
-    pub is_cursor_move: bool,
 }
 
 // ── PredictionOverlay ─────────────────────────────────────────────────────────
@@ -183,9 +181,14 @@ pub struct PredictionOverlay {
     predicted_cursor: CursorPos,
     /// Terminal column count.
     term_cols: u16,
-    /// Terminal row count (reserved for future row-bounds checks in on_input).
-    #[allow(dead_code)]
+    /// Terminal row count.
     term_rows: u16,
+    /// True when predictions have been enqueued but `cull()` has not yet run for
+    /// this epoch. Used by PREDICT-04 one-frame noecho protection: `cell_at` returns
+    /// `None` for the current epoch's predictions until at least one `cull()` call has
+    /// run, preventing the brief window where a password char could be rendered before
+    /// the noecho mismatch is detected (CR-03 fix).
+    awaiting_first_cull: bool,
 }
 
 impl PredictionOverlay {
@@ -202,6 +205,7 @@ impl PredictionOverlay {
             predicted_cursor: CursorPos { row: 0, col: 0 },
             term_cols: cols,
             term_rows: rows,
+            awaiting_first_cull: false,
         }
     }
 
@@ -222,6 +226,32 @@ impl PredictionOverlay {
         self.pending.len()
     }
 
+    /// Sync `predicted_cursor` from the confirmed cursor position (CR-01 fix).
+    ///
+    /// Must be called in the datagram arm after `cull()` so that new predictions
+    /// land on the correct row (the confirmed cursor row), not the hard-zeroed row 0.
+    /// Only syncs when `pending` is empty — a safe sync point where the predictor
+    /// has no speculative position to preserve.
+    ///
+    /// Also clears `awaiting_first_cull` — the one-frame noecho protection flag —
+    /// because the datagram arm has now run through cull() at least once.
+    pub fn sync_cursor_from_confirmed(&mut self, confirmed: CursorPos) {
+        if self.pending.is_empty() {
+            self.predicted_cursor = confirmed;
+        }
+        // A cull() has now run for this epoch — safe to render non-tentative predictions.
+        self.awaiting_first_cull = false;
+    }
+
+    /// Update the terminal dimensions used for right-edge and row-bounds checks (WR-01 fix).
+    ///
+    /// Must be called (together with `reset()`) whenever the terminal is resized so that
+    /// the wide-char right-edge guard (`col + col_width > term_cols`) uses the current size.
+    pub fn set_size(&mut self, cols: u16, rows: u16) {
+        self.term_cols = cols;
+        self.term_rows = rows;
+    }
+
     /// Return the predicted cursor position, if predictions are currently displayed
     /// and at least one non-tentative active prediction exists.
     ///
@@ -229,6 +259,10 @@ impl PredictionOverlay {
     /// are tentative. Consumed by the integration plan's render path (Pitfall 3).
     pub fn predicted_cursor(&self) -> Option<CursorPos> {
         if !self.should_display() {
+            return None;
+        }
+        // CR-03 / PREDICT-04: suppress cursor override until cull() has run.
+        if self.awaiting_first_cull {
             return None;
         }
         let has_visible = self
@@ -264,6 +298,13 @@ impl PredictionOverlay {
                     self.become_tentative();
                     return;
                 }
+                // CR-03 / PREDICT-04: if this is the first prediction in a fresh window
+                // (pending was empty before this keystroke), set the awaiting_first_cull
+                // flag. This prevents the prediction from being rendered until cull() has
+                // run at least once, closing the one-frame noecho exposure window.
+                if self.pending.is_empty() {
+                    self.awaiting_first_cull = true;
+                }
                 let epoch_required = screen.last_applied_epoch() + 1;
                 let tentative_until_epoch = self.prediction_epoch;
                 self.pending.push_back(PendingPrediction {
@@ -273,14 +314,24 @@ impl PredictionOverlay {
                     col_width,
                     epoch_required,
                     tentative_until_epoch,
-                    is_cursor_move: false,
                 });
                 self.predicted_cursor.col = col + col_width;
             }
             InputAction::PredictBackspace => {
-                // Cursor-only backspace: move predicted cursor left 1 (Open Question 2).
+                // CR-02 fix: remove the prediction at the vacated column so it no
+                // longer shows in the overlay. Without this, the deleted char remains
+                // visible until the next cull() — worse than no prediction (D-15-01).
                 if self.predicted_cursor.col > 0 {
-                    self.predicted_cursor.col -= 1;
+                    let vacated_col = self.predicted_cursor.col - 1;
+                    let row = self.predicted_cursor.row;
+                    self.pending.retain(|p| !(p.row == row && p.col == vacated_col));
+                    self.predicted_cursor.col = vacated_col;
+                    // If backspace emptied pending, also clear awaiting_first_cull —
+                    // there is nothing to suppress and the cursor position is now
+                    // safe to display again.
+                    if self.pending.is_empty() {
+                        self.awaiting_first_cull = false;
+                    }
                 }
             }
             InputAction::PredictCursorLeft => {
@@ -332,9 +383,19 @@ impl PredictionOverlay {
     pub fn cull(&mut self, screen: &ClientScreen, new_epoch: u64, rtt_ms: u64) {
         self.update_rtt_thresholds(rtt_ms);
 
+        // CR-03 / PREDICT-04: cull() has now run for this epoch. Clear the
+        // awaiting_first_cull flag so subsequent renders may show predictions.
+        // Note: if a non-tentative mismatch triggers reset() below, reset() will
+        // re-set awaiting_first_cull = true, correctly requiring another cull() before
+        // the next batch of predictions becomes visible.
+        self.awaiting_first_cull = false;
+
         // Collect indices of predictions to remove (confirmed or no-credit).
         // On a non-tentative mismatch: full reset and early return (Pitfall 1).
+        // WR-02 fix: epochs_to_kill collected inline (single pass) so the second loop
+        // (with O(n²) to_remove.contains(&i)) is eliminated.
         let mut to_remove: Vec<usize> = Vec::new();
+        let mut epochs_to_kill: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         for (i, pred) in self.pending.iter().enumerate() {
             // Pitfall 4: >= check, NOT ==. Tolerates dropped datagrams.
@@ -356,7 +417,8 @@ impl PredictionOverlay {
                     Validity::IncorrectOrExpired => {
                         if self.is_tentative(pred) {
                             // Tentative mismatch: prune only this epoch's predictions.
-                            // Mark for removal; kill_epoch handled after loop.
+                            // Collect epoch inline (WR-02 fix — no second pass needed).
+                            epochs_to_kill.insert(pred.tentative_until_epoch);
                             to_remove.push(i);
                         } else {
                             // Non-tentative mismatch: full reset (Pitfall 1).
@@ -367,18 +429,6 @@ impl PredictionOverlay {
                     Validity::Pending | Validity::Inactive => {
                         // Still pending — leave in place.
                     }
-                }
-            }
-        }
-
-        // Collect epochs to kill for tentative mismatches before modifying pending.
-        let mut epochs_to_kill: Vec<u64> = Vec::new();
-        for (i, pred) in self.pending.iter().enumerate() {
-            if pred.epoch_required <= new_epoch && to_remove.contains(&i) && self.is_tentative(pred) {
-                let confirmed_ch = screen.confirmed_cell(pred.row, pred.col).ch;
-                let validity = Self::check_validity(confirmed_ch, pred.predicted_ch);
-                if validity == Validity::IncorrectOrExpired {
-                    epochs_to_kill.push(pred.tentative_until_epoch);
                 }
             }
         }
@@ -437,6 +487,10 @@ impl PredictionOverlay {
     pub fn reset(&mut self) {
         self.pending.clear();
         self.become_tentative();
+        // After a reset, the next prediction will be in a fresh epoch. Set
+        // awaiting_first_cull so the first keystroke after a reset is also
+        // protected by the one-frame noecho guard (CR-03 / PREDICT-04).
+        self.awaiting_first_cull = true;
     }
 
     /// Remove all predictions with the given `tentative_until_epoch`.
@@ -507,12 +561,24 @@ impl Overlay for PredictionOverlay {
     ///
     /// Returns `None` when:
     /// - Display is disabled (`should_display()` is false), or
-    /// - No non-tentative prediction exists at `(row, col)`.
+    /// - No non-tentative prediction exists at `(row, col)`, or
+    /// - `awaiting_first_cull` is true (PREDICT-03/04 one-frame noecho protection).
+    ///
+    /// The `awaiting_first_cull` guard closes the PREDICT-04 one-frame exposure
+    /// window: when a fresh prediction epoch begins, no prediction is rendered until
+    /// `cull()` has confirmed at least one datagram for this epoch. This prevents a
+    /// password character from being written to stdout before the noecho mismatch
+    /// is structurally detected.
     ///
     /// Returns `Some(Cell)` with `UNDERLINE` style when `flagging` is true (RTT
     /// above FLAG_TRIGGER_HIGH_MS), plain style otherwise.
     fn cell_at(&self, row: u16, col: u16) -> Option<Cell> {
         if !self.should_display() {
+            return None;
+        }
+        // CR-03 / PREDICT-04: suppress ALL predictions until cull() has run for
+        // this epoch. This is the structural one-frame noecho protection.
+        if self.awaiting_first_cull {
             return None;
         }
         for pred in &self.pending {
@@ -1317,7 +1383,13 @@ mod tests {
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
         overlay.on_input(b"a", &screen);
 
-        // Manually set flagging.
+        // CR-03 fix: awaiting_first_cull is true after on_input on a fresh epoch.
+        // Simulate the datagram arm: cull() with epoch 0 (below epoch_required=1)
+        // clears awaiting_first_cull without removing the prediction from pending.
+        // The prediction remains non-tentative (tentative_until_epoch=0 <= confirmed_epoch=0).
+        overlay.cull(&screen, 0, 50); // clears awaiting_first_cull; prediction stays pending
+
+        // Manually set flagging (cull at rtt=50 < FLAG_TRIGGER_HIGH=80 won't set it).
         overlay.flagging = true;
         // The prediction's tentative_until_epoch = 0 = confirmed_epoch (0), not tentative.
         if let Some(cell) = overlay.cell_at(0, 0) {
@@ -1336,6 +1408,9 @@ mod tests {
         let screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
         overlay.on_input(b"a", &screen);
+        // CR-03 fix: awaiting_first_cull is true after on_input on a fresh epoch.
+        // Cull with epoch 0 clears the flag without removing the pending prediction.
+        overlay.cull(&screen, 0, 5); // clears awaiting_first_cull; rtt=5 → no flagging
         overlay.flagging = false;
         if let Some(cell) = overlay.cell_at(0, 0) {
             assert_eq!(
@@ -1402,5 +1477,166 @@ mod tests {
             None,
             "predicted_cursor must return None when all predictions are tentative"
         );
+    }
+
+    // ── Mandatory regression tests (CR-01, CR-02, CR-03) ─────────────────────
+
+    /// CR-01 regression: prediction lands on NON-ZERO confirmed cursor row.
+    ///
+    /// Before the fix, `predicted_cursor.row` was always 0 regardless of where
+    /// the confirmed cursor was. After the fix, `sync_cursor_from_confirmed` seeds
+    /// the predicted row from the confirmed cursor so predictions land correctly.
+    #[test]
+    fn cr01_prediction_lands_on_correct_nonzero_row() {
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Server places cursor at row=5, col=2 (simulating a multi-line shell prompt).
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 5, col: 2 },
+            runs: vec![],
+        };
+        screen.apply(&diff);
+
+        // Simulate the datagram arm: cull() then sync_cursor_from_confirmed.
+        overlay.cull(&screen, 1, 5); // clears awaiting_first_cull
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // seeds row=5, col=2
+
+        // Type 'a' — prediction must land at row=5, col=2 (not row=0).
+        overlay.on_input(b"a", &screen);
+
+        assert_eq!(
+            overlay.pending.len(),
+            1,
+            "one prediction must be enqueued"
+        );
+        let pred = &overlay.pending[0];
+        assert_eq!(pred.row, 5, "prediction must be at row 5 (confirmed cursor row), not row 0");
+        assert_eq!(pred.col, 2, "prediction must be at col 2 (confirmed cursor col)");
+
+        // Confirm: server echoes 'a' at row=5, col=2 with epoch=2.
+        let diff2 = make_diff_with_char(2, 5, 2, 'a');
+        screen.apply(&diff2);
+        overlay.cull(&screen, 2, 5);
+
+        // After correct confirmation, the prediction at (5,2) must be removed from pending.
+        // Note: confirmed_epoch only advances when tentative_until_epoch > confirmed_epoch.
+        // In this test, tentative_until_epoch=0 == confirmed_epoch=0, so confirmed_epoch
+        // stays 0 (CorrectNoCredit for blank→blank, or Correct without epoch advance).
+        // The key correctness assertion is that the prediction was placed at (5, 2),
+        // confirmed there, and is now gone — not at (0, 0) as the pre-fix bug caused.
+        assert_eq!(
+            overlay.pending.len(),
+            0,
+            "prediction confirmed at (5, 2) must be removed from pending (not stuck at row 0)"
+        );
+    }
+
+    /// CR-02 regression: backspace removes the prediction at the vacated column.
+    ///
+    /// Before the fix, PredictBackspace only moved the cursor left — the prediction
+    /// at the vacated column remained in `pending` and was still returned by `cell_at`.
+    /// This is worse than no prediction (D-15-01 "never render worse" invariant).
+    #[test]
+    fn cr02_backspace_removes_char_prediction_from_overlay() {
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Type 'a' — prediction at (0, 0); cursor → col=1.
+        overlay.on_input(b"a", &screen);
+        // Cull to clear awaiting_first_cull so cell_at can return the prediction.
+        overlay.cull(&screen, 0, 5);
+        assert!(
+            overlay.cell_at(0, 0).is_some(),
+            "prediction must be visible at (0,0) before backspace"
+        );
+
+        // Backspace — cursor moves to col=0; prediction at col=0 must be REMOVED.
+        overlay.on_input(&[0x7f], &screen);
+
+        assert!(
+            overlay.cell_at(0, 0).is_none(),
+            "after backspace, cell_at(0,0) must be None — \
+             deleted char must not remain in overlay (D-15-01 never-render-worse invariant)"
+        );
+        assert_eq!(
+            overlay.pending.len(),
+            0,
+            "after backspace, pending must be empty — prediction at vacated column removed"
+        );
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            0,
+            "after backspace, predicted cursor must be at col 0"
+        );
+    }
+
+    /// CR-03 regression: first keystroke of a new epoch is NOT rendered until cull() runs.
+    ///
+    /// Before the fix, `on_input` → `render_with_predictor` could show a prediction
+    /// to stdout before any `cull()` had detected a noecho mismatch — a one-frame
+    /// exposure window for passwords. After the fix, `awaiting_first_cull=true` suppresses
+    /// `cell_at` until cull() runs (PREDICT-03/04).
+    #[test]
+    fn cr03_noecho_first_keystroke_not_rendered_before_cull() {
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Type 'a' — fresh epoch, awaiting_first_cull=true.
+        overlay.on_input(b"a", &screen);
+
+        // BEFORE cull(), cell_at must return None (no one-frame render).
+        assert!(
+            overlay.cell_at(0, 0).is_none(),
+            "PREDICT-04 violation: cell_at(0,0) returned Some BEFORE cull() ran — \
+             first keystroke of a fresh epoch must not be rendered until cull() confirms \
+             the prediction or detects noecho (CR-03 one-frame noecho protection)"
+        );
+        assert!(
+            overlay.predicted_cursor().is_none(),
+            "predicted_cursor() must be None before cull() runs for a fresh epoch (CR-03)"
+        );
+
+        // Simulate noecho: cull() with an empty datagram (server didn't echo 'a').
+        // The prediction will mismatch → reset() → pending cleared.
+        let diff_empty = make_diff_empty(1);
+        let mut screen2 = make_screen(80, 24);
+        screen2.apply(&diff_empty);
+        overlay.cull(&screen2, 1, 5);
+
+        // After cull detected noecho (mismatch → reset), cell_at must still return None.
+        assert!(
+            overlay.cell_at(0, 0).is_none(),
+            "after noecho cull, cell_at(0,0) must be None — \
+             structural noecho suppression must hold (PREDICT-04)"
+        );
+    }
+
+    /// CR-01 / confirmed_cursor() getter: screen.confirmed_cursor() returns correct position.
+    #[test]
+    fn screen_confirmed_cursor_getter_returns_correct_position() {
+        let mut screen = make_screen(80, 24);
+
+        // Initial state: cursor at (0, 0).
+        let cursor = screen.confirmed_cursor();
+        assert_eq!(cursor.row, 0, "initial confirmed_cursor.row must be 0");
+        assert_eq!(cursor.col, 0, "initial confirmed_cursor.col must be 0");
+
+        // After apply with a non-trivial cursor, getter returns the updated position.
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 3, col: 15 },
+            runs: vec![],
+        };
+        screen.apply(&diff);
+
+        let cursor2 = screen.confirmed_cursor();
+        assert_eq!(cursor2.row, 3, "confirmed_cursor.row must be 3 after apply");
+        assert_eq!(cursor2.col, 15, "confirmed_cursor.col must be 15 after apply");
     }
 }

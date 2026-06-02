@@ -466,6 +466,14 @@ impl ClientScreen {
         self.last_applied_epoch
     }
 
+    /// Return the cursor position from the last applied `StateDiff`.
+    ///
+    /// Used by the prediction overlay to seed `predicted_cursor` from the
+    /// confirmed position so predictions land on the correct row (CR-01 fix).
+    pub fn confirmed_cursor(&self) -> CursorPos {
+        self.confirmed_cursor
+    }
+
     /// Return the current terminal dimensions as `(cols, rows)`.
     pub fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
@@ -993,12 +1001,11 @@ mod tests {
         // on_input on an empty screen (last_applied_epoch = 0).
         predictor.on_input(b"x", &screen);
 
-        // Force predictions to be visible: use Always mode + force confirmed_epoch
-        // to advance so predictions are non-tentative.
-        // The prediction's tentative_until_epoch is the prediction_epoch at time of
-        // on_input (which starts at 0). confirmed_epoch also starts at 0.
-        // Since tentative_until_epoch (0) <= confirmed_epoch (0), the prediction
-        // IS visible immediately in Always mode.
+        // CR-03 fix: awaiting_first_cull is true after the first on_input of a fresh
+        // epoch. Simulate the datagram arm: cull() with epoch 0 (below epoch_required=1)
+        // clears awaiting_first_cull without removing the prediction (epoch_required=1 > 0).
+        // The prediction remains non-tentative (tentative_until_epoch=0 == confirmed_epoch=0).
+        predictor.cull(&screen, 0, 5); // clears awaiting_first_cull
 
         let mut buf = Vec::<u8>::new();
         screen.render_with_predictor(&mut buf, &predictor).unwrap();

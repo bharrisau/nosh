@@ -706,12 +706,23 @@ async fn run_pump(
                         if let Ok(diff) = nosh_proto::datagram::decode_datagram(&bytes) {
                             // T-14-06: monotonic epoch gate — stale/replayed diffs discarded.
                             if diff.epoch > screen.last_applied_epoch() {
+                                // WR-01: capture dims before apply so we can detect a resize.
+                                let (cols_before, rows_before) = screen.size();
                                 screen.apply(&diff);
                                 // Cull predictions against the new confirmed state and quinn RTT
                                 // (D-17-02a: latency instrumentation hook — see below).
                                 let rtt_ms = conn.rtt().as_millis() as u64;
                                 let epoch_before_cull = predictor.confirmed_epoch();
                                 predictor.cull(&screen, diff.epoch, rtt_ms);
+                                // WR-01: update predictor dimensions when terminal was resized.
+                                let (cols_after, rows_after) = screen.size();
+                                if cols_after != cols_before || rows_after != rows_before {
+                                    predictor.set_size(cols_after, rows_after);
+                                    predictor.reset();
+                                }
+                                // CR-01: sync predicted cursor from confirmed cursor so that new
+                                // predictions land on the correct row (not the hard-zeroed row 0).
+                                predictor.sync_cursor_from_confirmed(screen.confirmed_cursor());
                                 // D-17-02a latency instrumentation: when cull advances confirmed_epoch,
                                 // one or more predictions were confirmed. Look up the enqueue time
                                 // for any epoch that was just confirmed and log the latency.

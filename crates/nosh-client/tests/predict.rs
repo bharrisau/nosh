@@ -148,9 +148,14 @@ fn vim_insert_zero_corrupt_cells() {
     // This tests the core vim-insert case: mid-word ESC resets all predictions.
     predictor.on_input(b"!", &screen); // an unconfirmed prediction
     assert_eq!(predictor.pending_len(), 1, "one unconfirmed prediction in pending");
+    // CR-03 fix: awaiting_first_cull=true after first on_input of a fresh epoch.
+    // Call cull() with epoch=5 (same as last applied epoch after 5 confirmed chars)
+    // to clear awaiting_first_cull. Epoch_required for '!' = last_applied+1 = 6 > 5,
+    // so the prediction stays pending (not confirmed/removed).
+    predictor.cull(&screen, 5, 50);
     assert!(
         predictor.predicted_cursor().is_some(),
-        "unconfirmed prediction must be visible in Always mode"
+        "unconfirmed prediction must be visible in Always mode after cull() clears awaiting_first_cull"
     );
 
     // ESC — epoch reset (clears pending via reset()).
@@ -202,6 +207,11 @@ fn cjk_wide_char_column_advance() {
     let ni_bytes = "你".as_bytes();
     assert_eq!(ni_bytes.len(), 3, "'你' must be exactly 3 UTF-8 bytes");
     predictor.on_input(ni_bytes, &screen);
+
+    // CR-03 fix: awaiting_first_cull=true after first on_input of a fresh epoch.
+    // Call cull() with epoch 0 (below epoch_required=1) to clear the flag without
+    // removing the prediction (epoch_required=1 > 0 → stays pending).
+    predictor.cull(&screen, 0, 5);
 
     // Predicted cursor advances by 2 (width-2 CJK char).
     assert_eq!(
@@ -284,6 +294,10 @@ fn less_cursor_addressing_disables_prediction() {
     // Type an unconfirmed char (pending prediction).
     predictor.on_input(b"b", &screen);
     assert_eq!(predictor.pending_len(), 1, "one unconfirmed prediction before cursor-addressing");
+    // CR-03 fix: awaiting_first_cull=true after first on_input of a fresh epoch.
+    // cull() with epoch 1 (same as last applied) clears the flag; epoch_required for
+    // 'b' is 2 > 1 so prediction stays pending.
+    predictor.cull(&screen, 1, 50);
     assert!(
         predictor.predicted_cursor().is_some(),
         "before cursor-addressing, predictor must have visible state"
@@ -520,13 +534,21 @@ fn home_end_motion_lands_correct_column() {
     screen.apply(&diff);
     predictor.cull(&screen, 1, 50);
 
-    // Set the predicted cursor to match the confirmed cursor (col 5).
-    // We do this by typing 'x' (advances to col 6) then backspace (back to col 5).
-    predictor.on_input(b"x", &screen);
-    predictor.on_input(&[0x7f], &screen); // backspace → col 5
+    // CR-01 fix: sync predicted cursor from the confirmed cursor so predictions
+    // start at col 5 (where the shell cursor is after "hello"), not col 0.
+    predictor.sync_cursor_from_confirmed(screen.confirmed_cursor());
+
+    // Type 'z' at col 5 to make pending non-empty (required for predicted_cursor()
+    // to return Some). Then use Home/End to navigate.
+    predictor.on_input(b"z", &screen);
+    // Cull with epoch 0 (below epoch_required=2) to clear awaiting_first_cull
+    // without removing the prediction.
+    predictor.cull(&screen, 1, 50);
 
     // Test CSI F (End) → col 5 (end of "hello" row).
     // find_line_end scans right-to-left: 'o' at col 4 → returns col 5.
+    // At this point predicted_cursor.col = 6 (col 5 + width 1 for 'z').
+    // CSI F moves it back to col 5 (the logical end of "hello").
     predictor.on_input(b"\x1b[F", &screen);
     let cursor_end = predictor.predicted_cursor().unwrap_or(CursorPos { row: 0, col: 99 });
     assert_eq!(
@@ -623,6 +645,50 @@ fn rtt_adaptive_loopback_invisible() {
     );
 }
 
+/// WR-05 / CR-02 regression: type-then-backspace stale prediction scenario.
+///
+/// Before the CR-02 fix, PredictBackspace only moved the cursor left — the
+/// prediction at the vacated column stayed in `pending` and was still returned
+/// by `cell_at`. This is worse than no prediction (D-15-01 "never render worse"
+/// invariant). After the fix, backspace removes the prediction at the vacated
+/// column from `pending` before moving the cursor.
+#[test]
+fn backspace_removes_stale_char_prediction() {
+    let screen = ClientScreen::new(80, 24);
+    let mut predictor = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+    // Type 'a' — prediction at (0, 0); cursor → col=1.
+    predictor.on_input(b"a", &screen);
+    // CR-03 fix: clear awaiting_first_cull so cell_at can return predictions.
+    // Cull with epoch 0 (below epoch_required=1) keeps prediction in pending.
+    predictor.cull(&screen, 0, 5);
+
+    // Confirm prediction is visible before backspace.
+    assert!(
+        predictor.cell_at(0, 0).is_some(),
+        "prediction must be visible at (0,0) before backspace"
+    );
+    assert_eq!(predictor.pending_len(), 1, "one prediction in pending before backspace");
+
+    // Backspace — cursor must move to col=0 AND prediction at col=0 must be removed.
+    predictor.on_input(&[0x7f], &screen);
+
+    // ADVERSARIAL ASSERTION: cell_at(0,0) must return None after backspace.
+    // Before the CR-02 fix, this would return Some('a') — the deleted char
+    // remained visible in the overlay (worse than no prediction).
+    assert!(
+        predictor.cell_at(0, 0).is_none(),
+        "INVARIANT VIOLATION: cell_at(0,0) returned Some after backspace — \
+         deleted char must not remain in overlay (D-15-01 never-render-worse invariant, \
+         CR-02 fix regression)"
+    );
+    assert_eq!(
+        predictor.pending_len(),
+        0,
+        "after backspace, pending must be empty — prediction at vacated column removed (CR-02)"
+    );
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // Live-server integration tests (real nosh-server PTY via QUIC)
 // ════════════════════════════════════════════════════════════════════════════════
@@ -706,14 +772,25 @@ async fn noecho_read_dash_s_zero_predicted_chars() {
         // Wait briefly and cull against incoming datagrams.
         drain_datagrams_with_cull(&conn, &mut screen, &mut predictor, Duration::from_millis(500)).await;
 
+        // Also sync predicted cursor from confirmed so the predictor tracks the real
+        // cursor row (CR-01 fix) — ensures noecho assertion covers the correct row.
+        predictor.sync_cursor_from_confirmed(screen.confirmed_cursor());
+
         // SECURITY ASSERTION: after each keystroke + cull, no predicted character
-        // must be visible at any position. Checked across all 80 columns.
-        for col in 0..80u16 {
-            assert!(
-                predictor.cell_at(0, col).is_none(),
-                "SECURITY VIOLATION: cell_at(0,{col}) returned Some during 'read -s' noecho — \
-                 password char prediction MUST be suppressed (Always mode, D-15-01c / PREDICT-04)"
-            );
+        // must be visible at any position on ANY row. WR-04 fix: check all 24 rows
+        // so that a non-zero confirmed cursor row (where 'read -s' actually runs) is
+        // also validated. Before CR-01 was fixed, predictions landed at row=0 regardless;
+        // now they land at the confirmed cursor row, so we check all rows adversarially.
+        let cursor_row = screen.confirmed_cursor().row;
+        for row in 0..24u16 {
+            for col in 0..80u16 {
+                assert!(
+                    predictor.cell_at(row, col).is_none(),
+                    "SECURITY VIOLATION: cell_at({row},{col}) returned Some during 'read -s' noecho \
+                     (confirmed cursor at row {cursor_row}) — \
+                     password char prediction MUST be suppressed (Always mode, D-15-01c / PREDICT-04)"
+                );
+            }
         }
     }
 
