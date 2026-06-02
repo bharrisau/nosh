@@ -13,7 +13,7 @@ pub mod transport;
 
 pub use codec::{decode, encode, read_message, write_message, ProtoError};
 pub use datagram::{CellStyle, ClientEpoch, CursorPos, DiffRun, MAX_RUNS, MIN_CAP, StateDiff, decode_datagram, decode_epoch_ack, encode_datagram, encode_epoch_ack};
-pub use messages::Message;
+pub use messages::{Message, TerminalControlPayload};
 pub use transport::transport_config;
 
 /// The single canonical ALPN identifier for the nosh protocol.

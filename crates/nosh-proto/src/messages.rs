@@ -150,6 +150,64 @@ pub enum Message {
         /// Next-expected-seq == count of output chunks the client has applied.
         seq: u64,
     },
+
+    // ── Phase 16: Out-of-band terminal control passthrough ───────────────────
+    //
+    // Appended AFTER `Ack` (discriminant 9) to preserve all existing discriminant
+    // orderings. NEVER insert or reorder variants — postcard encoding is
+    // NOT backward-compatible if discriminants shift (see append-only invariant
+    // at lines 56-62 above).
+
+    /// Server → client out-of-band terminal control passthrough (D-16-01, D-16-02).
+    ///
+    /// Carries OSC sequences that the server intercepted and wants to forward
+    /// to the client for out-of-band re-emission. The client re-emits the
+    /// payload to stdout, BYPASSING the compositor (not through the cell grid).
+    ///
+    /// **Reliable stream only (no MTU limit)**: this variant is always sent over
+    /// the reliable bidirectional QUIC stream using `write_message` / `read_message`,
+    /// NEVER as a datagram (`conn.send_datagram`).
+    ///
+    /// **Security**: only WRITE-form payloads are ever forwarded. The OSC 52
+    /// read/query form (`?`) is silently dropped in `osc_dispatch` before it can
+    /// reach the forwarding path (D-16-01a / T-16-01).
+    TerminalControl(TerminalControlPayload),
+}
+
+/// Payload for a [`Message::TerminalControl`] frame.
+///
+/// Each variant represents one category of out-of-band terminal control
+/// sequence forwarded from server to client (D-16-01, D-16-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalControlPayload {
+    /// OSC 52 clipboard-write passthrough (write-only, D-16-01a).
+    ///
+    /// The server detected an OSC 52 clipboard-write sequence in the PTY output
+    /// stream and forwards it to the client for out-of-band re-emission to the
+    /// local clipboard. The client re-emits `\x1b]52;<selection>;<data>\x07`
+    /// directly to stdout, bypassing the compositor.
+    ///
+    /// **NEVER contains the read/query form**: the `?` data value is silently
+    /// dropped in `osc_dispatch` before reaching this type (D-16-01a / T-16-01).
+    /// Only write payloads (non-`?` base64 data) appear here.
+    Clipboard {
+        /// The clipboard selection designator bytes (e.g. `b"c"` for the system
+        /// clipboard). Corresponds to OSC 52's first parameter after the code.
+        selection: Vec<u8>,
+        /// The base64-encoded clipboard content bytes. Corresponds to OSC 52's
+        /// second parameter. Never `b"?"` (the read/query form is always dropped).
+        data: Vec<u8>,
+    },
+    /// OSC 0/2 terminal title passthrough (D-16-02).
+    ///
+    /// The server detected an OSC 0 (icon + window title) or OSC 2 (window title)
+    /// sequence and forwards the title string to the client. The client re-emits
+    /// `\x1b]2;<title>\x07` directly to stdout so the local terminal window title
+    /// is updated. Bounded to `MAX_TITLE_BYTES` (1024 bytes) by `osc_dispatch`.
+    Title {
+        /// The terminal window title string. Bounded to `MAX_TITLE_BYTES` (1024).
+        title: String,
+    },
 }
 
 impl Message {
@@ -168,6 +226,7 @@ impl Message {
             Message::ReattachOk { .. } => "ReattachOk",
             Message::ReattachErr => "ReattachErr",
             Message::Ack { .. } => "Ack",
+            Message::TerminalControl(_) => "TerminalControl",
         }
     }
 }
@@ -194,6 +253,20 @@ mod tests {
             ),
             (Message::ReattachErr, "ReattachErr"),
             (Message::Ack { seq: 1 }, "Ack"),
+            // Phase 16: TerminalControl must not leak payload bytes.
+            (
+                Message::TerminalControl(TerminalControlPayload::Clipboard {
+                    selection: b"c".to_vec(),
+                    data: b"SGVsbG8=".to_vec(),
+                }),
+                "TerminalControl",
+            ),
+            (
+                Message::TerminalControl(TerminalControlPayload::Title {
+                    title: "My Terminal".into(),
+                }),
+                "TerminalControl",
+            ),
         ] {
             let name = msg.variant_name();
             assert_eq!(name, expected);
@@ -203,5 +276,34 @@ mod tests {
                 "variant_name must not contain token bytes: {name}"
             );
         }
+    }
+
+    /// Phase 16 / D-16-01: `Message::TerminalControl(Clipboard{..})` round-trips
+    /// through postcard encode/decode identically.
+    #[test]
+    fn terminal_control_clipboard_round_trips() {
+        use crate::codec;
+        let msg = Message::TerminalControl(TerminalControlPayload::Clipboard {
+            selection: b"c".to_vec(),
+            data: b"SGVsbG8=".to_vec(),
+        });
+        // encode() returns a length-prefixed frame; decode() takes the body only (strip 4-byte prefix).
+        let frame = codec::encode(&msg).expect("encode must succeed");
+        let decoded = codec::decode(&frame[4..]).expect("decode must succeed");
+        assert_eq!(msg, decoded, "Clipboard TerminalControl must round-trip through postcard");
+    }
+
+    /// Phase 16 / D-16-02: `Message::TerminalControl(Title{..})` round-trips
+    /// through postcard encode/decode identically.
+    #[test]
+    fn terminal_control_title_round_trips() {
+        use crate::codec;
+        let msg = Message::TerminalControl(TerminalControlPayload::Title {
+            title: "x".into(),
+        });
+        // encode() returns a length-prefixed frame; decode() takes the body only (strip 4-byte prefix).
+        let frame = codec::encode(&msg).expect("encode must succeed");
+        let decoded = codec::decode(&frame[4..]).expect("decode must succeed");
+        assert_eq!(msg, decoded, "Title TerminalControl must round-trip through postcard");
     }
 }
