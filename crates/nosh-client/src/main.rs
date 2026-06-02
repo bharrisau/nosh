@@ -692,7 +692,21 @@ async fn run_pump(
     // interval drives a re-render so the "last contact Ns ago" counter increments live
     // on screen (not frozen at activation). The arm is guarded by `if loss_overlay.active`
     // so it is a no-op when the overlay is inactive (no spurious re-renders).
-    let mut loss_tick = tokio::time::interval(Duration::from_secs(1));
+    //
+    // WR-02: use MissedTickBehavior::Skip (not the default Burst) to prevent back-to-back
+    // re-renders if the event loop was delayed (e.g. heavy keystroke traffic) while the
+    // overlay was active. Matches the ack_interval policy.
+    //
+    // WR-03: use interval_at(now + 1s, 1s) so the first tick fires 1s after creation,
+    // not immediately. Without interval_at, interval() fires its first tick on the first
+    // .tick() call; combined with the silence arm activating loss_overlay.active on the
+    // same iteration, this causes a spurious double repaint at activation time (the silence
+    // arm renders, then loss_tick immediately fires and renders again).
+    let mut loss_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    loss_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Latency instrumentation (D-17-02a): map from prediction_epoch → enqueue Instant.
     // Used to measure predicted-keystroke-time vs confirming-datagram-time for
     // Phase 17 Windows predictive echo validation. Logged at debug level under
