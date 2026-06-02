@@ -174,7 +174,11 @@ Plans:
   4. A `.github/workflows/ci.yml` `build-windows` job runs on a `windows-latest` runner and builds `nosh-client` for `x86_64-pc-windows-msvc` on every push — CI is not false-green
   5. The `WSAEMSGSIZE` quinn_udp warning is resolved or deliberately suppressed (e.g. `quinn_udp=error` tracing filter on Windows) with the rationale and upstream issue reference recorded in a code comment
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+- [ ] 16-01-PLAN.md — Server OSC passthrough: Message::TerminalControl proto variant, osc_dispatch read-gate + bounded caps, vte std re-enable, drain methods, forwarding
+- [ ] 16-02-PLAN.md — Client integration: OSC 52/0/2 re-emit, ConnectionLossOverlay activation + >5s silence timer, --status RTT title, WSAEMSGSIZE Windows filter
+- [ ] 16-03-PLAN.md — Windows CI gate: native ci.yml (Linux + windows-latest MSVC), retire windows-cross.yml (HARDEN-02 green-run is human sign-off)
 
 ### Phase 17: Windows-Host Predictive Echo Validation
 
