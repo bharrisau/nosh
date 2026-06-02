@@ -222,7 +222,7 @@ Plans:
 | 12. Server Terminal State Model | 2/2 | Complete    | 2026-06-01 |
 | 13. Server Datagram Sender | 3/3 | Complete    | 2026-06-01 |
 | 14. Client Predictor — Confirmed Rendering | 3/3 | Complete    | 2026-06-01 |
-| 15. Client Predictor — Speculative Overlay | 3/3 | Complete | 2026-06-02 |
+| 15. Client Predictor — Speculative Overlay | 3/3 | Complete    | 2026-06-02 |
 | 16. QoL Feature Pack + Windows CI Gate | 0/? | Not started | - |
 | 17. Windows-Host Predictive Echo Validation | 0/? | Not started | - |
 | 18. Security Design Pass | 0/? | Not started | - |
