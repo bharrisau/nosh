@@ -4,14 +4,14 @@ milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: planning
 stopped_at: Phase 15 context gathered
-last_updated: "2026-06-02T01:20:06.480Z"
-last_activity: 2026-06-02 -- Phase 16 planning complete
+last_updated: "2026-06-02T01:30:15Z"
+last_activity: 2026-06-02 -- Phase 16 Plan 01 complete (OSC passthrough infrastructure)
 progress:
   total_phases: 9
   completed_phases: 6
   total_plans: 17
-  completed_plans: 14
-  percent: 67
+  completed_plans: 16
+  percent: 70
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-01)
 ## Current Position
 
 Phase: 16
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-06-02 -- Phase 16 planning complete
+Plan: 01 (complete) — 02 next
+Status: In progress
+Last activity: 2026-06-02 -- Phase 16 Plan 01 complete (OSC passthrough infrastructure)
 
 ```
-Progress: [█████████░] 86%
+Progress: [█████████░] 88%
 ```
 
 ## Performance Metrics
@@ -71,6 +71,7 @@ Progress: [█████████░] 86%
 | Phase 15 P01 | 45 | 2 tasks | 3 files |
 | Phase 15 P02 | 30 | 2 tasks | 2 files |
 | Phase 15 P03 | 45 | 2 tasks | 2 files |
+| Phase 16 P01 | 30 | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -99,6 +100,11 @@ Recent decisions affecting current work:
 - v1.2 roadmap: Phase 17 (Windows-host validation) must execute from a physical Windows PC — halt Linux execution, run from Windows machine like v1.1 Phase 9; HARDEN-02/03 stay in Phase 16 (authorable from Linux)
 - v1.2 roadmap: 0-RTT cold reattach still deliberately deferred — 1-RTT already ships, replay-safety burden not justified
 - [Phase 15-03]: EpochReset/BulkSuppressed call reset() not become_tentative() — clears all pending predictions so no stale speculative state remains visible after Ctrl-C/ESC/cursor-addressing
+- [Phase 16-01]: TerminalControl appended after Ack (discriminant 9) to preserve postcard discriminant order
+- [Phase 16-01]: vte std re-enabled with explicit osc_dispatch caps (OSC_52_MAX_BYTES=65536, MAX_TITLE_BYTES=1024) to re-mitigate CR-03
+- [Phase 16-01]: OSC 52 read/query form ('?') silently dropped in osc_dispatch before any store (D-16-01a)
+- [Phase 16-01]: drain_terminal_control() uses Option::take semantics to prevent double-forwarding
+- [Phase 16-01]: TerminalControl forwarded via write_message (reliable stream) NEVER via send_datagram
 - [Phase ?]: emit_diff factored as shared private method
 - [Phase ?]: Predictor held in run_pump not overlays Vec
 - [Phase ?]: D-17-02a latency hook uses HashMap in run_pump
