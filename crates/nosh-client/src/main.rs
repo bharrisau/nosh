@@ -871,7 +871,13 @@ async fn run_pump(
             // Silence detection (QOL-01): fires when no datagram arrives for >5 s.
             // Activates the loss overlay and forces an immediate render so the banner
             // appears exactly at the 5 s threshold (not frozen until next datagram).
-            _ = silence_sleep => {
+            // Guard: `if !loss_overlay.active` prevents a hot-spin after activation —
+            // without the guard, silence_sleep is recreated each iteration at a deadline
+            // already in the past (last_datagram_time is not updated after activation),
+            // causing it to resolve immediately every iteration and flood the render path.
+            // With the guard, once the overlay is active this arm becomes pending() and
+            // only loss_tick.tick() drives the 1s re-renders (CR-01).
+            _ = silence_sleep, if !loss_overlay.active => {
                 loss_overlay.active = true;
                 loss_overlay.last_contact = last_datagram_time.into_std();
                 let mut buf: Vec<u8> = Vec::new();
