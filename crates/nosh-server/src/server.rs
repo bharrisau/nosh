@@ -21,7 +21,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
 use rustls::pki_types::CertificateDer;
-use nosh_proto::Message;
+use nosh_proto::{Message, TerminalControlPayload};
 use nosh_proto::datagram::{
     encode_datagram, decode_epoch_ack, StateDiff, DiffRun, MIN_CAP, MAX_RUNS,
 };
@@ -617,6 +617,37 @@ async fn run_session(
                             // Send failed → transport lost (not a clean close).
                             break SessionEnd::TransportLost;
                         }
+                        // Phase 16 (D-16-01, D-16-02): drain any pending OSC 0/2 title and
+                        // OSC 52 clipboard-write detected during parse, and forward them to
+                        // the client over the RELIABLE stream (not datagrams — no MTU limit).
+                        // Write-only OSC 52: read/query form already dropped in osc_dispatch.
+                        // Client re-emits these to stdout, bypassing the compositor.
+                        let (drained_title, drained_clipboard) = slot.drain_terminal_control();
+                        if let Some(title) = drained_title {
+                            if nosh_proto::write_message(
+                                &mut send,
+                                &Message::TerminalControl(TerminalControlPayload::Title { title }),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break SessionEnd::TransportLost;
+                            }
+                        }
+                        if let Some((selection, data)) = drained_clipboard {
+                            if nosh_proto::write_message(
+                                &mut send,
+                                &Message::TerminalControl(TerminalControlPayload::Clipboard {
+                                    selection,
+                                    data,
+                                }),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break SessionEnd::TransportLost;
+                            }
+                        }
                     }
                     None => {
                         // Output pump ended (PTY EOF). Await the exit code.
@@ -1092,6 +1123,37 @@ async fn run_reattach_session(
                             .is_err()
                         {
                             break SessionEnd::TransportLost;
+                        }
+                        // Phase 16 (D-16-01, D-16-02): drain any pending OSC 0/2 title and
+                        // OSC 52 clipboard-write detected during parse, and forward them to
+                        // the client over the RELIABLE stream (not datagrams — no MTU limit).
+                        // Write-only OSC 52: read/query form already dropped in osc_dispatch.
+                        // Client re-emits these to stdout, bypassing the compositor.
+                        let (drained_title, drained_clipboard) = slot.drain_terminal_control();
+                        if let Some(title) = drained_title {
+                            if nosh_proto::write_message(
+                                &mut send,
+                                &Message::TerminalControl(TerminalControlPayload::Title { title }),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break SessionEnd::TransportLost;
+                            }
+                        }
+                        if let Some((selection, data)) = drained_clipboard {
+                            if nosh_proto::write_message(
+                                &mut send,
+                                &Message::TerminalControl(TerminalControlPayload::Clipboard {
+                                    selection,
+                                    data,
+                                }),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break SessionEnd::TransportLost;
+                            }
                         }
                     }
                     None => {

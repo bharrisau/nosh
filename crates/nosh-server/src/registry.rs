@@ -501,6 +501,28 @@ impl SessionSlot {
         f(&ts)
     }
 
+    /// Drain pending OSC 0/2 title and OSC 52 clipboard-write for forwarding to
+    /// the client as `Message::TerminalControl` frames over the reliable stream (Phase 16).
+    ///
+    /// Returns `(title, clipboard)` where:
+    /// - `title` is `Some(String)` if an OSC 0/2 title was pending, `None` otherwise.
+    /// - `clipboard` is `Some((selection, data))` if an OSC 52 write was pending, `None` otherwise.
+    ///
+    /// Both fields use [`Option::take`] semantics — they are cleared after this call,
+    /// preventing double-forwarding on the next iteration.
+    ///
+    /// # Caller contract
+    ///
+    /// - Call ONLY after `push_output_and_parse` (not before); the drain is the write-mutation
+    ///   counterpart to `with_terminal_state` (which provides read-only access).
+    /// - MUST NOT be called while holding any other lock across `.await` (Anti-Pattern #2).
+    /// - The returned `(Option<String>, Option<(Vec<u8>, Vec<u8>)>)` must be forwarded via
+    ///   `nosh_proto::write_message` (reliable stream), NEVER via `conn.send_datagram`.
+    pub fn drain_terminal_control(&self) -> (Option<String>, Option<(Vec<u8>, Vec<u8>)>) {
+        let mut ts = self.terminal_state.lock().unwrap_or_else(|e| e.into_inner());
+        (ts.take_title(), ts.take_osc52())
+    }
+
     /// Non-blocking check whether the shell child has exited. Returns the
     /// exit code if it has, `None` if it is still running.
     ///
@@ -1937,6 +1959,98 @@ mod tests {
         assert!(
             actual_rows <= 1000,
             "grid rows must be <= MAX_ROWS=1000 after resize(65535,65535), got {actual_rows}"
+        );
+
+        slot.sighup();
+    }
+
+    // ── Phase 16: drain_terminal_control tests ───────────────────────────────
+
+    /// Phase 16: feeding an OSC 52 write via push_output_and_parse then draining
+    /// yields the clipboard payload with drain-once semantics (the key path that the
+    /// server loop uses to forward TerminalControl::Clipboard over the reliable stream).
+    ///
+    /// This test does NOT require a real PTY — it operates on the SequencedOutputBuffer
+    /// + TerminalState path directly (same as other non-PTY registry tests).
+    #[test]
+    fn drain_terminal_control_clipboard_write_yields_payload() {
+        if !have_sh() {
+            eprintln!("skipping drain_terminal_control_clipboard_write_yields_payload: /bin/sh unavailable");
+            return;
+        }
+        let sess = open_sh_session(test_key(0xA1));
+        let slot = SessionSlot::new(sess);
+
+        // Feed an OSC 52 clipboard-write sequence (base64 "Hello").
+        slot.push_output_and_parse(b"\x1b]52;c;SGVsbG8=\x07");
+
+        // Drain: must yield Some clipboard payload.
+        let (title, clipboard) = slot.drain_terminal_control();
+        assert!(title.is_none(), "no title was set — title drain must be None");
+        assert!(clipboard.is_some(), "OSC 52 write must yield Some clipboard payload on drain");
+        let (sel, data) = clipboard.unwrap();
+        assert_eq!(sel, b"c", "selection must be 'c'");
+        assert_eq!(data, b"SGVsbG8=", "data must be the base64 payload");
+
+        // Second drain must return None (drain-once semantics).
+        let (title2, clipboard2) = slot.drain_terminal_control();
+        assert!(title2.is_none(), "second drain title must be None");
+        assert!(clipboard2.is_none(), "second drain clipboard must be None (drain-once)");
+
+        slot.sighup();
+    }
+
+    /// Phase 16: feeding an OSC 2 title via push_output_and_parse then draining
+    /// yields the title payload with drain-once semantics.
+    #[test]
+    fn drain_terminal_control_title_yields_payload() {
+        if !have_sh() {
+            eprintln!("skipping drain_terminal_control_title_yields_payload: /bin/sh unavailable");
+            return;
+        }
+        let sess = open_sh_session(test_key(0xA2));
+        let slot = SessionSlot::new(sess);
+
+        // Feed an OSC 2 title sequence.
+        slot.push_output_and_parse(b"\x1b]2;My Title\x07");
+
+        // Drain: must yield Some title.
+        let (title, clipboard) = slot.drain_terminal_control();
+        assert!(clipboard.is_none(), "no OSC 52 was set — clipboard drain must be None");
+        assert!(title.is_some(), "OSC 2 title must yield Some title on drain");
+        assert_eq!(title.unwrap(), "My Title", "title must match the OSC 2 payload");
+
+        // Second drain must return None (drain-once semantics).
+        let (title2, clipboard2) = slot.drain_terminal_control();
+        assert!(title2.is_none(), "second drain title must be None (drain-once)");
+        assert!(clipboard2.is_none(), "second drain clipboard must be None");
+
+        slot.sighup();
+    }
+
+    /// Phase 16 security regression: OSC 52 read/query form must yield None on drain.
+    ///
+    /// Defense in depth: the osc_dispatch gate drops the read form before it
+    /// reaches osc52_pending. This test verifies the gate also holds at the
+    /// SessionSlot drain accessor level.
+    #[test]
+    fn drain_terminal_control_osc52_read_form_yields_none() {
+        if !have_sh() {
+            eprintln!("skipping drain_terminal_control_osc52_read_form_yields_none: /bin/sh unavailable");
+            return;
+        }
+        let sess = open_sh_session(test_key(0xA3));
+        let slot = SessionSlot::new(sess);
+
+        // Feed the OSC 52 read/query form (data field is "?").
+        slot.push_output_and_parse(b"\x1b]52;c;?\x07");
+
+        // Drain: the read form must have been dropped by osc_dispatch — both must be None.
+        let (title, clipboard) = slot.drain_terminal_control();
+        assert!(title.is_none(), "no title was set — title drain must be None");
+        assert!(
+            clipboard.is_none(),
+            "OSC 52 read/query form ('?') must yield None on drain (security gate holds at slot level)"
         );
 
         slot.sighup();
