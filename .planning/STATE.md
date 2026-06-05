@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: executing
-stopped_at: Phase 999.4 context gathered
-last_updated: "2026-06-05T08:05:01.289Z"
+stopped_at: Phase 999.4 complete — D-02 (read -s newline) + D-03 (mash-glitch instrument + fix) shipped & verified; D-01 burst pacing deferred to 999.6; TUI/alt-screen bug logged as 999.5
+last_updated: "2026-06-05T14:11:15.901Z"
 last_activity: 2026-06-05 -- Phase 999.4 execution started
 progress:
-  total_phases: 14
+  total_phases: 15
   completed_phases: 10
   total_plans: 24
   completed_plans: 24
-  percent: 71
+  percent: 67
 ---
 
 # Project State
@@ -158,9 +158,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-05T08:05:01.229Z
-Stopped at: Phase 999.4 context gathered
-Resume file: .planning/phases/999.4-predictive-echo-repaint-pacing-live-fix-round-2/999.4-CONTEXT.md
+Last session: 2026-06-05T14:11:15.872Z
+Stopped at: Phase 999.4 complete — D-02 (read -s newline) + D-03 (mash-glitch instrument + fix) shipped & verified; D-01 burst pacing deferred to 999.6; TUI/alt-screen bug logged as 999.5
+Resume file: .planning/phases/999.4-predictive-echo-repaint-pacing-live-fix-round-2/999.4-VERIFICATION.md
 
 ## Operator Next Steps
 
