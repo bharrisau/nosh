@@ -2618,24 +2618,18 @@ mod tests {
             "WR-01: BulkSuppressed with pending>0 must preserve predictions (become_tentative)"
         );
 
-        // Step 4: server confirms "abc" → sync_cursor_from_confirmed fires with confirmed col=5.
-        // With the bug: needs_epoch_start_sync was true → epoch_start_col updated to 5.
-        // With the fix: needs_epoch_start_sync is still false → epoch_start_col stays at 2.
-        // Note: pending is NOT empty at this point (predictions survived BulkSuppressed),
-        // so sync_cursor_from_confirmed won't fire the epoch_start_col capture path.
-        // Simulate cull confirming the predictions first, then sync.
-        let diff_confirm = make_diff_with_char(2, 0, 2, 'a');
-        screen.apply(&diff_confirm);
-        overlay.cull(&screen, 2, 5); // confirms 'a' at (0,2); remaining predictions still pending
-        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor());
-
-        // After cull empties pending fully, try one more sync at the mid-line confirmed col 5.
-        // Force-empty pending to simulate the rest of the confirming datagrams.
-        overlay.pending.clear();
-        // Now sync fires with confirmed col 5 (the mid-line position after "abc").
-        let diff_mid = make_diff_with_char(3, 0, 5, ' ');
+        // Step 4: the server confirms the typed run. The FIRST sync_cursor_from_confirmed
+        // after the BulkSuppressed must happen at the MID-LINE confirmed column (col 5),
+        // with pending empty so the epoch_start_col-capture path runs. There must be NO
+        // intervening sync at the prompt column (col 2) that could consume a spurious flag
+        // harmlessly — that is exactly what made an earlier version of this test non-adversarial.
+        //   With the bug (needs_epoch_start_sync wrongly set in the BulkSuppressed branch):
+        //     this sync captures epoch_start_col = 5 → BUG-E (clamp floor tightened mid-line).
+        //   With the fix (flag untouched by BulkSuppressed): no capture → epoch_start_col stays 2.
+        overlay.pending.clear(); // simulate the confirming datagrams emptying pending
+        let diff_mid = make_diff_with_char(2, 0, 5, ' ');
         screen.apply(&diff_mid);
-        overlay.cull(&screen, 3, 5);
+        overlay.cull(&screen, 2, 5);
         overlay.sync_cursor_from_confirmed(screen.confirmed_cursor());
 
         // Key assertion (WR-01 / BUG-E): epoch_start_col must still be 2 (true prompt start).
