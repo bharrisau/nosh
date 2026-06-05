@@ -839,12 +839,19 @@ async fn run_pump(
         Duration::from_secs(1),
     );
     loss_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Latency instrumentation (D-17-02a): map from prediction_epoch → enqueue Instant.
-    // Used to measure predicted-keystroke-time vs confirming-datagram-time for
-    // Phase 17 Windows predictive echo validation. Logged at debug level under
-    // target "nosh::predict" — no character content is emitted (T-15-08).
+    // D-04 latency instrumentation (rework of D-17-02a): map from per-keystroke monotonic
+    // counter (keystroke_id) → enqueue Instant. Records one timestamp per forwarded keystroke
+    // batch so the datagram arm can compute per-keystroke RTT (predicted→confirmed), not the
+    // coarser epoch-confirmation time that included user think-time.
+    // Key: u64 keystroke_id (incremented per forwarded keystroke in the stdin arm).
+    // Value: Instant at which the keystroke batch was handed to the predictor + forwarded.
+    // The retain() prune on the confirm side prevents unbounded growth (D-04 invariant).
+    // Logged at debug level under target "nosh::predict" — no character content (T-15-08).
     let mut predict_enqueue_times: std::collections::HashMap<u64, Instant> =
         std::collections::HashMap::new();
+    // Monotonic counter incremented once per forwarded keystroke batch.
+    // Used as the map key so per-keystroke RTT can be measured independently of epoch grouping.
+    let mut keystroke_id: u64 = 0;
 
     // BUG-G (Windows-specific): ConPTY startup size-sync lag.
     //
@@ -1008,26 +1015,41 @@ async fn run_pump(
                                 // CR-01: sync predicted cursor from confirmed cursor so that new
                                 // predictions land on the correct row (not the hard-zeroed row 0).
                                 predictor.sync_cursor_from_confirmed(screen.confirmed_cursor());
-                                // D-17-02a latency instrumentation: when cull advances confirmed_epoch,
-                                // one or more predictions were confirmed. Look up the enqueue time
-                                // for any epoch that was just confirmed and log the latency.
-                                // No character content is logged — only timing + epoch (T-15-08).
-                                // Phase 17 (Windows validation) will use this to verify prediction
-                                // latency on high-RTT links (D-17-02a deferred dependency).
+                                // D-04 latency instrumentation: when cull advances confirmed_epoch,
+                                // one or more keystroke batches were confirmed. Drain all entries
+                                // from predict_enqueue_times whose keystroke_id is at or below
+                                // the current watermark (keystroke_id at confirm time), log per-
+                                // keystroke RTT (predicted→confirmed latency_ms) for each.
+                                // No character content is logged — only timing + ids (T-15-08).
                                 let epoch_after_cull = predictor.confirmed_epoch();
                                 if epoch_after_cull > epoch_before_cull {
-                                    if let Some(enqueued_at) = predict_enqueue_times.remove(&epoch_after_cull) {
-                                        let latency_ms = enqueued_at.elapsed().as_millis() as u64;
-                                        tracing::debug!(
-                                            target: "nosh::predict",
-                                            event = "confirm",
-                                            epoch = epoch_after_cull,
-                                            latency_ms,
-                                            "prediction confirmed"
-                                        );
+                                    // All keystrokes enqueued up to the current keystroke_id
+                                    // counter are confirmed by this epoch advance. Drain them in
+                                    // order and log per-keystroke latency.
+                                    let confirmed_watermark = keystroke_id;
+                                    let mut ids_to_drain: Vec<u64> = predict_enqueue_times
+                                        .keys()
+                                        .copied()
+                                        .filter(|&k| k <= confirmed_watermark)
+                                        .collect();
+                                    ids_to_drain.sort_unstable();
+                                    for kid in ids_to_drain {
+                                        if let Some(enqueued_at) = predict_enqueue_times.remove(&kid) {
+                                            let latency_ms = enqueued_at.elapsed().as_millis() as u64;
+                                            tracing::debug!(
+                                                target: "nosh::predict",
+                                                event = "confirm",
+                                                keystroke_id = kid,
+                                                epoch = epoch_after_cull,
+                                                latency_ms,
+                                                "prediction confirmed"
+                                            );
+                                        }
                                     }
-                                    // Prune stale enqueue entries (epochs that were reset/culled).
-                                    predict_enqueue_times.retain(|&k, _| k > epoch_after_cull);
+                                    // Prune any remaining stale entries (keystroke_ids from epochs
+                                    // that were reset/culled without confirming). Keep only entries
+                                    // above the watermark that may still be in-flight.
+                                    predict_enqueue_times.retain(|&k, _| k > confirmed_watermark);
                                 }
                                 // Pitfall 1: render_with_predictor requires std::io::Write (NOT
                                 // tokio::io::AsyncWrite). Buffer to Vec<u8>, then async flush.
@@ -1160,14 +1182,18 @@ async fn run_pump(
                             // slice — byte-identical keystrokes still flow to server via send_input).
                             predictor.on_input(&result.bytes_to_forward, &screen);
 
-                            // D-17-02a latency instrumentation: record enqueue time for the
-                            // current prediction epoch so the datagram arm can measure confirmation
-                            // latency when this epoch is confirmed. Only timing data logged (T-15-08).
+                            // D-04 latency instrumentation: record enqueue time per forwarded
+                            // keystroke batch (keystroke_id), not per prediction epoch.
+                            // This gives per-keystroke RTT (predicted→confirmed) rather than
+                            // epoch-confirmation time which included user think-time. Only timing
+                            // data logged — no character content (T-15-08).
+                            keystroke_id += 1;
+                            predict_enqueue_times.insert(keystroke_id, Instant::now());
                             let epoch_required = predictor.prediction_epoch();
-                            predict_enqueue_times.entry(epoch_required).or_insert_with(Instant::now);
                             tracing::debug!(
                                 target: "nosh::predict",
                                 event = "predict",
+                                keystroke_id,
                                 epoch_required,
                                 "keystroke predicted"
                             );
