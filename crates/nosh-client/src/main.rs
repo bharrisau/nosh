@@ -1182,6 +1182,21 @@ async fn run_pump(
                             // slice — byte-identical keystrokes still flow to server via send_input).
                             predictor.on_input(&result.bytes_to_forward, &screen);
 
+                            // WR-02 fix: prune stale predict_enqueue_times entries on
+                            // EpochReset / BulkSuppressed (signalled by pending becoming empty).
+                            // When the predictor resets, all in-flight keystroke batches will
+                            // never be confirmed — their enqueue_times are stale. Pruning here
+                            // prevents unbounded growth during noecho sessions (stty -echo /
+                            // read -s / sudo) where confirmed_epoch never advances and the
+                            // datagram-arm prune block never runs.
+                            // Pruning up to the CURRENT keystroke_id (pre-increment) retains
+                            // entries from the batch just handed to on_input (which may be a
+                            // printable char that survives; keystroke_id+1 will be inserted below).
+                            if predictor.pending_len() == 0 {
+                                let watermark = keystroke_id;
+                                predict_enqueue_times.retain(|&k, _| k > watermark);
+                            }
+
                             // D-04 latency instrumentation: record enqueue time per forwarded
                             // keystroke batch (keystroke_id), not per prediction epoch.
                             // This gives per-keystroke RTT (predicted→confirmed) rather than
