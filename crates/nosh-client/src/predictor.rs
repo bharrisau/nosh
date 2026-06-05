@@ -333,10 +333,30 @@ impl PredictionOverlay {
         let pending_before = self.pending.len(); // D-03: capture before classify/match
         let action = classify_input(bytes);
         let action_kind = action_kind_tag(&action); // D-03: tag before match (Option b — avoids moving action)
+        // WR-02: D-03 instrumentation macro — emit one trace event per on_input call on
+        // ALL exit paths, including early returns. Using a macro lets us capture the
+        // borrow-checked locals (bytes, action_kind, pending_before) at each call site
+        // without a closure (which would re-borrow self). T-15-08: no char/byte content.
+        macro_rules! trace_exit {
+            () => {
+                tracing::debug!(
+                    target: "nosh::predict",
+                    event = "on_input",
+                    batch_len = bytes.len(),
+                    action = action_kind,
+                    pending_before,
+                    pending_after = self.pending.len(),
+                    predictions_dropped = pending_before.saturating_sub(self.pending.len()),
+                    pred_row = self.predicted_cursor.row,
+                    pred_col = self.predicted_cursor.col,
+                );
+            };
+        }
         match action {
             InputAction::PredictChar { ch, col_width } => {
                 if self.in_bracketed_paste {
                     // Suppress all cell predictions during bracketed paste.
+                    trace_exit!();
                     return;
                 }
                 let col = self.predicted_cursor.col;
@@ -344,6 +364,7 @@ impl PredictionOverlay {
                 // Pitfall 6: wide char at right edge → become_tentative instead of predicting.
                 if col.saturating_add(col_width) > self.term_cols {
                     self.become_tentative();
+                    trace_exit!();
                     return;
                 }
                 // BUG-D: noecho suppression is provided by the tentative-epoch machinery
@@ -440,7 +461,9 @@ impl PredictionOverlay {
                 // The noecho tentative machinery handles suppression structurally (no explicit flag).
                 self.pending.clear();
                 self.become_tentative();
-                self.cursor_motion_pending = false;
+                // IN-01: removed dead write `cursor_motion_pending = false` — unconditionally
+                // overwritten below with `true`; the intermediate `false` state is never
+                // observed by any caller (no sync_cursor_from_confirmed call between them).
                 self.needs_epoch_start_sync = true;
                 // Clamp backspace at predicted col 0 (the enter predicts a fresh line start).
                 // sync_cursor_from_confirmed will correct this once the server confirms.
@@ -469,7 +492,14 @@ impl PredictionOverlay {
                     self.reset();
                 } else {
                     self.become_tentative();
-                    self.needs_epoch_start_sync = true;
+                    // WR-01: Do NOT set needs_epoch_start_sync here. BulkSuppressed fires
+                    // mid-epoch (during active typing at the current prompt), NOT at a prompt
+                    // boundary. Setting the flag here would cause the next
+                    // sync_cursor_from_confirmed call to overwrite epoch_start_col with
+                    // whatever mid-line column the confirmed cursor lands on after the burst —
+                    // misplacing the backspace/cursor-left clamp floor (BUG-E reintroduced).
+                    // The existing epoch_start_col (captured at the true prompt boundary by
+                    // reset() → sync_cursor_from_confirmed) remains valid and must be preserved.
                 }
             }
             InputAction::BracketedPasteStart => {
@@ -491,6 +521,7 @@ impl PredictionOverlay {
                 // The wide-char right-edge guard (become_tentative) is applied per char.
                 // PredictBackspace/CursorLeft/EpochReset arms are NOT affected.
                 if self.in_bracketed_paste {
+                    trace_exit!();
                     return;
                 }
                 for (ch, col_width) in chars {
@@ -501,6 +532,7 @@ impl PredictionOverlay {
                     // still use this guard for safety.
                     if col.saturating_add(col_width) > self.term_cols {
                         self.become_tentative();
+                        trace_exit!();
                         return;
                     }
                     let epoch_required = screen.last_applied_epoch() + 1;
@@ -518,19 +550,10 @@ impl PredictionOverlay {
                 }
             }
         }
-        // D-03 decision-trace: one debug event per on_input call, after the match.
-        // No character content logged (T-15-08 — action_kind_tag omits ch/batch content).
-        tracing::debug!(
-            target: "nosh::predict",
-            event = "on_input",
-            batch_len = bytes.len(),
-            action = action_kind,
-            pending_before,
-            pending_after = self.pending.len(),
-            predictions_dropped = pending_before.saturating_sub(self.pending.len()),
-            pred_row = self.predicted_cursor.row,
-            pred_col = self.predicted_cursor.col,
-        );
+        // D-03 decision-trace: fires on the normal (non-early-return) exit path.
+        // WR-02: early-return paths now call trace_exit!() before returning so that
+        // every on_input call produces exactly one trace event (T-15-08: no char/byte content).
+        trace_exit!();
     }
 
     /// Confirm or cull predictions against the latest confirmed grid state.
@@ -2542,6 +2565,101 @@ mod tests {
             1,
             "D-03: BulkSuppressed with pending>0 must preserve existing predictions \
              (become_tentative, not reset+clear)"
+        );
+    }
+
+    /// WR-01 regression: mid-epoch BulkSuppressed must NOT tighten the epoch_start_col
+    /// (backspace/cursor-left clamp floor) to a mid-line confirmed column.
+    ///
+    /// Scenario: user types "abc" at a prompt starting at col 2 → epoch_start_col = 2,
+    /// predicted cursor col = 5. A key-repeat burst with an escape byte fires →
+    /// BulkSuppressed with pending > 0 → become_tentative (preserves predictions).
+    /// Server confirms "abc" → sync_cursor_from_confirmed fires with confirmed col = 5.
+    ///
+    /// BUG (before fix): needs_epoch_start_sync was set to true in the become_tentative
+    /// branch → sync_cursor_from_confirmed updated epoch_start_col to 5. Backspace could
+    /// no longer return to col 2 (the true prompt start) — BUG-E reintroduced mid-epoch.
+    ///
+    /// FIX (after fix): needs_epoch_start_sync is NOT set in the become_tentative branch.
+    /// The existing epoch_start_col (2) is preserved. Backspace still clamps at col 2.
+    #[test]
+    fn wr01_mid_epoch_bulk_suppressed_does_not_tighten_epoch_start_col() {
+        // FAIL BEFORE FIX: after BulkSuppressed (pending>0) + confirming sync, epoch_start_col
+        //   is updated to 5 (mid-line confirmed column) → backspace stops at col 5, not col 2.
+        // PASS AFTER FIX:  epoch_start_col remains 2 (true prompt boundary) → backspace
+        //   clamps at col 2. (WR-01 / BUG-E assertion)
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Step 1: establish epoch_start_col = 2 (prompt "$ " at col 2).
+        overlay.reset(); // sets needs_epoch_start_sync = true
+        let diff_prompt = make_diff_with_char(1, 0, 2, ' ');
+        screen.apply(&diff_prompt);
+        overlay.cull(&screen, 1, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // epoch_start_col = 2
+        assert_eq!(
+            overlay.epoch_start_col, 2,
+            "WR-01 setup: epoch_start_col must be 2 after prompt sync"
+        );
+
+        // Step 2: type "abc" — enqueues 3 predictions; cursor advances to col 5.
+        overlay.on_input(b"a", &screen);
+        overlay.on_input(b"b", &screen);
+        overlay.on_input(b"c", &screen);
+        assert_eq!(overlay.pending.len(), 3, "WR-01 setup: 3 predictions in pending");
+        assert_eq!(overlay.predicted_cursor.col, 5, "WR-01 setup: cursor at col 5");
+
+        // Step 3: mid-epoch BulkSuppressed (pending > 0) — key-repeat burst with escape byte.
+        // This triggers become_tentative (not reset); pending predictions survive.
+        overlay.on_input(b"ab\x1bcd", &screen);
+        assert_eq!(
+            overlay.pending.len(),
+            3,
+            "WR-01: BulkSuppressed with pending>0 must preserve predictions (become_tentative)"
+        );
+
+        // Step 4: server confirms "abc" → sync_cursor_from_confirmed fires with confirmed col=5.
+        // With the bug: needs_epoch_start_sync was true → epoch_start_col updated to 5.
+        // With the fix: needs_epoch_start_sync is still false → epoch_start_col stays at 2.
+        // Note: pending is NOT empty at this point (predictions survived BulkSuppressed),
+        // so sync_cursor_from_confirmed won't fire the epoch_start_col capture path.
+        // Simulate cull confirming the predictions first, then sync.
+        let diff_confirm = make_diff_with_char(2, 0, 2, 'a');
+        screen.apply(&diff_confirm);
+        overlay.cull(&screen, 2, 5); // confirms 'a' at (0,2); remaining predictions still pending
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor());
+
+        // After cull empties pending fully, try one more sync at the mid-line confirmed col 5.
+        // Force-empty pending to simulate the rest of the confirming datagrams.
+        overlay.pending.clear();
+        // Now sync fires with confirmed col 5 (the mid-line position after "abc").
+        let diff_mid = make_diff_with_char(3, 0, 5, ' ');
+        screen.apply(&diff_mid);
+        overlay.cull(&screen, 3, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor());
+
+        // Key assertion (WR-01 / BUG-E): epoch_start_col must still be 2 (true prompt start).
+        // Before the fix, it would have been updated to 5 by the sync after BulkSuppressed.
+        assert_eq!(
+            overlay.epoch_start_col, 2,
+            "WR-01 / BUG-E: epoch_start_col must remain 2 (true prompt boundary) after \
+             mid-epoch BulkSuppressed + confirming sync. Setting needs_epoch_start_sync \
+             in the become_tentative branch incorrectly tightens the clamp floor to the \
+             mid-line confirmed column, preventing backspace from returning to the prompt start."
+        );
+
+        // Also verify: backspace from the current cursor position cannot retreat past col 2.
+        // Re-type some chars from col 5 → cursor at 5; backspace 20 times must stop at col 2.
+        overlay.on_input(b"a", &screen);
+        overlay.on_input(b"b", &screen);
+        for _ in 0..20 {
+            overlay.on_input(&[0x7f], &screen); // backspace
+        }
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            2,
+            "WR-01 / BUG-E: backspace must clamp at epoch_start_col (2) after mid-epoch \
+             BulkSuppressed, not at the wrongly-captured mid-line col 5"
         );
     }
 }
