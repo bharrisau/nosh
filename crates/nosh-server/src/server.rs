@@ -1135,7 +1135,7 @@ async fn run_reattach_session(
     // CR-01 fix: bounded per-epoch sent-snapshot store (same as run_session).
     let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
-    let session_end: SessionEnd = loop {
+    let session_end: SessionEnd = 'pump: loop {
         tokio::select! {
             chunk = out_rx.recv() => {
                 match chunk {
@@ -1186,8 +1186,9 @@ async fn run_reattach_session(
                     }
                 }
             }
-            // SYNC-03: diff-interval tick — same arm as run_session.
-            // D-13-03: gated by resume_complete (false until replay loop above completes).
+            // SYNC-03: diff-interval tick — same burst-loop arm as run_session.
+            // D-01: bounded burst; see run_session arm for full commentary.
+            // D-13-03: gated by resume_complete (true after replay completes above).
             _ = diff_interval.tick() => {
                 if !resume_complete {
                     continue;
@@ -1196,29 +1197,44 @@ async fn run_reattach_session(
                     Some(c) if c >= MIN_CAP => c,
                     _ => continue,
                 };
-                let deferred = std::mem::take(&mut pending_deferred);
-                if let Some(result) = build_state_diff(
-                    &slot,
-                    &mut current_epoch,
-                    last_acked_epoch,
-                    &last_acked_snapshot,
-                    &last_sent_snapshot,
-                    deferred,
-                    cap,
-                ) {
-                    // CR-01 fix: store sent snapshot keyed by epoch (same as run_session).
-                    epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
-                    if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
-                        epoch_snapshots.pop_front();
+                loop {
+                    // Budget gate: stop if Layer-1 application queue has less than
+                    // one datagram's worth of free space.
+                    if conn.datagram_send_buffer_space() < cap {
+                        break;
                     }
-                    last_sent_snapshot = result.sent_cells;
-                    pending_deferred = result.deferred;
-                    if let Err(e) = conn.send_datagram(result.payload) {
-                        use quinn::SendDatagramError::*;
-                        match e {
-                            TooLarge => {}
-                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
-                            ConnectionLost(_) => break SessionEnd::TransportLost,
+                    let deferred = std::mem::take(&mut pending_deferred);
+                    match build_state_diff(
+                        &slot,
+                        &mut current_epoch,
+                        last_acked_epoch,
+                        &last_acked_snapshot,
+                        &last_sent_snapshot,
+                        deferred,
+                        cap,
+                    ) {
+                        None => break,
+                        Some(result) => {
+                            // CR-01 fix: store sent snapshot keyed by epoch (same as run_session).
+                            epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
+                            if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
+                                epoch_snapshots.pop_front();
+                            }
+                            // Pitfall 2: update last_sent_snapshot inside the loop.
+                            last_sent_snapshot = result.sent_cells;
+                            let no_more = result.deferred.is_empty();
+                            pending_deferred = result.deferred;
+                            if let Err(e) = conn.send_datagram(result.payload) {
+                                use quinn::SendDatagramError::*;
+                                match e {
+                                    TooLarge => {}
+                                    UnsupportedByPeer | Disabled => break 'pump SessionEnd::TransportLost,
+                                    ConnectionLost(_) => break 'pump SessionEnd::TransportLost,
+                                }
+                            }
+                            if no_more {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1369,6 +1385,133 @@ fn clean_exit(e: quinn::ConnectionError) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // ── Shared test helpers ────────────────────────────────────────────────────
+
+    fn have_sh() -> bool {
+        std::path::Path::new("/bin/sh").exists()
+    }
+
+    fn test_key(seed: u8) -> nosh_auth::NoshPublicKey {
+        nosh_auth::NoshPublicKey::from_raw([seed; 32])
+    }
+
+    fn open_sh_slot(seed: u8) -> Arc<crate::registry::SessionSlot> {
+        let passwd = crate::session::lookup_self(Some("/bin/sh"));
+        let (sess, _reader, _writer) =
+            crate::session::open(&passwd, "xterm", 80, 24, &[], test_key(seed))
+                .expect("open /bin/sh");
+        crate::registry::SessionSlot::new(sess)
+    }
+
+    // ── D-01: burst loop behavioural drain test ───────────────────────────────
+
+    /// D-01: a full-screen diff that overflows one MTU-capped datagram is fully
+    /// drained in a single logical burst tick when the budget (datagram_send_buffer_space)
+    /// allows.
+    ///
+    /// Before the fix, the single-datagram-per-tick policy would produce one datagram
+    /// and leave the rest deferred — requiring N ticks × RTT to drain a full-screen
+    /// repaint.
+    /// After the fix, the burst loop calls build_state_diff repeatedly while budget
+    /// allows, draining pending_deferred to empty within one logical tick.
+    ///
+    /// Test design: rather than feeding a full-screen diff (which requires an empty
+    /// acked baseline and creates a non-terminating loop), we pre-build a synthetic
+    /// `pending_deferred` pile (many DiffRun entries) and set last_acked_snapshot =
+    /// last_sent_snapshot = current_grid, so fresh_runs = []. The burst loop then
+    /// processes only the deferred pile, which shrinks monotonically toward empty.
+    #[test]
+    fn burst_drains_large_diff_in_one_tick() {
+        // FAIL BEFORE FIX: with a single-datagram-per-tick policy, one call to
+        //   build_state_diff returns Some with non-empty deferred; the loop in the old
+        //   code does not iterate, leaving pending_deferred non-empty.
+        // PASS AFTER FIX:  the burst loop iterates until pending_deferred is empty,
+        //   producing more than one datagram payload.
+        if !have_sh() {
+            eprintln!("skipping burst_drains_large_diff_in_one_tick: /bin/sh unavailable");
+            return;
+        }
+
+        let slot = open_sh_slot(0xB1);
+
+        // Get the current terminal grid so we can set acked = sent = current.
+        // This means compute_diff_runs(current, last_acked) = [] (no fresh diff) —
+        // only the synthetic pending_deferred pile will be processed each iteration,
+        // guaranteeing termination.
+        let current_grid: Vec<Vec<Cell>> = slot.with_terminal_state(|ts| {
+            ts.viewport_rows().map(|(_, row)| row.to_vec()).collect()
+        });
+
+        // Build a large synthetic pending_deferred pile: 100 DiffRun entries,
+        // each representing a single-character run on a different cell.
+        // At cap=50 bytes each encoded run is ~15–20 bytes (row+col+style+fg+bg+1char),
+        // so 100 runs require at least 5–6 datagram calls to encode.
+        let pending_deferred_initial: Vec<DiffRun> = (0u16..100)
+            .map(|i| nosh_proto::DiffRun {
+                row: i % 24,
+                start_col: i % 80,
+                style: nosh_proto::CellStyle(0),
+                fg: None,
+                bg: None,
+                chars: "X".to_string(),
+            })
+            .collect();
+
+        // Use a small cap (50 bytes) to force multiple burst iterations.
+        // MIN_CAP = 8; cap=50 is large enough to encode a few runs per call.
+        let cap: usize = 50;
+
+        let mut current_epoch: u64 = 1; // non-zero so acked < sent is possible
+        let last_acked_epoch: u64 = 0;   // acked behind sent → epoch check passes
+        let last_acked_snapshot = current_grid.clone(); // acked = current → fresh_runs = []
+        let mut last_sent_snapshot = current_grid.clone();
+        let mut pending_deferred = pending_deferred_initial;
+
+        let mut payloads_produced: usize = 0;
+
+        loop {
+            // Budget always available in test (no real connection to query).
+            let deferred = std::mem::take(&mut pending_deferred);
+            match build_state_diff(
+                &slot,
+                &mut current_epoch,
+                last_acked_epoch,
+                &last_acked_snapshot,
+                &last_sent_snapshot,
+                deferred,
+                cap,
+            ) {
+                None => break,
+                Some(result) => {
+                    // Pitfall 2: advance last_sent_snapshot inside the loop.
+                    last_sent_snapshot = result.sent_cells;
+                    let no_more = result.deferred.is_empty();
+                    pending_deferred = result.deferred;
+                    payloads_produced += 1;
+                    if no_more {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Signal the shell before dropping the slot.
+        slot.sighup();
+
+        assert!(
+            pending_deferred.is_empty(),
+            "D-01: burst loop must drain pending_deferred to empty in one logical tick \
+             (repaint fully sent, not dribbled)"
+        );
+        assert!(
+            payloads_produced > 1,
+            "D-01: 100-run deferred diff at cap={cap} must require >1 datagram payload \
+             (got {payloads_produced}) — burst loop must iterate, not single-shot",
+        );
+    }
+
     /// CLOSE_AUTH defensive branch: verify the building blocks that
     /// `extract_peer_identity` delegates to correctly return `None` for
     /// non-Ed25519 / malformed SPKI bytes, triggering the CLOSE_AUTH path.
