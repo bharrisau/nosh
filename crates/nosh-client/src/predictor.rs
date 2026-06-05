@@ -1740,6 +1740,172 @@ mod tests {
         );
     }
 
+    /// BUG-E regression: backspace must clamp at the epoch-start column, not col 0.
+    ///
+    /// Before the fix, `PredictBackspace` clamped at col 0 — the predictor had no
+    /// knowledge of the prompt boundary. After the fix, it clamps at the epoch-start
+    /// column recorded by `sync_cursor_from_confirmed` at the start of each fresh input
+    /// epoch.
+    #[test]
+    fn bug_e_backspace_clamps_at_epoch_start_col() {
+        // FAIL BEFORE FIX: cursor walks past col 5 (epoch start) toward col 0.
+        // PASS AFTER FIX:  cursor stops at col 5.
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Server confirms cursor at col 5 (after a prompt "user> ").
+        let diff = make_diff_with_char(1, 0, 5, ' ');
+        screen.apply(&diff);
+        overlay.cull(&screen, 1, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // epoch_start_col = 5
+
+        // Type "abc" then backspace 10 times — cursor must not go below col 5.
+        overlay.on_input(b"a", &screen);
+        overlay.on_input(b"b", &screen);
+        overlay.on_input(b"c", &screen);
+        for _ in 0..10 {
+            overlay.on_input(&[0x7f], &screen); // backspace
+        }
+
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            5,
+            "BUG-E: backspace must clamp at epoch-start col 5, not walk to col 0"
+        );
+    }
+
+    /// BUG-E regression: cursor-left must clamp at the epoch-start column, not col 0.
+    ///
+    /// Before the fix, `PredictCursorLeft` clamped at col 0 — the predictor had no
+    /// knowledge of the prompt boundary. After the fix, it clamps at the epoch-start
+    /// column recorded by `sync_cursor_from_confirmed` at the start of each fresh input
+    /// epoch.
+    #[test]
+    fn bug_e_cursor_left_clamps_at_epoch_start_col() {
+        // FAIL BEFORE FIX: cursor-left walks past col 5 (epoch start) toward col 0.
+        // PASS AFTER FIX:  cursor-left stops at col 5.
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Server confirms cursor at col 5 (after a prompt "user> ").
+        let diff = make_diff_with_char(1, 0, 5, ' ');
+        screen.apply(&diff);
+        overlay.cull(&screen, 1, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // epoch_start_col = 5
+
+        // Type "abc" then cursor-left (CSI D) 10 times — cursor must not go below col 5.
+        overlay.on_input(b"a", &screen);
+        overlay.on_input(b"b", &screen);
+        overlay.on_input(b"c", &screen);
+        for _ in 0..10 {
+            overlay.on_input(b"\x1b[D", &screen); // cursor left
+        }
+
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            5,
+            "BUG-E: cursor-left must clamp at epoch-start col 5, not walk to col 0"
+        );
+    }
+
+    /// BUG-F regression: after a noecho epoch (EpochReset), the predicted caret must
+    /// be synced from the confirmed cursor so the post-`read -s` Enter advances the line.
+    ///
+    /// Before the fix, `EpochReset` called `reset()` which did not update
+    /// `predicted_cursor`, leaving it at a stale position. After the fix, `EpochReset`
+    /// calls `reset_with_cursor(screen.confirmed_cursor())` which forcibly syncs the caret.
+    #[test]
+    fn bug_f_enter_after_noecho_syncs_caret_from_confirmed() {
+        // FAIL BEFORE FIX: predicted_cursor stays at stale col after EpochReset.
+        // PASS AFTER FIX:  predicted_cursor matches the confirmed cursor after EpochReset.
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Server confirms cursor at row 1, col 10 (e.g. after `read -s` prompt).
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 1, col: 10 },
+            runs: vec![],
+        };
+        screen.apply(&diff);
+        overlay.cull(&screen, 1, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor());
+
+        // Simulate noecho typing — moves predicted_cursor to a stale position.
+        // (These won't be visible due to tentative epoch, but they do advance the caret.)
+        overlay.on_input(b"\r", &screen); // EpochReset first (initial state)
+
+        // Manually stale the predicted cursor to simulate a diverged position.
+        overlay.predicted_cursor = CursorPos { row: 0, col: 3 };
+
+        // Server advances cursor (e.g. after `read -s` completes, Enter was pressed).
+        let diff2 = StateDiff {
+            epoch: 2,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 2, col: 0 },
+            runs: vec![],
+        };
+        screen.apply(&diff2);
+        overlay.cull(&screen, 2, 5);
+
+        // Simulate user pressing Enter at end of read -s prompt (EpochReset).
+        overlay.on_input(b"\r", &screen);
+
+        // After EpochReset, predicted_cursor must be synced from the confirmed cursor.
+        assert_eq!(
+            overlay.predicted_cursor.row,
+            screen.confirmed_cursor().row,
+            "BUG-F: after EpochReset, predicted_cursor.row must match confirmed cursor row"
+        );
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            screen.confirmed_cursor().col,
+            "BUG-F: after EpochReset, predicted_cursor.col must match confirmed cursor col"
+        );
+    }
+
+    /// BUG-F: BulkSuppressed must NOT sync the predicted caret from the confirmed cursor.
+    ///
+    /// Before the fix, EpochReset and BulkSuppressed shared the same arm. After splitting
+    /// them, BulkSuppressed must still call plain `reset()` (no cursor sync), because
+    /// there is no reliable confirmed cursor available at that point.
+    #[test]
+    fn bug_f_bulk_suppressed_does_not_sync_caret() {
+        // FAIL BEFORE FIX: (n/a — this verifies BulkSuppressed does NOT sync).
+        // PASS AFTER FIX:  BulkSuppressed leaves predicted_cursor unchanged (no force-sync).
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Establish a confirmed cursor at col 10.
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 10 },
+            runs: vec![],
+        };
+        screen.apply(&diff);
+        overlay.cull(&screen, 1, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // predicted at col 10
+
+        // Move predicted cursor to col 3 (simulating some typing and cursor motion).
+        overlay.predicted_cursor = CursorPos { row: 0, col: 3 };
+
+        // Trigger BulkSuppressed — must NOT sync predicted_cursor to the confirmed col 10.
+        // "hello" = 5 bytes > BULK_SUPPRESS_THRESHOLD (4), classified as BulkSuppressed.
+        overlay.on_input(b"hello", &screen);
+
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            3,
+            "BUG-F: BulkSuppressed must NOT sync predicted_cursor from confirmed cursor \
+             (predicted_cursor must remain at col 3, not snap to confirmed col 10)"
+        );
+    }
+
     /// CR-01 / confirmed_cursor() getter: screen.confirmed_cursor() returns correct position.
     #[test]
     fn screen_confirmed_cursor_getter_returns_correct_position() {
