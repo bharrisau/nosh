@@ -594,7 +594,7 @@ async fn run_session(
     // the new last_acked_snapshot (not the current grid, which may have advanced).
     let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
-    let session_end: SessionEnd = loop {
+    let session_end: SessionEnd = 'pump: loop {
         tokio::select! {
             // Shell exited: capture the code and tell the client.
             res = &mut wait_task => {
@@ -670,8 +670,12 @@ async fn run_session(
                     last_seen_addr = cur;
                 }
             }
-            // SYNC-03: diff-interval tick — emit one coalesced StateDiff datagram.
-            // D-13-02: one diff per tick, not per PTY chunk.
+            // SYNC-03: diff-interval tick — emit coalesced StateDiff datagrams.
+            // D-01: burst the full deferred diff per tick as multiple MTU-capped
+            // datagrams, bounded by datagram_send_buffer_space() so a large repaint
+            // cannot flood the path. Loop until no deferred runs remain or Layer-1
+            // queue space is exhausted.
+            // D-13-02: one diff tick, not per PTY chunk.
             // D-13-03: gate on resume_complete (always true for run_session).
             _ = diff_interval.tick() => {
                 if !resume_complete {
@@ -681,32 +685,51 @@ async fn run_session(
                     Some(c) if c >= MIN_CAP => c,
                     _ => continue, // datagrams not negotiated or cap too small — skip silently
                 };
-                let deferred = std::mem::take(&mut pending_deferred);
-                if let Some(result) = build_state_diff(
-                    &slot,
-                    &mut current_epoch,
-                    last_acked_epoch,
-                    &last_acked_snapshot,
-                    &last_sent_snapshot,
-                    deferred,
-                    cap,
-                ) {
-                    // CR-01 fix: store the sent snapshot keyed by epoch BEFORE
-                    // calling send_datagram. On ack receipt we look up this
-                    // snapshot rather than snapshotting the current (potentially
-                    // advanced) grid.
-                    epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
-                    if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
-                        epoch_snapshots.pop_front();
+                loop {
+                    // Budget gate: stop if Layer-1 application queue has less than
+                    // one datagram's worth of free space. This prevents bursting from
+                    // displacing already-queued datagrams under congestion.
+                    // datagram_send_buffer_space() is confirmed public on quinn::Connection 0.11.9.
+                    if conn.datagram_send_buffer_space() < cap {
+                        break;
                     }
-                    last_sent_snapshot = result.sent_cells;
-                    pending_deferred = result.deferred;
-                    if let Err(e) = conn.send_datagram(result.payload) {
-                        use quinn::SendDatagramError::*;
-                        match e {
-                            TooLarge => {} // encode_datagram guarantees this is unreachable; treat as skip
-                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
-                            ConnectionLost(_) => break SessionEnd::TransportLost,
+                    let deferred = std::mem::take(&mut pending_deferred);
+                    match build_state_diff(
+                        &slot,
+                        &mut current_epoch,
+                        last_acked_epoch,
+                        &last_acked_snapshot,
+                        &last_sent_snapshot,
+                        deferred,
+                        cap,
+                    ) {
+                        None => break,
+                        Some(result) => {
+                            // CR-01 fix: store the sent snapshot keyed by epoch BEFORE
+                            // calling send_datagram. On ack receipt we look up this
+                            // snapshot rather than snapshotting the current (potentially
+                            // advanced) grid.
+                            epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
+                            if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
+                                epoch_snapshots.pop_front();
+                            }
+                            // Pitfall 2: update last_sent_snapshot INSIDE the loop so
+                            // the next build_state_diff call sees the correct baseline
+                            // and does not spuriously increment current_epoch.
+                            last_sent_snapshot = result.sent_cells;
+                            let no_more = result.deferred.is_empty();
+                            pending_deferred = result.deferred;
+                            if let Err(e) = conn.send_datagram(result.payload) {
+                                use quinn::SendDatagramError::*;
+                                match e {
+                                    TooLarge => {} // encode_datagram guarantees this is unreachable; treat as skip
+                                    UnsupportedByPeer | Disabled => break 'pump SessionEnd::TransportLost,
+                                    ConnectionLost(_) => break 'pump SessionEnd::TransportLost,
+                                }
+                            }
+                            if no_more {
+                                break;
+                            }
                         }
                     }
                 }
