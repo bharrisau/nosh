@@ -329,25 +329,13 @@ fn build_state_diff(
         *current_epoch += 1;
     }
 
-    // Deferred runs from a prior chunk go FIRST so encode_datagram
+    // Compute changed runs vs the last-acked baseline.
+    let fresh_runs = compute_diff_runs(&cells, last_acked_snapshot);
+
+    // Deferred runs from the previous tick go FIRST so encode_datagram
     // re-prioritises cursor-proximate content (Anti-Pattern: deferred FIRST).
-    //
-    // BURST-DRAIN FIX (999.4 D-01): only compute fresh runs when NOT draining a
-    // prior chunk. `fresh_runs` is diffed against `last_acked_snapshot`, which does
-    // NOT advance within a single burst (epoch-acks are processed in a different
-    // `select!` arm that cannot run while the synchronous burst loop holds the task).
-    // If we re-merged `fresh_runs` on every burst iteration, the deferred queue would
-    // be refilled with the full diff each time and never drain — `no_more` would never
-    // be true and, on a fast-draining (loopback) path where datagram_send_buffer_space()
-    // stays >= cap, the burst loop would spin forever and starve the connection driver.
-    // When draining (pending_deferred non-empty), the deferred runs already represent
-    // the remaining diff for this tick, so encode them alone. Fresh runs are recomputed
-    // on the next tick once deferred is empty, preserving the acked-baseline
-    // resend-until-acked loss tolerance across ticks.
     let mut all_runs: Vec<DiffRun> = pending_deferred;
-    if all_runs.is_empty() {
-        all_runs = compute_diff_runs(&cells, last_acked_snapshot);
-    }
+    all_runs.extend(fresh_runs);
 
     // Pitfall 3: cap the deferred queue to MAX_RUNS to prevent unbounded growth.
     // WR-03 fix: truncate from the END (drop least-cursor-proximate runs) rather
@@ -606,7 +594,7 @@ async fn run_session(
     // the new last_acked_snapshot (not the current grid, which may have advanced).
     let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
-    let session_end: SessionEnd = 'pump: loop {
+    let session_end: SessionEnd = loop {
         tokio::select! {
             // Shell exited: capture the code and tell the client.
             res = &mut wait_task => {
@@ -682,12 +670,8 @@ async fn run_session(
                     last_seen_addr = cur;
                 }
             }
-            // SYNC-03: diff-interval tick — emit coalesced StateDiff datagrams.
-            // D-01: burst the full deferred diff per tick as multiple MTU-capped
-            // datagrams, bounded by datagram_send_buffer_space() so a large repaint
-            // cannot flood the path. Loop until no deferred runs remain or Layer-1
-            // queue space is exhausted.
-            // D-13-02: one diff tick, not per PTY chunk.
+            // SYNC-03: diff-interval tick — emit one coalesced StateDiff datagram.
+            // D-13-02: one diff per tick, not per PTY chunk.
             // D-13-03: gate on resume_complete (always true for run_session).
             _ = diff_interval.tick() => {
                 if !resume_complete {
@@ -697,51 +681,32 @@ async fn run_session(
                     Some(c) if c >= MIN_CAP => c,
                     _ => continue, // datagrams not negotiated or cap too small — skip silently
                 };
-                loop {
-                    // Budget gate: stop if Layer-1 application queue has less than
-                    // one datagram's worth of free space. This prevents bursting from
-                    // displacing already-queued datagrams under congestion.
-                    // datagram_send_buffer_space() is confirmed public on quinn::Connection 0.11.9.
-                    if conn.datagram_send_buffer_space() < cap {
-                        break;
+                let deferred = std::mem::take(&mut pending_deferred);
+                if let Some(result) = build_state_diff(
+                    &slot,
+                    &mut current_epoch,
+                    last_acked_epoch,
+                    &last_acked_snapshot,
+                    &last_sent_snapshot,
+                    deferred,
+                    cap,
+                ) {
+                    // CR-01 fix: store the sent snapshot keyed by epoch BEFORE
+                    // calling send_datagram. On ack receipt we look up this
+                    // snapshot rather than snapshotting the current (potentially
+                    // advanced) grid.
+                    epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
+                    if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
+                        epoch_snapshots.pop_front();
                     }
-                    let deferred = std::mem::take(&mut pending_deferred);
-                    match build_state_diff(
-                        &slot,
-                        &mut current_epoch,
-                        last_acked_epoch,
-                        &last_acked_snapshot,
-                        &last_sent_snapshot,
-                        deferred,
-                        cap,
-                    ) {
-                        None => break,
-                        Some(result) => {
-                            // CR-01 fix: store the sent snapshot keyed by epoch BEFORE
-                            // calling send_datagram. On ack receipt we look up this
-                            // snapshot rather than snapshotting the current (potentially
-                            // advanced) grid.
-                            epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
-                            if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
-                                epoch_snapshots.pop_front();
-                            }
-                            // Pitfall 2: update last_sent_snapshot INSIDE the loop so
-                            // the next build_state_diff call sees the correct baseline
-                            // and does not spuriously increment current_epoch.
-                            last_sent_snapshot = result.sent_cells;
-                            let no_more = result.deferred.is_empty();
-                            pending_deferred = result.deferred;
-                            if let Err(e) = conn.send_datagram(result.payload) {
-                                use quinn::SendDatagramError::*;
-                                match e {
-                                    TooLarge => {} // encode_datagram guarantees this is unreachable; treat as skip
-                                    UnsupportedByPeer | Disabled => break 'pump SessionEnd::TransportLost,
-                                    ConnectionLost(_) => break 'pump SessionEnd::TransportLost,
-                                }
-                            }
-                            if no_more {
-                                break;
-                            }
+                    last_sent_snapshot = result.sent_cells;
+                    pending_deferred = result.deferred;
+                    if let Err(e) = conn.send_datagram(result.payload) {
+                        use quinn::SendDatagramError::*;
+                        match e {
+                            TooLarge => {} // encode_datagram guarantees this is unreachable; treat as skip
+                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
+                            ConnectionLost(_) => break SessionEnd::TransportLost,
                         }
                     }
                 }
@@ -1147,7 +1112,7 @@ async fn run_reattach_session(
     // CR-01 fix: bounded per-epoch sent-snapshot store (same as run_session).
     let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
-    let session_end: SessionEnd = 'pump: loop {
+    let session_end: SessionEnd = loop {
         tokio::select! {
             chunk = out_rx.recv() => {
                 match chunk {
@@ -1198,9 +1163,8 @@ async fn run_reattach_session(
                     }
                 }
             }
-            // SYNC-03: diff-interval tick — same burst-loop arm as run_session.
-            // D-01: bounded burst; see run_session arm for full commentary.
-            // D-13-03: gated by resume_complete (true after replay completes above).
+            // SYNC-03: diff-interval tick — same arm as run_session.
+            // D-13-03: gated by resume_complete (false until replay loop above completes).
             _ = diff_interval.tick() => {
                 if !resume_complete {
                     continue;
@@ -1209,44 +1173,29 @@ async fn run_reattach_session(
                     Some(c) if c >= MIN_CAP => c,
                     _ => continue,
                 };
-                loop {
-                    // Budget gate: stop if Layer-1 application queue has less than
-                    // one datagram's worth of free space.
-                    if conn.datagram_send_buffer_space() < cap {
-                        break;
+                let deferred = std::mem::take(&mut pending_deferred);
+                if let Some(result) = build_state_diff(
+                    &slot,
+                    &mut current_epoch,
+                    last_acked_epoch,
+                    &last_acked_snapshot,
+                    &last_sent_snapshot,
+                    deferred,
+                    cap,
+                ) {
+                    // CR-01 fix: store sent snapshot keyed by epoch (same as run_session).
+                    epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
+                    if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
+                        epoch_snapshots.pop_front();
                     }
-                    let deferred = std::mem::take(&mut pending_deferred);
-                    match build_state_diff(
-                        &slot,
-                        &mut current_epoch,
-                        last_acked_epoch,
-                        &last_acked_snapshot,
-                        &last_sent_snapshot,
-                        deferred,
-                        cap,
-                    ) {
-                        None => break,
-                        Some(result) => {
-                            // CR-01 fix: store sent snapshot keyed by epoch (same as run_session).
-                            epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
-                            if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
-                                epoch_snapshots.pop_front();
-                            }
-                            // Pitfall 2: update last_sent_snapshot inside the loop.
-                            last_sent_snapshot = result.sent_cells;
-                            let no_more = result.deferred.is_empty();
-                            pending_deferred = result.deferred;
-                            if let Err(e) = conn.send_datagram(result.payload) {
-                                use quinn::SendDatagramError::*;
-                                match e {
-                                    TooLarge => {}
-                                    UnsupportedByPeer | Disabled => break 'pump SessionEnd::TransportLost,
-                                    ConnectionLost(_) => break 'pump SessionEnd::TransportLost,
-                                }
-                            }
-                            if no_more {
-                                break;
-                            }
+                    last_sent_snapshot = result.sent_cells;
+                    pending_deferred = result.deferred;
+                    if let Err(e) = conn.send_datagram(result.payload) {
+                        use quinn::SendDatagramError::*;
+                        match e {
+                            TooLarge => {}
+                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
+                            ConnectionLost(_) => break SessionEnd::TransportLost,
                         }
                     }
                 }
@@ -1397,207 +1346,6 @@ fn clean_exit(e: quinn::ConnectionError) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // ── Shared test helpers ────────────────────────────────────────────────────
-
-    fn have_sh() -> bool {
-        std::path::Path::new("/bin/sh").exists()
-    }
-
-    fn test_key(seed: u8) -> nosh_auth::NoshPublicKey {
-        nosh_auth::NoshPublicKey::from_raw([seed; 32])
-    }
-
-    fn open_sh_slot(seed: u8) -> Arc<crate::registry::SessionSlot> {
-        let passwd = crate::session::lookup_self(Some("/bin/sh"));
-        let (sess, _reader, _writer) =
-            crate::session::open(&passwd, "xterm", 80, 24, &[], test_key(seed))
-                .expect("open /bin/sh");
-        crate::registry::SessionSlot::new(sess)
-    }
-
-    // ── D-01: burst loop behavioural drain test ───────────────────────────────
-
-    /// D-01: a full-screen diff that overflows one MTU-capped datagram is fully
-    /// drained in a single logical burst tick when the budget (datagram_send_buffer_space)
-    /// allows.
-    ///
-    /// Before the fix, the single-datagram-per-tick policy would produce one datagram
-    /// and leave the rest deferred — requiring N ticks × RTT to drain a full-screen
-    /// repaint.
-    /// After the fix, the burst loop calls build_state_diff repeatedly while budget
-    /// allows, draining pending_deferred to empty within one logical tick.
-    ///
-    /// Test design: rather than feeding a full-screen diff (which requires an empty
-    /// acked baseline and creates a non-terminating loop), we pre-build a synthetic
-    /// `pending_deferred` pile (many DiffRun entries) and set last_acked_snapshot =
-    /// last_sent_snapshot = current_grid, so fresh_runs = []. The burst loop then
-    /// processes only the deferred pile, which shrinks monotonically toward empty.
-    #[test]
-    fn burst_drains_large_diff_in_one_tick() {
-        // FAIL BEFORE FIX: with a single-datagram-per-tick policy, one call to
-        //   build_state_diff returns Some with non-empty deferred; the loop in the old
-        //   code does not iterate, leaving pending_deferred non-empty.
-        // PASS AFTER FIX:  the burst loop iterates until pending_deferred is empty,
-        //   producing more than one datagram payload.
-        if !have_sh() {
-            eprintln!("skipping burst_drains_large_diff_in_one_tick: /bin/sh unavailable");
-            return;
-        }
-
-        let slot = open_sh_slot(0xB1);
-
-        // Get the current terminal grid so we can set acked = sent = current.
-        // This means compute_diff_runs(current, last_acked) = [] (no fresh diff) —
-        // only the synthetic pending_deferred pile will be processed each iteration,
-        // guaranteeing termination.
-        let current_grid: Vec<Vec<Cell>> = slot.with_terminal_state(|ts| {
-            ts.viewport_rows().map(|(_, row)| row.to_vec()).collect()
-        });
-
-        // Build a large synthetic pending_deferred pile: 100 DiffRun entries,
-        // each representing a single-character run on a different cell.
-        // At cap=50 bytes each encoded run is ~15–20 bytes (row+col+style+fg+bg+1char),
-        // so 100 runs require at least 5–6 datagram calls to encode.
-        let pending_deferred_initial: Vec<DiffRun> = (0u16..100)
-            .map(|i| nosh_proto::DiffRun {
-                row: i % 24,
-                start_col: i % 80,
-                style: nosh_proto::CellStyle(0),
-                fg: None,
-                bg: None,
-                chars: "X".to_string(),
-            })
-            .collect();
-
-        // Use a small cap (50 bytes) to force multiple burst iterations.
-        // MIN_CAP = 8; cap=50 is large enough to encode a few runs per call.
-        let cap: usize = 50;
-
-        let mut current_epoch: u64 = 1; // non-zero so acked < sent is possible
-        let last_acked_epoch: u64 = 0;   // acked behind sent → epoch check passes
-        let last_acked_snapshot = current_grid.clone(); // acked = current → fresh_runs = []
-        let mut last_sent_snapshot = current_grid.clone();
-        let mut pending_deferred = pending_deferred_initial;
-
-        let mut payloads_produced: usize = 0;
-
-        loop {
-            // Budget always available in test (no real connection to query).
-            let deferred = std::mem::take(&mut pending_deferred);
-            match build_state_diff(
-                &slot,
-                &mut current_epoch,
-                last_acked_epoch,
-                &last_acked_snapshot,
-                &last_sent_snapshot,
-                deferred,
-                cap,
-            ) {
-                None => break,
-                Some(result) => {
-                    // Pitfall 2: advance last_sent_snapshot inside the loop.
-                    last_sent_snapshot = result.sent_cells;
-                    let no_more = result.deferred.is_empty();
-                    pending_deferred = result.deferred;
-                    payloads_produced += 1;
-                    if no_more {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Signal the shell before dropping the slot.
-        slot.sighup();
-
-        assert!(
-            pending_deferred.is_empty(),
-            "D-01: burst loop must drain pending_deferred to empty in one logical tick \
-             (repaint fully sent, not dribbled)"
-        );
-        assert!(
-            payloads_produced > 1,
-            "D-01: 100-run deferred diff at cap={cap} must require >1 datagram payload \
-             (got {payloads_produced}) — burst loop must iterate, not single-shot",
-        );
-    }
-
-    #[test]
-    fn burst_drains_when_grid_differs_from_acked_baseline() {
-        // Regression for the 999.4-01 burst spin (hung mutual_auth_inprocess_happy_path).
-        //
-        // FAIL BEFORE FIX: build_state_diff computed `fresh_runs` against
-        //   `last_acked_snapshot` UNCONDITIONALLY. last_acked does NOT advance within a
-        //   burst (acks are processed in another select! arm), so every burst iteration
-        //   re-merged the full diff into the deferred queue → `deferred` never emptied →
-        //   `no_more` never true → the burst loop spun forever (hung the session task).
-        // PASS AFTER FIX:  when draining (pending_deferred non-empty) fresh_runs is NOT
-        //   recomputed, so the deferred queue drains to empty in a bounded number of
-        //   iterations even though last_acked never advances mid-burst.
-        if !have_sh() {
-            eprintln!("skipping burst_drains_when_grid_differs_from_acked_baseline: /bin/sh unavailable");
-            return;
-        }
-
-        let slot = open_sh_slot(0xB2);
-
-        // Acked baseline is EMPTY (nothing acknowledged yet), so the current grid
-        // differs from it and compute_diff_runs(current, &[]) is NON-EMPTY — the exact
-        // condition that regenerated fresh_runs every iteration before the fix.
-        let last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
-        let mut last_sent_snapshot: Vec<Vec<Cell>> = Vec::new();
-        let mut current_epoch: u64 = 0;
-        let last_acked_epoch: u64 = 0;
-        let mut pending_deferred: Vec<DiffRun> = Vec::new();
-
-        // Small cap forces many burst iterations to drain a full-grid diff.
-        let cap: usize = 50;
-        // Guard well above the worst-case legitimate drain count (a blank 80x24 grid is
-        // ~24 row-runs; at cap=50 that drains in a few dozen iterations). Before the fix
-        // this loop never terminates on its own, so the guard converts the hang into a
-        // deterministic assertion failure.
-        const GUARD: usize = 1000;
-
-        let mut iterations = 0usize;
-        loop {
-            iterations += 1;
-            assert!(
-                iterations <= GUARD,
-                "D-01 burst loop did not drain within {GUARD} iterations — fresh_runs is \
-                 regenerating against the un-advancing acked baseline (the spin bug)"
-            );
-            let deferred = std::mem::take(&mut pending_deferred);
-            match build_state_diff(
-                &slot,
-                &mut current_epoch,
-                last_acked_epoch,
-                &last_acked_snapshot,
-                &last_sent_snapshot,
-                deferred,
-                cap,
-            ) {
-                None => break,
-                Some(result) => {
-                    last_sent_snapshot = result.sent_cells;
-                    let no_more = result.deferred.is_empty();
-                    pending_deferred = result.deferred;
-                    if no_more {
-                        break;
-                    }
-                }
-            }
-        }
-
-        slot.sighup();
-
-        assert!(
-            pending_deferred.is_empty(),
-            "D-01: burst must drain to empty even when the grid differs from the acked baseline"
-        );
-    }
-
     /// CLOSE_AUTH defensive branch: verify the building blocks that
     /// `extract_peer_identity` delegates to correctly return `None` for
     /// non-Ed25519 / malformed SPKI bytes, triggering the CLOSE_AUTH path.
