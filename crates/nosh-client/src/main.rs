@@ -788,6 +788,26 @@ async fn run_pump(
     // symmetric). Calling reset_physical() explicitly is only needed if the
     // screen is ever hoisted above run_pump scope; do NOT hoist it.
     let mut screen = nosh_client::screen::ClientScreen::new(cols, rows);
+    // D-03 / BUG-H: clear the physical terminal on connect so any prior content
+    // does not bleed through the first render. emit_connect_clear writes \x1b[2J\x1b[H
+    // (ED2 + cursor-home) and calls reset_physical(), so the subsequent
+    // render_with_predictor forces a full repaint from a known-clean terminal state.
+    // This is the single sanctioned pre-render clear (CONTEXT.md D-03b exception).
+    {
+        let mut init_buf: Vec<u8> = Vec::new();
+        if let Err(e) = screen.emit_connect_clear(&mut init_buf) {
+            tracing::warn!("emit_connect_clear error: {e}");
+        }
+        if !init_buf.is_empty() {
+            if let Err(e) = stdout.write_all(&init_buf).await {
+                tracing::warn!("emit_connect_clear stdout write_all failed: {e}");
+                screen.reset_physical();
+            } else if let Err(e) = stdout.flush().await {
+                tracing::warn!("emit_connect_clear stdout flush failed: {e}");
+                screen.reset_physical();
+            }
+        }
+    }
     // Speculative-echo overlay (Phase 15, PREDICT-02/04/05).
     // Mutably owned here so both stdin arm (on_input) and datagram arm (cull)
     // can drive it, and render_with_predictor receives it by shared ref.
