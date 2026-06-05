@@ -121,7 +121,11 @@ pub enum InputAction {
     PredictLineEnd,
     /// Reset the prediction epoch; display nothing until server confirms.
     EpochReset,
-    /// Enter/newline — predict cursor line-advance (col 0 of next row), Mosh-style. // filled in Task 2
+    /// Enter/newline — predict cursor line-advance (col 0 of next row), Mosh-style.
+    /// Calls `become_tentative()` + advances `predicted_cursor` to row+1/col 0.
+    /// On last row: cursor stays at (row, 0) — scroll not predicted (matches Mosh).
+    /// Must not mispredict during subsequent noecho secret entry; the tentative
+    /// machinery already suppresses char predictions structurally.
     PredictEnter,
     /// Begin bracketed paste — suppress all prediction.
     BracketedPasteStart,
@@ -426,10 +430,31 @@ impl PredictionOverlay {
                 self.reset_with_cursor(screen.confirmed_cursor());
             }
             InputAction::PredictEnter => {
-                // D-02: full handler wired in Task 2; stub matches EpochReset behaviour
-                // so the build stays clean while classify_input still returns EpochReset
-                // for b"\r"/b"\n" (Task 1). Task 2 replaces this arm.
-                self.reset_with_cursor(screen.confirmed_cursor());
+                // D-02: predict the Enter line-advance, Mosh newline_carriage_return style.
+                // 1. Clear pending (same as EpochReset — we cannot know noecho state yet).
+                // 2. become_tentative (new epoch — subsequent chars hidden until confirmed).
+                // 3. Predict cursor → (row+1, col 0) if not at last row; (row, col 0) on last row.
+                // 4. Set epoch_start_col = 0 to match the predicted position (col 0); the CR-01
+                //    sync_cursor_from_confirmed will update it to the confirmed prompt column
+                //    once cursor_motion_pending clears and pending empties.
+                // The noecho tentative machinery handles suppression structurally (no explicit flag).
+                self.pending.clear();
+                self.become_tentative();
+                self.cursor_motion_pending = false;
+                self.needs_epoch_start_sync = true;
+                // Clamp backspace at predicted col 0 (the enter predicts a fresh line start).
+                // sync_cursor_from_confirmed will correct this once the server confirms.
+                self.epoch_start_col = 0;
+                let row = self.predicted_cursor.row;
+                if row < self.term_rows.saturating_sub(1) {
+                    // Normal case: advance to next row, column 0.
+                    self.predicted_cursor = CursorPos { row: row + 1, col: 0 };
+                } else {
+                    // At last row: cursor stays at (row, 0) — scroll is unpredictable.
+                    // Mosh does NOT predict scroll; we match that (RESEARCH Q2).
+                    self.predicted_cursor = CursorPos { row, col: 0 };
+                }
+                self.cursor_motion_pending = true;
             }
             InputAction::BulkSuppressed => {
                 // Bulk input (large byte batch): reset without cursor sync. There is no
@@ -834,8 +859,8 @@ pub fn classify_input(bytes: &[u8]) -> InputAction {
         [0x01] => InputAction::PredictLineStart,
         [0x05] => InputAction::PredictLineEnd,
 
-        // Enter / newline → epoch reset.
-        [b'\r'] | [b'\n'] => InputAction::EpochReset,
+        // Enter / newline → predict line-advance (D-02: PredictEnter, not EpochReset).
+        [b'\r'] | [b'\n'] => InputAction::PredictEnter,
 
         // Tab → epoch reset (tab-stop ambiguity, D-15-01a).
         [b'\t'] => InputAction::EpochReset,
@@ -1109,17 +1134,82 @@ mod tests {
         );
     }
 
+    /// D-02: Enter / newline classifies as PredictEnter, not EpochReset.
+    ///
+    /// Before the fix, CR and LF both returned EpochReset.
+    /// After the fix, they return PredictEnter so the on_input arm can predict
+    /// the cursor line-advance instead of only resetting the epoch.
     #[test]
-    fn classify_enter_epoch_reset() {
+    fn classify_enter_predict_enter() {
+        // FAIL BEFORE FIX: classify_input(b"\r") == InputAction::EpochReset.
+        // PASS AFTER FIX:  classify_input(b"\r") == InputAction::PredictEnter.
         assert_eq!(
             classify_input(b"\r"),
-            InputAction::EpochReset,
-            "CR must yield EpochReset"
+            InputAction::PredictEnter,
+            "D-02: CR must yield PredictEnter (not EpochReset)"
         );
         assert_eq!(
             classify_input(b"\n"),
-            InputAction::EpochReset,
-            "LF must yield EpochReset"
+            InputAction::PredictEnter,
+            "D-02: LF must yield PredictEnter (not EpochReset)"
+        );
+    }
+
+    /// D-02: pressing Enter at a non-last row predicts cursor line-advance to (row+1, 0).
+    ///
+    /// Before the fix, Enter only called EpochReset → predicted cursor stayed on the
+    /// current row until the next confirming datagram.
+    /// After the fix, Enter calls PredictEnter → predicted cursor moves to the next row.
+    #[test]
+    fn enter_predicts_line_advance_cursor() {
+        // FAIL BEFORE FIX: predicted_cursor.row stays at 5 (EpochReset does not advance row).
+        // PASS AFTER FIX:  predicted_cursor == CursorPos { row: 6, col: 0 } and cursor_motion_pending true.
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Position predicted cursor at row 5, col 10 (simulating mid-line typing).
+        overlay.predicted_cursor = CursorPos { row: 5, col: 10 };
+
+        // Press Enter — should advance to row 6, col 0.
+        overlay.on_input(b"\r", &screen);
+
+        assert_eq!(
+            overlay.predicted_cursor,
+            CursorPos { row: 6, col: 0 },
+            "D-02: Enter at row 5 of 24 must predict cursor at (6, 0)"
+        );
+        assert!(
+            overlay.cursor_motion_pending,
+            "D-02: cursor_motion_pending must be true after PredictEnter"
+        );
+    }
+
+    /// D-02: pressing Enter on the last row must NOT predict row advance (scroll unpredictable).
+    ///
+    /// Before the fix, Enter only called EpochReset — no row advance (accidentally correct,
+    /// wrong reason). After the fix, PredictEnter explicitly handles this: cursor stays at
+    /// (row, 0) — matching Mosh's "no scroll prediction" policy.
+    #[test]
+    fn enter_at_last_row_stays_on_row() {
+        // FAIL BEFORE FIX: cursor row position undefined (EpochReset path taken, not PredictEnter).
+        // PASS AFTER FIX:  predicted_cursor == CursorPos { row: 23, col: 0 }, no row advance.
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Position predicted cursor at last row (row 23 of 24 rows, 0-indexed).
+        overlay.predicted_cursor = CursorPos { row: 23, col: 40 };
+
+        // Press Enter on last row — scroll is unpredictable, cursor stays at (23, 0).
+        overlay.on_input(b"\r", &screen);
+
+        assert_eq!(
+            overlay.predicted_cursor,
+            CursorPos { row: 23, col: 0 },
+            "D-02: Enter at last row (23 of 24) must keep cursor on row 23 (no row advance — scroll not predicted)"
+        );
+        assert!(
+            overlay.cursor_motion_pending,
+            "D-02: cursor_motion_pending must be true after PredictEnter at last row"
         );
     }
 
@@ -1964,11 +2054,15 @@ mod tests {
             "BUG-D: two right arrows from col 4 must move predicted caret to col 6"
         );
 
-        // Enter (epoch reset) clears motion → caret no longer overridden.
+        // Enter (PredictEnter) predicts the line-advance: caret moves to (row+1, 0).
+        // D-02: PredictEnter sets cursor_motion_pending = true and predicts row+1, col 0.
+        // Screen confirmed cursor is at row 0, col 5; the overlay's predicted cursor was at (0,6).
+        // After PredictEnter, predicted cursor is at (1, 0) and cursor_motion_pending is true.
         overlay.on_input(b"\r", &screen);
-        assert!(
-            overlay.predicted_cursor().is_none(),
-            "BUG-D: after Enter (reset), cursor_motion_pending must clear → predicted_cursor() None"
+        assert_eq!(
+            overlay.predicted_cursor(),
+            Some(CursorPos { row: 1, col: 0 }),
+            "BUG-D (D-02 update): after Enter (PredictEnter), predicted caret must move to (row+1, 0)"
         );
     }
 
@@ -2104,12 +2198,15 @@ mod tests {
     /// be synced from the confirmed cursor so the post-`read -s` Enter advances the line.
     ///
     /// Before the fix, `EpochReset` called `reset()` which did not update
-    /// `predicted_cursor`, leaving it at a stale position. After the fix, `EpochReset`
-    /// calls `reset_with_cursor(screen.confirmed_cursor())` which forcibly syncs the caret.
+    /// `predicted_cursor`, leaving it at a stale position. D-05 (BUG-F) fixes this for
+    /// the EpochReset path (Tab/ESC/other). D-02 introduces PredictEnter for Enter/newline:
+    /// rather than snapping to the confirmed cursor, Enter now positively predicts the
+    /// line-advance — cursor moves to (stale_row+1, 0). Tab/ESC still call reset_with_cursor.
     #[test]
     fn bug_f_enter_after_noecho_syncs_caret_from_confirmed() {
-        // FAIL BEFORE FIX: predicted_cursor stays at stale col after EpochReset.
-        // PASS AFTER FIX:  predicted_cursor matches the confirmed cursor after EpochReset.
+        // D-02 update: Enter now calls PredictEnter (not EpochReset → reset_with_cursor).
+        // PredictEnter predicts cursor at (stale_predicted_row + 1, 0) rather than snapping
+        // to the confirmed position. The cull() mechanism reconciles on the next datagram.
         let mut screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
 
@@ -2127,9 +2224,9 @@ mod tests {
 
         // Simulate noecho typing — moves predicted_cursor to a stale position.
         // (These won't be visible due to tentative epoch, but they do advance the caret.)
-        overlay.on_input(b"\r", &screen); // EpochReset first (initial state)
+        overlay.on_input(b"\r", &screen); // PredictEnter: from row 1 → predicts row 2, col 0
 
-        // Manually stale the predicted cursor to simulate a diverged position.
+        // Manually set predicted cursor to simulate a diverged position (mid-noecho).
         overlay.predicted_cursor = CursorPos { row: 0, col: 3 };
 
         // Server advances cursor (e.g. after `read -s` completes, Enter was pressed).
@@ -2143,19 +2240,16 @@ mod tests {
         screen.apply(&diff2);
         overlay.cull(&screen, 2, 5);
 
-        // Simulate user pressing Enter at end of read -s prompt (EpochReset).
+        // Simulate user pressing Enter at end of read -s prompt (PredictEnter from row 0).
+        // D-02: PredictEnter predicts cursor at (predicted_row+1, 0) = (1, 0).
+        // Tab/ESC still call reset_with_cursor and snap to confirmed position.
         overlay.on_input(b"\r", &screen);
 
-        // After EpochReset, predicted_cursor must be synced from the confirmed cursor.
+        // After PredictEnter from stale row 0, predicted cursor must be at (1, 0).
         assert_eq!(
-            overlay.predicted_cursor.row,
-            screen.confirmed_cursor().row,
-            "BUG-F: after EpochReset, predicted_cursor.row must match confirmed cursor row"
-        );
-        assert_eq!(
-            overlay.predicted_cursor.col,
-            screen.confirmed_cursor().col,
-            "BUG-F: after EpochReset, predicted_cursor.col must match confirmed cursor col"
+            overlay.predicted_cursor,
+            CursorPos { row: 1, col: 0 },
+            "BUG-F (D-02 update): Enter (PredictEnter) from stale row 0 must predict (1, 0)"
         );
     }
 
@@ -2326,64 +2420,66 @@ mod tests {
         assert_eq!(cursor2.col, 15, "confirmed_cursor.col must be 15 after apply");
     }
 
-    // ── CR-01 adversarial: reset_with_cursor → sync_cursor_from_confirmed chain ─
+    // ── CR-01 adversarial: EpochReset/reset_with_cursor → sync_cursor_from_confirmed chain ─
 
-    /// CR-01 adversarial regression: `reset_with_cursor` must NOT lock `epoch_start_col`
-    /// to the stale pre-Enter cursor position. The clamp floor for the NEXT epoch must
-    /// be captured from the NEW prompt position delivered by `sync_cursor_from_confirmed`.
+    /// CR-01 adversarial regression: `reset_with_cursor` (called by EpochReset — Tab/ESC/other)
+    /// must NOT lock `epoch_start_col` to the stale pre-reset cursor position. The clamp floor
+    /// for the NEXT epoch must be captured from the NEW prompt position delivered by
+    /// `sync_cursor_from_confirmed`.
+    ///
+    /// D-02 note: Enter now calls PredictEnter (not EpochReset). This test uses Tab to trigger
+    /// EpochReset → reset_with_cursor, which is the path that was broken before the D-05 fix.
     ///
     /// This test exercises the real call chain from `run_pump`:
-    ///   `reset_with_cursor(prev_cursor)` → `sync_cursor_from_confirmed(new_prompt_cursor)`
+    ///   `EpochReset` (Tab) → `reset_with_cursor(prev_cursor)` → `sync_cursor_from_confirmed(new_prompt_cursor)`
     ///   → `PredictBackspace` (repeat)
     ///
     /// The backspace clamp floor must follow the NEW prompt column (6), NOT the stale
-    /// pre-Enter column (9). Before the fix, `epoch_start_col` was set to `confirmed.col`
-    /// at `reset_with_cursor` time (col 9) and `needs_epoch_start_sync` was set to false,
-    /// preventing the subsequent sync from correcting it — so PredictBackspace stopped at
-    /// col 9 instead of col 6.
+    /// pre-reset column (9). Before the fix, `reset_with_cursor` set `epoch_start_col = 9`
+    /// and `needs_epoch_start_sync = false`, preventing the subsequent sync from correcting it.
     ///
-    /// Before the fix: backspace clamps at col 9 (stale pre-Enter position).
-    /// After the fix:  backspace clamps at col 6 (new prompt boundary, from post-Enter sync).
+    /// Before the fix: backspace clamps at col 9 (stale pre-reset position).
+    /// After the fix:  backspace clamps at col 6 (new prompt boundary, from post-reset sync).
     #[test]
     fn cr01_reset_with_cursor_epoch_start_col_follows_new_prompt_not_pre_enter() {
         // FAIL BEFORE FIX: backspace stops at col 9 (stale epoch_start_col from reset_with_cursor).
-        // PASS AFTER FIX:  backspace stops at col 6 (epoch_start_col from post-Enter sync).
+        // PASS AFTER FIX:  backspace stops at col 6 (epoch_start_col from post-Tab sync).
         let mut screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
 
-        // Step 1: establish a pre-Enter session state.
+        // Step 1: establish a pre-reset session state.
         // The user typed "abc" after a prompt at col 6 (e.g. "user> abc").
         // Confirmed cursor is now at col 9 (6 + 3 chars).
-        let diff_before_enter = StateDiff {
+        let diff_before_reset = StateDiff {
             epoch: 1,
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 9 },
             runs: vec![],
         };
-        screen.apply(&diff_before_enter);
+        screen.apply(&diff_before_reset);
         overlay.cull(&screen, 1, 5);
         // Simulate that epoch_start_col was correctly set to 6 earlier (user was typing
         // at prompt col 6). We set it directly to mirror what reset() + sync would set.
         overlay.epoch_start_col = 6;
         overlay.needs_epoch_start_sync = false;
 
-        // Step 2: user presses Enter. run_pump calls on_input(b"\r", &screen) which
-        // triggers EpochReset → reset_with_cursor(screen.confirmed_cursor()).
-        // At this moment, confirmed cursor is at col 9 (the pre-Enter position).
+        // Step 2: user presses Tab (EpochReset → reset_with_cursor).
+        // D-02: Tab/ESC/other still call EpochReset; only Enter now calls PredictEnter.
+        // At this moment, confirmed cursor is at col 9 (the pre-Tab position).
         // The bug: reset_with_cursor sets epoch_start_col = 9 and needs_epoch_start_sync = false.
         // The fix: reset_with_cursor sets needs_epoch_start_sync = true (leaves epoch_start_col alone).
-        overlay.on_input(b"\r", &screen); // EpochReset → reset_with_cursor({row:0, col:9})
+        overlay.on_input(b"\t", &screen); // EpochReset → reset_with_cursor({row:0, col:9})
 
-        // Step 3: server processes Enter and advances cursor to the new prompt on row 1 col 6.
-        let diff_after_enter = StateDiff {
+        // Step 3: server processes Tab and advances cursor to the new prompt on row 1 col 6.
+        let diff_after_reset = StateDiff {
             epoch: 2,
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 1, col: 6 },
             runs: vec![],
         };
-        screen.apply(&diff_after_enter);
+        screen.apply(&diff_after_reset);
         overlay.cull(&screen, 2, 5);
         // The datagram arm calls sync_cursor_from_confirmed after cull.
         // With the fix, needs_epoch_start_sync is still true here → epoch_start_col = 6.
@@ -2404,8 +2500,8 @@ mod tests {
         assert_eq!(
             overlay.predicted_cursor.col,
             6,
-            "CR-01: backspace clamp floor must be col 6 (new prompt boundary from post-Enter sync), \
-             not col 9 (stale pre-Enter cursor position from reset_with_cursor)"
+            "CR-01: backspace clamp floor must be col 6 (new prompt boundary from post-Tab sync), \
+             not col 9 (stale pre-Tab cursor position from reset_with_cursor)"
         );
     }
 }
