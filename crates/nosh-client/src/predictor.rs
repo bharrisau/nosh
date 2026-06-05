@@ -397,10 +397,20 @@ impl PredictionOverlay {
                 self.predicted_cursor.col = end_col;
                 self.cursor_motion_pending = true;
             }
-            InputAction::EpochReset | InputAction::BulkSuppressed => {
-                // Reset clears all pending predictions AND increments prediction_epoch,
-                // ensuring no stale speculative state remains visible after a control
-                // sequence (Ctrl-C, ESC, Tab, Enter, cursor-addressing, bulk input).
+            InputAction::EpochReset => {
+                // D-05 (BUG-F): on noecho-epoch end (Enter / newline after read -s),
+                // force-sync the predicted caret from the confirmed cursor so the caret
+                // is in the correct position for the next input epoch. Uses
+                // `reset_with_cursor` which bypasses the CR-01 guard (pending is being
+                // cleared, so the guard's purpose — preventing a snap while pending
+                // predictions exist — does not apply here).
+                self.reset_with_cursor(screen.confirmed_cursor());
+            }
+            InputAction::BulkSuppressed => {
+                // Bulk input (large byte batch): reset without cursor sync. There is no
+                // reliable confirmed cursor available at the time a BulkSuppressed fires
+                // (the server has not yet processed the batch), so keep calling plain
+                // reset() (unchanged from pre-D-05 behavior).
                 self.reset();
             }
             InputAction::BracketedPasteStart => {
@@ -532,6 +542,29 @@ impl PredictionOverlay {
         // capture the new epoch-start column (the prompt boundary). Cleared once
         // captured so mid-epoch datagram confirmations don't reset the floor.
         self.needs_epoch_start_sync = true;
+    }
+
+    /// Clear all pending predictions, increment prediction epoch, and forcibly sync
+    /// the predicted cursor from the confirmed cursor position.
+    ///
+    /// Use for `EpochReset` (e.g. Enter ending a `read -s` prompt) where the predicted
+    /// caret may be stale (noecho epoch left it diverged). The direct assignment bypasses
+    /// the CR-01 guard intentionally: `pending` is being cleared here, so the conservative
+    /// guard is unnecessary and would leave the caret stale (BUG-F / D-05).
+    ///
+    /// NOT used for `BulkSuppressed` — that case has no reliable confirmed cursor
+    /// available at the call site, so it keeps calling plain `reset()`.
+    pub fn reset_with_cursor(&mut self, confirmed: CursorPos) {
+        self.pending.clear();
+        self.become_tentative();
+        self.cursor_motion_pending = false;
+        // D-05 (BUG-F): force-sync the predicted caret so the post-`read -s` Enter
+        // advances the line from the correct position. Direct assignment bypasses CR-01
+        // (pending IS empty — we just cleared it) and supersedes needs_epoch_start_sync
+        // for this epoch's floor (both cursor and floor are known from confirmed here).
+        self.predicted_cursor = confirmed;
+        self.epoch_start_col = confirmed.col;
+        self.needs_epoch_start_sync = false;
     }
 
     /// Remove all predictions with the given `tentative_until_epoch`.
