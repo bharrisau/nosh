@@ -275,7 +275,7 @@ Plans:
 **Origin**: surfaced during 999.3 live validation, 2026-06-05.
 **Plans**: 2 plans
 Plans:
-- [x] 999.4-01-PLAN.md — D-01: bounded-burst datagram send per diff tick (both server pumps; congestion-transparent via datagram_send_buffer_space)
+- [~] 999.4-01-PLAN.md — D-01 burst datagram send: implemented then REVERTED (infinite-spin + noecho-epoch security interaction); DEFERRED to phase 999.6
 - [x] 999.4-02-PLAN.md — D-02 PredictEnter line-advance + D-03 on_input decision-trace instrumentation & BulkSuppressed preserves-pending fix (predictor.rs)
 
 ### Phase 999.5: Full-screen TUI rendering correctness (alternate-screen buffer + cell width)
@@ -287,3 +287,12 @@ Plans:
 - NOT the simple blank-cell diff path (that was fixed in 999.3; `compute_diff_runs` emits spaces over changed cells correctly — verified).
 **Approach**: live Linux reproduction (run a TUI through a Linux nosh client↔server, diff the server model grid against a reference terminal / capture the datagram run stream) → pin the root cause → fix in `nosh-server/src/terminal.rs` (terminal model) with adversarial tests; client `screen.rs`/`emit_diff` only if the repro implicates it.
 **Origin**: surfaced during 999.4 discussion / 999.3 live validation follow-up, 2026-06-05.
+
+### Phase 999.6: Repaint pacing — burst datagrams per tick (epoch-under-burst redesign)
+**Goal**: Make full-screen repaints (vim startup, multi-line paste) land in ~1 RTT instead of dribbling one MTU per 16 ms tick — WITHOUT breaking the noecho security invariant. This is D-01 from 999.4, reverted there because the first implementation surfaced two bugs.
+**Why it was deferred from 999.4** (lessons — design these in, don't re-discover):
+- **Infinite spin**: `build_state_diff` (`nosh-server/src/server.rs`) computes `fresh_runs` against `last_acked_snapshot`, which does NOT advance within a burst (epoch-acks are processed in a different `select!` arm). Re-merging `fresh_runs` every burst iteration refills the deferred queue → it never drains → the pump task spins (hung `mutual_auth_inprocess_happy_path`). Mitigation proven in 999.4: when draining (pending_deferred non-empty) do NOT recompute fresh_runs.
+- **Noecho-epoch security interaction**: the burst incremented `current_epoch` once PER datagram and changed delivery timing, so the client's `confirmed_epoch` advanced during a `read -s` window — tripping `noecho_read_dash_s_zero_predicted_chars` (the literal secret chars stayed suppressed; the confirmed-state proxy moved). Likely fix: ONE epoch per tick (all burst datagrams of one screen state share an epoch), restoring the per-tick epoch cadence but delivered faster.
+**Mandatory gates**: `crates/nosh-client/tests/predict.rs::noecho_read_dash_s_zero_predicted_chars` and the `auth.rs` integration tests MUST pass; add a burst-drain unit test that fails-before/passes-after against a non-empty grid vs an empty acked baseline (see the reverted 999.4 `burst_drains_when_grid_differs_from_acked_baseline`). `datagram_send_buffer_space()` (public on quinn 0.11.9) is the per-tick budget gate; fixed-count fallback if needed.
+**Confirmed mechanism (from 999.4 investigation)**: the server terminal model is already decoupled from the send (PTY output feeds the model on the `out_rx.recv()` arm via `push_output_and_parse`, `server.rs:612`), so the full final state is available at tick time. There is no QUIC flow-control ceiling (datagrams are not ack-gated; send buffer is 1 MiB). The only limiter is the one-datagram-per-tick policy.
+**Origin**: deferred from phase 999.4 D-01, 2026-06-05.
