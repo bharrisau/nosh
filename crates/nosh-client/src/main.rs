@@ -967,7 +967,17 @@ async fn run_pump(
                                 // When --status is active, the RTT title in the datagram arm
                                 // takes precedence (Pitfall 5 — suppress forwarded title).
                                 if !status {
-                                    let osc02 = format!("\x1b]0;{title}\x07");
+                                    // WR-03 fix: strip ESC (\x1b) and BEL (\x07) from the
+                                    // server-controlled title before interpolation — defense-
+                                    // in-depth, consistent with the OSC 52 clipboard path.
+                                    // A premature BEL in title would terminate the OSC sequence
+                                    // early and allow remaining bytes to be interpreted as raw
+                                    // terminal escape sequences by the local terminal.
+                                    let clean_title: String = title
+                                        .chars()
+                                        .filter(|&c| c != '\x07' && c != '\x1b')
+                                        .collect();
+                                    let osc02 = format!("\x1b]0;{clean_title}\x07");
                                     let _ = stdout.write_all(osc02.as_bytes()).await;
                                     let _ = stdout.flush().await;
                                 }
