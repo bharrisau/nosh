@@ -259,9 +259,9 @@ Parking lot for ideas not scheduled into a milestone yet (999.x). Promote via `/
 - **Typematic / fast-typing glitch in vim** — `BulkSuppressed` fires on >4-byte stdin batches in `predictor.rs`; threshold may be too aggressive for fast typists.
 - **D-17-02a latency instrumentation measures epoch-confirmation time** (inclusive of think-time), not per-keystroke RTT — too coarse for measured-timing evidence; consider per-keystroke timing hooks.
 **Origin**: surfaced during Phase 17 live validation 2026-06-02.
-**Plans:** 1/4 plans executed
+**Plans:** 2/4 plans executed
 Plans:
 - [x] 999.3-01-PLAN.md — D-01 BUG-E epoch-start clamp + D-05 BUG-F noecho cursor sync (predictor.rs)
 - [ ] 999.3-02-PLAN.md — D-02 typematic content-inspection batch classification (predictor.rs)
-- [ ] 999.3-03-PLAN.md — D-03 BUG-H blank-cell painting + emit_connect_clear (screen.rs)
+- [x] 999.3-03-PLAN.md — D-03 BUG-H blank-cell painting + emit_connect_clear (screen.rs)
 - [ ] 999.3-04-PLAN.md — D-04 per-keystroke RTT instrumentation + D-03b connect-clear wiring (main.rs)
