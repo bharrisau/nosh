@@ -887,6 +887,86 @@ mod tests {
         );
     }
 
+    // ── BUG-H: blank-cell emission + connect-clear (D-03a / D-03b) ──────────
+
+    /// BUG-H regression: prior terminal content bleeds through after Ctrl-L / ED2 clear.
+    ///
+    /// Before the fix: a cell that is blank in `want` but non-blank in `have` (physical
+    /// shows a visible char) would be skipped if the skip condition was too broad — leaving
+    /// old content visible on the terminal instead of overwriting with a space.
+    ///
+    /// After the fix: `emit_diff` emits a space for any cell where `want != have`, including
+    /// the case where `want.ch == ' '` (blank) and `have.ch != ' '` (physical shows a char).
+    /// A second render with no change must be minimal (idempotent — no double-write).
+    #[test]
+    fn bug_h_blank_cell_after_clear_is_emitted() {
+        // FAIL BEFORE FIX: if the skip condition were `want.ch == have.ch` (char-only),
+        //                  a styled blank vs default-blank would be incorrectly skipped.
+        //                  More critically: if the skip were overly broad, 'X' in physical
+        //                  with ' ' in confirmed would not produce a space write.
+        // PASS AFTER FIX:  `want != have` → space IS emitted; physical is updated to blank,
+        //                  so the next render is a no-op for that cell (idempotent).
+        let mut screen = ClientScreen::new(80, 24);
+
+        // Step 1: Write 'X' to confirmed and render — physical now has 'X' at (0,0).
+        screen.apply(&make_diff(1, "X"));
+        let mut buf1 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf1).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf1).contains('X'),
+            "first render must contain 'X'"
+        );
+
+        // Step 2: Server sends an ED-style diff that blanks (0,0) back to space.
+        // physical[0][0] is still Cell { ch: 'X', ... }.
+        // confirmed[0][0] becomes Cell::default() = { ch: ' ', style: NONE, fg: None, bg: None }.
+        let blank_diff = StateDiff {
+            epoch: 2,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 0 },
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                chars: " ".to_string(),
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+            }],
+        };
+        screen.apply(&blank_diff);
+
+        // Step 3: Render — want.ch==' ', have.ch=='X' → want != have → MUST emit a space
+        // (MoveTo + SGR + ' ') so the terminal's 'X' is overwritten.
+        let mut buf2 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf2).unwrap();
+
+        // The output MUST contain more than just the final cursor MoveTo.
+        // A cell write at (0,0) produces: MoveTo(0,0) + SGR(\x1b[0m) + ' '.
+        // We assert the SGR reset sequence is present — it only appears when a cell is
+        // written, never as part of the bare cursor-position final move.
+        let output = String::from_utf8_lossy(&buf2);
+        assert!(
+            output.contains("\x1b[0m"),
+            "BUG-H: blanking a previously non-blank cell (have.ch='X', want.ch=' ') \
+             must emit a space write (including SGR reset), not just skip the cell; \
+             output was {:?}",
+            output
+        );
+
+        // Step 4: Idempotency — a second render with no confirmed change must NOT
+        // re-emit the space (physical was updated to blank, so want == have now).
+        let mut buf3 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf3).unwrap();
+        assert!(
+            !output.contains("\x1b[0m") || buf3.len() < buf2.len(),
+            "BUG-H idempotency: second render after blank must not re-emit the space; \
+             buf2.len()={}, buf3.len()={}",
+            buf2.len(),
+            buf3.len()
+        );
+    }
+
     // ── Task 2: render / idempotency / SGR / reset_physical tests ────────────
 
     #[test]
