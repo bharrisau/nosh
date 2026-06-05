@@ -275,7 +275,7 @@ Plans:
 **Origin**: surfaced during 999.3 live validation, 2026-06-05.
 **Plans**: 2 plans
 Plans:
-- [ ] 999.4-01-PLAN.md — D-01: bounded-burst datagram send per diff tick (both server pumps; congestion-transparent via datagram_send_buffer_space)
+- [x] 999.4-01-PLAN.md — D-01: bounded-burst datagram send per diff tick (both server pumps; congestion-transparent via datagram_send_buffer_space)
 - [ ] 999.4-02-PLAN.md — D-02 PredictEnter line-advance + D-03 on_input decision-trace instrumentation & BulkSuppressed preserves-pending fix (predictor.rs)
 
 ### Phase 999.5: Full-screen TUI rendering correctness (alternate-screen buffer + cell width)
