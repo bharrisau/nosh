@@ -396,7 +396,13 @@ impl PredictionOverlay {
                 self.cursor_motion_pending = true;
             }
             InputAction::PredictLineStart => {
-                self.predicted_cursor.col = 0;
+                // WR-01 fix: clamp at epoch_start_col (the prompt boundary), consistent with
+                // BUG-E fix for PredictBackspace and PredictCursorLeft. Home/Ctrl-A in a
+                // readline shell moves to the start of the input area, not to column 0.
+                // Without this, pressing Home predicted col 0 (overlapping the prompt text)
+                // while the server moved the cursor to epoch_start_col — causing a cull
+                // mismatch and an epoch reset on every Home keypress.
+                self.predicted_cursor.col = self.epoch_start_col;
                 self.cursor_motion_pending = true;
             }
             InputAction::PredictLineEnd => {
@@ -1992,6 +1998,59 @@ mod tests {
             overlay.predicted_cursor.col,
             5,
             "BUG-E: cursor-left must clamp at epoch-start col 5, not walk to col 0"
+        );
+    }
+
+    /// WR-01 regression: PredictLineStart (Home/Ctrl-A) must clamp at epoch_start_col,
+    /// not unconditionally set col to 0.
+    ///
+    /// Before the fix, `PredictLineStart` set `predicted_cursor.col = 0`, which placed
+    /// the caret before the prompt text when the prompt started at a non-zero column
+    /// (e.g. `user> ` starts input at col 6). The server moves the cursor to col 6 on
+    /// Home; the mismatch caused an epoch reset on every Home keypress.
+    ///
+    /// After the fix, `PredictLineStart` sets `predicted_cursor.col = epoch_start_col`,
+    /// consistent with the BUG-E fix for PredictBackspace and PredictCursorLeft.
+    #[test]
+    fn wr01_home_ctrl_a_clamps_at_epoch_start_col() {
+        // FAIL BEFORE FIX: PredictLineStart sets cursor.col = 0, not epoch_start_col.
+        // PASS AFTER FIX:  PredictLineStart sets cursor.col = epoch_start_col.
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Establish epoch_start_col = 6 (prompt "user> " at col 6).
+        overlay.reset();
+        let diff = make_diff_with_char(1, 0, 6, ' ');
+        screen.apply(&diff);
+        overlay.cull(&screen, 1, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // epoch_start_col = 6
+
+        // Type "abc" — cursor advances to col 9.
+        overlay.on_input(b"a", &screen);
+        overlay.on_input(b"b", &screen);
+        overlay.on_input(b"c", &screen);
+        assert_eq!(overlay.predicted_cursor.col, 9, "cursor at col 9 after typing 'abc'");
+
+        // Press Home (CSI H) — cursor must move to epoch_start_col (6), NOT to col 0.
+        overlay.on_input(b"\x1b[H", &screen);
+
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            6,
+            "WR-01: Home/PredictLineStart must clamp at epoch_start_col (6), not col 0"
+        );
+
+        // Also verify Ctrl-A (0x01) behaves the same way.
+        // Reset cursor to col 9 first.
+        overlay.on_input(b"a", &screen);
+        overlay.on_input(b"b", &screen);
+        overlay.on_input(b"c", &screen);
+        overlay.on_input(&[0x01], &screen); // Ctrl-A
+
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            6,
+            "WR-01: Ctrl-A/PredictLineStart must clamp at epoch_start_col (6), not col 0"
         );
     }
 
