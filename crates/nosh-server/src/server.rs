@@ -329,13 +329,25 @@ fn build_state_diff(
         *current_epoch += 1;
     }
 
-    // Compute changed runs vs the last-acked baseline.
-    let fresh_runs = compute_diff_runs(&cells, last_acked_snapshot);
-
-    // Deferred runs from the previous tick go FIRST so encode_datagram
+    // Deferred runs from a prior chunk go FIRST so encode_datagram
     // re-prioritises cursor-proximate content (Anti-Pattern: deferred FIRST).
+    //
+    // BURST-DRAIN FIX (999.4 D-01): only compute fresh runs when NOT draining a
+    // prior chunk. `fresh_runs` is diffed against `last_acked_snapshot`, which does
+    // NOT advance within a single burst (epoch-acks are processed in a different
+    // `select!` arm that cannot run while the synchronous burst loop holds the task).
+    // If we re-merged `fresh_runs` on every burst iteration, the deferred queue would
+    // be refilled with the full diff each time and never drain — `no_more` would never
+    // be true and, on a fast-draining (loopback) path where datagram_send_buffer_space()
+    // stays >= cap, the burst loop would spin forever and starve the connection driver.
+    // When draining (pending_deferred non-empty), the deferred runs already represent
+    // the remaining diff for this tick, so encode them alone. Fresh runs are recomputed
+    // on the next tick once deferred is empty, preserving the acked-baseline
+    // resend-until-acked loss tolerance across ticks.
     let mut all_runs: Vec<DiffRun> = pending_deferred;
-    all_runs.extend(fresh_runs);
+    if all_runs.is_empty() {
+        all_runs = compute_diff_runs(&cells, last_acked_snapshot);
+    }
 
     // Pitfall 3: cap the deferred queue to MAX_RUNS to prevent unbounded growth.
     // WR-03 fix: truncate from the END (drop least-cursor-proximate runs) rather
@@ -1509,6 +1521,80 @@ mod tests {
             payloads_produced > 1,
             "D-01: 100-run deferred diff at cap={cap} must require >1 datagram payload \
              (got {payloads_produced}) — burst loop must iterate, not single-shot",
+        );
+    }
+
+    #[test]
+    fn burst_drains_when_grid_differs_from_acked_baseline() {
+        // Regression for the 999.4-01 burst spin (hung mutual_auth_inprocess_happy_path).
+        //
+        // FAIL BEFORE FIX: build_state_diff computed `fresh_runs` against
+        //   `last_acked_snapshot` UNCONDITIONALLY. last_acked does NOT advance within a
+        //   burst (acks are processed in another select! arm), so every burst iteration
+        //   re-merged the full diff into the deferred queue → `deferred` never emptied →
+        //   `no_more` never true → the burst loop spun forever (hung the session task).
+        // PASS AFTER FIX:  when draining (pending_deferred non-empty) fresh_runs is NOT
+        //   recomputed, so the deferred queue drains to empty in a bounded number of
+        //   iterations even though last_acked never advances mid-burst.
+        if !have_sh() {
+            eprintln!("skipping burst_drains_when_grid_differs_from_acked_baseline: /bin/sh unavailable");
+            return;
+        }
+
+        let slot = open_sh_slot(0xB2);
+
+        // Acked baseline is EMPTY (nothing acknowledged yet), so the current grid
+        // differs from it and compute_diff_runs(current, &[]) is NON-EMPTY — the exact
+        // condition that regenerated fresh_runs every iteration before the fix.
+        let last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
+        let mut last_sent_snapshot: Vec<Vec<Cell>> = Vec::new();
+        let mut current_epoch: u64 = 0;
+        let last_acked_epoch: u64 = 0;
+        let mut pending_deferred: Vec<DiffRun> = Vec::new();
+
+        // Small cap forces many burst iterations to drain a full-grid diff.
+        let cap: usize = 50;
+        // Guard well above the worst-case legitimate drain count (a blank 80x24 grid is
+        // ~24 row-runs; at cap=50 that drains in a few dozen iterations). Before the fix
+        // this loop never terminates on its own, so the guard converts the hang into a
+        // deterministic assertion failure.
+        const GUARD: usize = 1000;
+
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            assert!(
+                iterations <= GUARD,
+                "D-01 burst loop did not drain within {GUARD} iterations — fresh_runs is \
+                 regenerating against the un-advancing acked baseline (the spin bug)"
+            );
+            let deferred = std::mem::take(&mut pending_deferred);
+            match build_state_diff(
+                &slot,
+                &mut current_epoch,
+                last_acked_epoch,
+                &last_acked_snapshot,
+                &last_sent_snapshot,
+                deferred,
+                cap,
+            ) {
+                None => break,
+                Some(result) => {
+                    last_sent_snapshot = result.sent_cells;
+                    let no_more = result.deferred.is_empty();
+                    pending_deferred = result.deferred;
+                    if no_more {
+                        break;
+                    }
+                }
+            }
+        }
+
+        slot.sighup();
+
+        assert!(
+            pending_deferred.is_empty(),
+            "D-01: burst must drain to empty even when the grid differs from the acked baseline"
         );
     }
 
