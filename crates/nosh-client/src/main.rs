@@ -797,6 +797,11 @@ async fn run_pump(
         let mut init_buf: Vec<u8> = Vec::new();
         if let Err(e) = screen.emit_connect_clear(&mut init_buf) {
             tracing::warn!("emit_connect_clear error: {e}");
+            // IN-01 fix: call reset_physical() so the physical grid is marked unclean
+            // and the first render will be a full repaint, consistent with the write-
+            // failure paths below. In practice Vec<u8>::write_all is infallible, but
+            // the symmetry prevents a misleading code pattern for future refactors.
+            screen.reset_physical();
         }
         if !init_buf.is_empty() {
             if let Err(e) = stdout.write_all(&init_buf).await {
