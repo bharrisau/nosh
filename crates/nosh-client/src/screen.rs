@@ -501,6 +501,37 @@ impl ClientScreen {
         self.physical_cursor = CursorPos { row: 0, col: 0 };
     }
 
+    /// Emit a physical clear to the terminal and reset the physical grid.
+    ///
+    /// Writes `\x1b[2J\x1b[H` (ED2 = Erase Entire Display, then cursor-home) to `out`,
+    /// then calls `reset_physical()` so the subsequent `render_to_stdout` forces a full
+    /// repaint from a known-clean terminal state.
+    ///
+    /// # Invariant exception (D-03 / CONTEXT.md)
+    ///
+    /// This is the **ONE sanctioned exception** to the "all output through
+    /// `render_to_stdout`" invariant. It fires **once**, at connect time, before the
+    /// first datagram arrives. Because it calls `reset_physical()` after writing the
+    /// escape sequence, all subsequent output still flows through `render_to_stdout`
+    /// and the physical-model / terminal-state invariant is preserved for every
+    /// subsequent render.
+    ///
+    /// The ED2+home escape is the minimal choice: it clears the terminal without
+    /// disturbing the confirmed or physical grids (which are reset separately via
+    /// `reset_physical`).
+    ///
+    /// # Call site
+    ///
+    /// Called once from `run_pump` immediately after constructing `ClientScreen`,
+    /// before entering the datagram receive loop (plan 999.3-04). Buffer into
+    /// `Vec<u8>` and flush to tokio stdout with `write_all` + `flush` (the
+    /// established pattern from the render path).
+    pub fn emit_connect_clear<W: Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        out.write_all(b"\x1b[2J\x1b[H")?;
+        self.reset_physical();
+        Ok(())
+    }
+
     // ── Read API ──────────────────────────────────────────────────────────────
 
     /// Read a cell from the confirmed grid.
@@ -964,6 +995,79 @@ mod tests {
              buf2.len()={}, buf3.len()={}",
             buf2.len(),
             buf3.len()
+        );
+    }
+
+    /// BUG-H regression: on connect, prior terminal content from a previous process
+    /// bleeds through because nosh never clears the physical terminal before the first
+    /// render. The `emit_connect_clear` method is the single sanctioned exception to the
+    /// render-only invariant — it fires once at connect.
+    ///
+    /// Before the fix: no clear is issued on connect; old terminal content remains visible
+    /// under nosh's rendering because `emit_diff` skips blank-vs-blank cells (physical model
+    /// says blank, terminal also appears blank to nosh, but actually shows old content).
+    ///
+    /// After the fix: `emit_connect_clear` writes `\x1b[2J\x1b[H` (ED2 + cursor-home) then
+    /// calls `reset_physical()` so the subsequent `render_to_stdout` forces a full repaint
+    /// from a known-clean terminal state.
+    #[test]
+    fn bug_h_connect_clear_emits_ed2_home_and_resets_physical() {
+        // FAIL BEFORE FIX: emit_connect_clear does not exist — compile error.
+        // PASS AFTER FIX:  method exists, writes \x1b[2J\x1b[H, and resets physical so
+        //                  the next render is a full repaint (mirrors reset_physical_forces_full_repaint).
+        let mut screen = ClientScreen::new(80, 24);
+
+        // Dirty the physical grid by rendering some content.
+        screen.apply(&make_diff(1, "hello"));
+        let mut buf_dirty = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf_dirty).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf_dirty).contains('h'),
+            "setup: first render must contain 'h'"
+        );
+
+        // Verify a second render is minimal (physical is in sync with confirmed).
+        let mut buf_minimal = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf_minimal).unwrap();
+        assert!(
+            buf_minimal.len() < buf_dirty.len(),
+            "setup: second render must be minimal; \
+             buf_dirty.len()={}, buf_minimal.len()={}",
+            buf_dirty.len(),
+            buf_minimal.len()
+        );
+
+        // Call emit_connect_clear — the ONE sanctioned pre-render clear (D-03 / CONTEXT.md).
+        let mut clear_buf = Vec::<u8>::new();
+        screen.emit_connect_clear(&mut clear_buf).unwrap();
+
+        // Assert 1: the clear buffer contains both \x1b[2J (ED2) and \x1b[H (cursor-home).
+        let clear_str = String::from_utf8_lossy(&clear_buf);
+        assert!(
+            clear_str.contains("\x1b[2J"),
+            "BUG-H: emit_connect_clear must write \\x1b[2J (ED2); clear_buf was {:?}",
+            clear_str
+        );
+        assert!(
+            clear_str.contains("\x1b[H"),
+            "BUG-H: emit_connect_clear must write \\x1b[H (cursor-home); clear_buf was {:?}",
+            clear_str
+        );
+
+        // Assert 2: physical was reset — the next render is a full repaint (confirmed
+        // still has 'hello', physical is now blank defaults from reset_physical()).
+        let mut buf_after_clear = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf_after_clear).unwrap();
+        assert!(
+            buf_after_clear.len() >= buf_dirty.len(),
+            "BUG-H: after emit_connect_clear, render must be a full repaint (reset_physical \
+             was called); buf_dirty.len()={}, buf_after_clear.len()={}",
+            buf_dirty.len(),
+            buf_after_clear.len()
+        );
+        assert!(
+            String::from_utf8_lossy(&buf_after_clear).contains('h'),
+            "BUG-H: full repaint after emit_connect_clear must include confirmed content 'h'"
         );
     }
 
