@@ -125,8 +125,17 @@ pub enum InputAction {
     BracketedPasteStart,
     /// End bracketed paste — re-enable prediction (still tentative until server confirms).
     BracketedPasteEnd,
-    /// Input suppressed: bulk batch > `BULK_SUPPRESS_THRESHOLD` bytes.
+    /// Input suppressed: bulk batch > `BULK_SUPPRESS_THRESHOLD` bytes with un-modelable content
+    /// (escape bytes, control chars, mixed printable+control, or any width-2 char).
     BulkSuppressed,
+    /// Printable-only batch (D-02 typematic fix): each `(char, col_width)` pair is a
+    /// single-width printable char to predict in sequence.
+    ///
+    /// Returned by `classify_input` when the entire batch decodes as valid UTF-8 and
+    /// every scalar has `UnicodeWidthChar::width` == `Some(1)`. Width-2 chars (CJK)
+    /// fall through to the flat bulk guard (single CJK chars ≤ 4 bytes still reach
+    /// `classify_printable` via the single-scalar path).
+    PredictBatch(Vec<(char, u16)>),
 }
 
 // ── PendingPrediction ─────────────────────────────────────────────────────────
@@ -422,6 +431,42 @@ impl PredictionOverlay {
                 self.in_bracketed_paste = false;
                 // Still tentative until server confirms (become_tentative already called at start).
             }
+            InputAction::PredictBatch(chars) => {
+                // D-02 (typematic fix): predict each printable single-width char in the
+                // batch in sequence, applying the same PredictChar logic as the single-
+                // char path above. Each char gets its own PendingPrediction; the cursor
+                // advances by col_width per char.
+                //
+                // in_bracketed_paste suppression is respected (same as PredictChar).
+                // The wide-char right-edge guard (become_tentative) is applied per char.
+                // PredictBackspace/CursorLeft/EpochReset arms are NOT affected.
+                if self.in_bracketed_paste {
+                    return;
+                }
+                for (ch, col_width) in chars {
+                    let col = self.predicted_cursor.col;
+                    let row = self.predicted_cursor.row;
+                    // Pitfall 6: wide-char (col_width == 2) at right edge → become_tentative.
+                    // Single-width chars (col_width == 1, the only variant in PredictBatch)
+                    // still use this guard for safety.
+                    if col.saturating_add(col_width) > self.term_cols {
+                        self.become_tentative();
+                        return;
+                    }
+                    let epoch_required = screen.last_applied_epoch() + 1;
+                    let tentative_until_epoch = self.prediction_epoch;
+                    self.pending.push_back(PendingPrediction {
+                        row,
+                        col,
+                        predicted_ch: ch,
+                        col_width,
+                        epoch_required,
+                        tentative_until_epoch,
+                    });
+                    self.predicted_cursor.col = col + col_width;
+                    self.cursor_motion_pending = false;
+                }
+            }
         }
     }
 
@@ -690,9 +735,39 @@ pub fn classify_input(bytes: &[u8]) -> InputAction {
         _ => {}
     }
 
-    // Bulk suppression: D-15-01b. Any input > 4 bytes that is not a recognised
-    // paste/escape sequence is suppressed (paste, bracketed-paste body, etc.).
+    // D-02 (typematic fix): content inspection for batches > BULK_SUPPRESS_THRESHOLD.
+    // If the batch is valid UTF-8 and EVERY scalar has UnicodeWidthChar::width == Some(1)
+    // (single-width printable, no control chars, no escape bytes, no wide/combining/ZWJ),
+    // return PredictBatch so on_input can predict each char in sequence.
+    //
+    // Width-2 chars (CJK) are intentionally excluded from the batch path: they would need
+    // the same right-edge wide-char guard as single CJK input, and a single CJK scalar is
+    // ≤ 4 bytes (well below BULK_SUPPRESS_THRESHOLD), so it always reaches classify_printable
+    // via the single-scalar fallthrough below — unchanged from pre-D-02 behaviour.
+    //
+    // Bracketed-paste body bytes DO appear here after the markers are matched above; they are
+    // variable-length arbitrary bytes that will almost always fail the UTF-8 / width-1 check,
+    // falling through to BulkSuppressed. The paste markers themselves are already handled.
     if bytes.len() > BULK_SUPPRESS_THRESHOLD {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            let mut batch: Vec<(char, u16)> = Vec::with_capacity(s.len());
+            let mut all_single_width = true;
+            for ch in s.chars() {
+                match UnicodeWidthChar::width(ch) {
+                    Some(1) => batch.push((ch, 1)),
+                    _ => {
+                        // Control char (None), combining/ZWJ (Some(0)), or wide (Some(2+)):
+                        // fall through to the flat BulkSuppressed guard below.
+                        all_single_width = false;
+                        break;
+                    }
+                }
+            }
+            if all_single_width && !batch.is_empty() {
+                return InputAction::PredictBatch(batch);
+            }
+        }
+        // Not a clean printable-only batch (non-UTF-8, empty after inspection, or mixed content).
         return InputAction::BulkSuppressed;
     }
 
@@ -1031,13 +1106,45 @@ mod tests {
         );
     }
 
+    /// D-02 (typematic): a batch of printable single-width chars is now predicted
+    /// char-by-char instead of being bulk-suppressed.
+    ///
+    /// Before the fix: `classify_input(b"hello")` returned `BulkSuppressed` (flat
+    /// length rule: >4 bytes → suppress regardless of content).
+    /// After the fix: `classify_input(b"hello")` returns `PredictBatch` carrying all
+    /// five chars, so key-repeat / fast typing produces visible predictions.
     #[test]
-    fn classify_bulk_suppressed() {
-        // 5 bytes that are not a recognised escape sequence
+    fn classify_printable_batch_not_bulk_suppressed() {
+        // FAIL BEFORE FIX: b"hello" is >4 bytes → BulkSuppressed; PredictBatch does not exist.
+        // PASS AFTER FIX:  b"hello" is all single-width printable → PredictBatch with 5 chars.
+        let action = classify_input(b"hello");
+        match &action {
+            InputAction::PredictBatch(chars) => {
+                assert_eq!(
+                    chars.len(),
+                    5,
+                    "D-02: printable batch 'hello' must yield PredictBatch with 5 chars"
+                );
+                let expected: Vec<(char, u16)> = "hello".chars().map(|c| (c, 1u16)).collect();
+                assert_eq!(
+                    chars, &expected,
+                    "D-02: PredictBatch chars must match 'hello' with col_width=1 each"
+                );
+            }
+            other => panic!(
+                "D-02: classify_input(b\"hello\") must return PredictBatch, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_bulk_suppressed_with_escape_still_suppresses() {
+        // A batch containing an escape byte must still be BulkSuppressed (content inspection
+        // falls through to the flat guard when any byte is a control/escape char).
         assert_eq!(
-            classify_input(b"hello"),
+            classify_input(b"ab\x1bcd"),
             InputAction::BulkSuppressed,
-            ">4 non-escape bytes must yield BulkSuppressed"
+            "batch with escape byte must still yield BulkSuppressed"
         );
     }
 
@@ -1520,11 +1627,13 @@ mod tests {
 
     #[test]
     fn bulk_suppressed_becomes_tentative() {
+        // Use a batch with an escape byte — content inspection falls through to
+        // BulkSuppressed; predictable-only batches (e.g. b"hello") are now PredictBatch.
         let screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
         let initial_epoch = overlay.prediction_epoch();
 
-        overlay.on_input(b"hello", &screen); // 5 bytes → BulkSuppressed
+        overlay.on_input(b"ab\x1bcd", &screen); // escape byte → BulkSuppressed
         assert!(
             overlay.prediction_epoch() > initial_epoch,
             "BulkSuppressed must increment prediction_epoch (become_tentative)"
@@ -1970,14 +2079,117 @@ mod tests {
         overlay.predicted_cursor = CursorPos { row: 0, col: 3 };
 
         // Trigger BulkSuppressed — must NOT sync predicted_cursor to the confirmed col 10.
-        // "hello" = 5 bytes > BULK_SUPPRESS_THRESHOLD (4), classified as BulkSuppressed.
-        overlay.on_input(b"hello", &screen);
+        // Use a batch with an escape byte so content inspection falls through to BulkSuppressed.
+        // (D-02: pure printable batches like b"hello" are now PredictBatch, not BulkSuppressed.)
+        overlay.on_input(b"ab\x1bcd", &screen);
 
         assert_eq!(
             overlay.predicted_cursor.col,
             3,
             "BUG-F: BulkSuppressed must NOT sync predicted_cursor from confirmed cursor \
              (predicted_cursor must remain at col 3, not snap to confirmed col 10)"
+        );
+    }
+
+    // ── D-02 Typematic / fast-typing adversarial tests (BUG / D-02) ──────────────
+
+    /// D-02 (typematic) regression: a stdin batch of entirely printable single-width
+    /// chars must be predicted char-by-char, NOT collapsed into BulkSuppressed.
+    ///
+    /// Before the fix, `classify_input(b"aaaaa")` returned `BulkSuppressed` (flat
+    /// >4-byte rule). The predictor then called `reset()` → no predictions, no caret
+    /// advance, full repaint glitch in vim on key-repeat.
+    ///
+    /// After the fix, `classify_input(b"aaaaa")` returns `PredictBatch` with 5 chars,
+    /// and `on_input` applies the PredictChar path once per char.
+    #[test]
+    fn typematic_printable_batch_predicts_each_char() {
+        // FAIL BEFORE FIX: classify_input(b"aaaaa") == BulkSuppressed → no PredictBatch.
+        // PASS AFTER FIX:  PredictBatch with 5 chars returned; on_input enqueues 5 predictions.
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Verify classify_input yields PredictBatch (not BulkSuppressed).
+        let action = classify_input(b"aaaaa");
+        match &action {
+            InputAction::PredictBatch(chars) => {
+                assert_eq!(
+                    chars.len(),
+                    5,
+                    "D-02 typematic: classify_input(b\"aaaaa\") must yield PredictBatch with 5 chars"
+                );
+            }
+            other => panic!(
+                "D-02 typematic: classify_input(b\"aaaaa\") must return PredictBatch, got {other:?} \
+                 (BUG: fast-typing batch is being wrongly suppressed)"
+            ),
+        }
+
+        // Verify on_input enqueues 5 predictions.
+        overlay.on_input(b"aaaaa", &screen);
+        assert_eq!(
+            overlay.pending.len(),
+            5,
+            "D-02 typematic: on_input(b\"aaaaa\") must enqueue 5 pending predictions, not 0 \
+             (BUG: fast-typing batch is being wrongly suppressed)"
+        );
+        assert!(
+            !matches!(classify_input(b"aaaaa"), InputAction::BulkSuppressed),
+            "D-02 typematic: b\"aaaaa\" must NOT be classified as BulkSuppressed after D-02 fix"
+        );
+    }
+
+    /// D-02 (typematic) regression: a batch containing any escape/control byte must
+    /// still be `BulkSuppressed` — content inspection only enables batch-prediction
+    /// for clean printable-only batches.
+    ///
+    /// Before the fix: `b"ab\x1bcd"` (5 bytes, escape at index 2) was BulkSuppressed
+    /// by the flat length rule. After the fix, it remains BulkSuppressed because the
+    /// escape byte fails the printable-only content inspection.
+    #[test]
+    fn typematic_mixed_batch_with_escape_is_suppressed() {
+        // FAIL BEFORE FIX: n/a — escape batch was already suppressed.
+        // PASS AFTER FIX:  escape batch is still suppressed (regression guard).
+        assert_eq!(
+            classify_input(b"ab\x1bcd"),
+            InputAction::BulkSuppressed,
+            "D-02 typematic: batch with escape byte must remain BulkSuppressed even after D-02 fix"
+        );
+    }
+
+    /// D-02 (typematic) regression: `on_input` with a printable 5-char batch advances
+    /// the predicted cursor by 5 columns from the epoch-start baseline.
+    ///
+    /// Before the fix, `on_input(b"aaaaa")` triggered BulkSuppressed → `reset()` →
+    /// predicted_cursor.col unchanged (or reset to 0). After the fix, each char
+    /// in the batch is predicted in sequence and the caret advances by 1 per char.
+    #[test]
+    fn typematic_batch_advances_cursor() {
+        // FAIL BEFORE FIX: BulkSuppressed resets epoch; cursor does NOT advance by 5.
+        // PASS AFTER FIX:  PredictBatch predicts each char; cursor advances by 5.
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Establish epoch_start_col = 0 (cursor at col 0 after reset).
+        overlay.reset();
+        let diff = make_diff_with_char(1, 0, 0, ' ');
+        screen.apply(&diff);
+        overlay.cull(&screen, 1, 5);
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor()); // epoch_start_col = 0
+
+        // Feed a 5-char printable batch (simulating key-repeat of 'a' × 5).
+        overlay.on_input(b"aaaaa", &screen);
+
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            5,
+            "D-02 typematic: on_input(b\"aaaaa\") must advance predicted_cursor.col by 5 \
+             (BUG: fast-typing batch is being wrongly suppressed; cursor not advancing)"
+        );
+        assert_eq!(
+            overlay.pending.len(),
+            5,
+            "D-02 typematic: on_input(b\"aaaaa\") must enqueue 5 pending predictions"
         );
     }
 
