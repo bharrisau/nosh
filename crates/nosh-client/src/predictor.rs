@@ -457,11 +457,20 @@ impl PredictionOverlay {
                 self.cursor_motion_pending = true;
             }
             InputAction::BulkSuppressed => {
-                // Bulk input (large byte batch): reset without cursor sync. There is no
-                // reliable confirmed cursor available at the time a BulkSuppressed fires
-                // (the server has not yet processed the batch), so keep calling plain
-                // reset() (unchanged from pre-D-05 behavior).
-                self.reset();
+                // D-03 hypothesis fix: if predictions are already visible, do NOT clear them
+                // on BulkSuppressed — call become_tentative() instead so existing predictions
+                // survive until cull() reconciles against the confirmed grid (~RTT later).
+                // This matches Mosh's approach: only cull() on confirmed mismatch, not proactively.
+                // If pending is empty, reset() is harmless and preferred (cleaner state).
+                // Rationale: a mash/key-repeat burst containing a control byte classifies as
+                // BulkSuppressed; the old unconditional reset() erased already-shown predictions,
+                // causing the "letters disappear" typematic glitch (RESEARCH Q3 hypothesis).
+                if self.pending.is_empty() {
+                    self.reset();
+                } else {
+                    self.become_tentative();
+                    self.needs_epoch_start_sync = true;
+                }
             }
             InputAction::BracketedPasteStart => {
                 self.in_bracketed_paste = true;
@@ -2502,6 +2511,37 @@ mod tests {
             6,
             "CR-01: backspace clamp floor must be col 6 (new prompt boundary from post-Tab sync), \
              not col 9 (stale pre-Tab cursor position from reset_with_cursor)"
+        );
+    }
+
+    /// D-03 hypothesis fix: BulkSuppressed must not drop existing visible predictions.
+    ///
+    /// Before the fix, BulkSuppressed always called reset() → pending.clear() → letters
+    /// disappeared until the next confirming datagram (~RTT later).
+    /// After the fix, BulkSuppressed calls become_tentative() when pending.len() > 0,
+    /// preserving existing predictions for cull() to reconcile.
+    #[test]
+    fn bulk_suppressed_does_not_drop_existing_predictions() {
+        // FAIL BEFORE FIX: pending.len() == 0 after BulkSuppressed (reset() clears all).
+        // PASS AFTER FIX:  pending.len() == 1 (existing prediction preserved; become_tentative only).
+        let screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Enqueue one printable prediction (simulating a prior keystroke).
+        overlay.on_input(b"a", &screen);
+        assert_eq!(overlay.pending.len(), 1, "setup: one prediction in pending");
+
+        // Trigger BulkSuppressed with a mixed batch (escape byte → content inspection fails).
+        // b"ab\x1bcd" is 5 bytes (> BULK_SUPPRESS_THRESHOLD=4) and contains ESC (0x1b,
+        // width=None) → all_single_width=false → BulkSuppressed. Confirmed by the existing
+        // classify_bulk_suppressed_with_escape_still_suppresses test.
+        overlay.on_input(b"ab\x1bcd", &screen);
+
+        assert_eq!(
+            overlay.pending.len(),
+            1,
+            "D-03: BulkSuppressed with pending>0 must preserve existing predictions \
+             (become_tentative, not reset+clear)"
         );
     }
 }
