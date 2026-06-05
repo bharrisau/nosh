@@ -273,6 +273,10 @@ Plans:
 - **Startup typing glitch** — a larger prediction glitch occurs at the very beginning of a session (first keystrokes / first epoch) but not later. Needs reproduction; suspected `awaiting_first_cull` / initial `epoch_start_col` / first-epoch baseline interaction in `predictor.rs`.
 - **Slow / progressive full-screen repaint** — vim TUI startup paints top-down and a pasted multi-line block paints bottom-up in visible waves at 150 ms RTT. Root: the server session pump (`nosh-server/src/server.rs:580`) emits at most ONE state-diff datagram per 16 ms tick, MTU-capped (`conn.max_datagram_size()`), deferring overflow cells to later ticks (`server.rs:684-703`); a full-screen repaint is many MTUs so it drips over many ticks × RTT. NOT QUIC flow control (datagrams are not ack-gated; send buffer is 1 MiB). Design decision required: burst multiple datagrams per tick (congestion-bounded) vs raise per-tick byte budget vs reliable-stream fallback for full-screen repaints (the Phase 11 deferred large-repaint strategy). Direction artefact (top-down/bottom-up) is the `build_state_diff` cell-walk + deferral order.
 **Origin**: surfaced during 999.3 live validation, 2026-06-05.
+**Plans**: 2 plans
+Plans:
+- [ ] 999.4-01-PLAN.md — D-01: bounded-burst datagram send per diff tick (both server pumps; congestion-transparent via datagram_send_buffer_space)
+- [ ] 999.4-02-PLAN.md — D-02 PredictEnter line-advance + D-03 on_input decision-trace instrumentation & BulkSuppressed preserves-pending fix (predictor.rs)
 
 ### Phase 999.5: Full-screen TUI rendering correctness (alternate-screen buffer + cell width)
 **Goal**: Make complex full-screen TUI applications (Claude Code, vim, htop) render correctly over nosh. Investigation-first — reproduce on a Linux client↔server before fixing.
