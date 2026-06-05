@@ -190,6 +190,21 @@ pub struct PredictionOverlay {
     term_cols: u16,
     /// Terminal row count.
     term_rows: u16,
+    /// The confirmed cursor column at the start of the most recent fresh input epoch.
+    ///
+    /// Set by `sync_cursor_from_confirmed` once after each `reset()` call (i.e. after
+    /// Enter / Ctrl-C / epoch-reset), under the CR-01 guard (pending empty AND no
+    /// outstanding cursor motion). The `needs_epoch_start_sync` flag gates this so that
+    /// mid-epoch confirmations (pending empties because typed chars were confirmed by the
+    /// server) do NOT overwrite the floor — only the first sync after a reset captures
+    /// the true "where typing begins" boundary. Used as a clamp floor in `PredictBackspace`
+    /// and `PredictCursorLeft` so the predicted caret cannot retreat past the prompt start —
+    /// fixing BUG-E (D-01). Initialized to 0.
+    epoch_start_col: u16,
+    /// Set to `true` by `reset()` (and `reset_with_cursor()`); cleared once
+    /// `sync_cursor_from_confirmed` captures `epoch_start_col` for the new epoch.
+    /// Prevents mid-epoch datagram confirmations from updating the clamp floor (D-01).
+    needs_epoch_start_sync: bool,
 }
 
 impl PredictionOverlay {
@@ -207,6 +222,8 @@ impl PredictionOverlay {
             cursor_motion_pending: false,
             term_cols: cols,
             term_rows: rows,
+            epoch_start_col: 0,
+            needs_epoch_start_sync: false,
         }
     }
 
@@ -243,6 +260,16 @@ impl PredictionOverlay {
     pub fn sync_cursor_from_confirmed(&mut self, confirmed: CursorPos) {
         if self.pending.is_empty() && !self.cursor_motion_pending {
             self.predicted_cursor = confirmed;
+            // D-01 (BUG-E): record the column where typing begins after a fresh epoch
+            // reset (Enter / Ctrl-C / epoch-reset). The `needs_epoch_start_sync` flag
+            // is set by `reset()` / `reset_with_cursor()` and cleared here after the
+            // first sync so that mid-epoch confirmations (server echoing back typed
+            // chars that empty `pending`) do NOT overwrite the floor — only the first
+            // datagram after a reset captures the true prompt-boundary column.
+            if self.needs_epoch_start_sync {
+                self.epoch_start_col = confirmed.col;
+                self.needs_epoch_start_sync = false;
+            }
         }
     }
 
@@ -331,7 +358,9 @@ impl PredictionOverlay {
                 // CR-02 fix: remove the prediction at the vacated column so it no
                 // longer shows in the overlay. Without this, the deleted char remains
                 // visible until the next cull() — worse than no prediction (D-15-01).
-                if self.predicted_cursor.col > 0 {
+                // D-01 (BUG-E): clamp at epoch_start_col (the prompt boundary) instead
+                // of col 0 so backspace cannot walk the predicted caret past the prompt.
+                if self.predicted_cursor.col > self.epoch_start_col {
                     let vacated_col = self.predicted_cursor.col - 1;
                     let row = self.predicted_cursor.row;
                     self.pending.retain(|p| !(p.row == row && p.col == vacated_col));
@@ -342,7 +371,9 @@ impl PredictionOverlay {
                 }
             }
             InputAction::PredictCursorLeft => {
-                if self.predicted_cursor.col > 0 {
+                // D-01 (BUG-E): clamp at epoch_start_col (the prompt boundary) instead
+                // of col 0 so cursor-left cannot walk the predicted caret past the prompt.
+                if self.predicted_cursor.col > self.epoch_start_col {
                     self.predicted_cursor.col -= 1;
                 }
                 // Pure motion enqueues no pending cell; mark so predicted_cursor() emits
@@ -497,6 +528,10 @@ impl PredictionOverlay {
         // outstanding local cursor motion: the new epoch is tentative (hidden) until
         // the server confirms, so no speculative caret should be shown (BUG-D).
         self.cursor_motion_pending = false;
+        // D-01 (BUG-E): signal that the next sync_cursor_from_confirmed call should
+        // capture the new epoch-start column (the prompt boundary). Cleared once
+        // captured so mid-epoch datagram confirmations don't reset the floor.
+        self.needs_epoch_start_sync = true;
     }
 
     /// Remove all predictions with the given `tentative_until_epoch`.
@@ -1744,8 +1779,8 @@ mod tests {
     ///
     /// Before the fix, `PredictBackspace` clamped at col 0 — the predictor had no
     /// knowledge of the prompt boundary. After the fix, it clamps at the epoch-start
-    /// column recorded by `sync_cursor_from_confirmed` at the start of each fresh input
-    /// epoch.
+    /// column recorded by `sync_cursor_from_confirmed` after a fresh epoch reset
+    /// (e.g. the Enter that submitted the previous command).
     #[test]
     fn bug_e_backspace_clamps_at_epoch_start_col() {
         // FAIL BEFORE FIX: cursor walks past col 5 (epoch start) toward col 0.
@@ -1753,7 +1788,12 @@ mod tests {
         let mut screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
 
-        // Server confirms cursor at col 5 (after a prompt "user> ").
+        // Simulate user pressing Enter on the previous command → epoch reset.
+        // In a real session this happens via EpochReset in on_input; call reset()
+        // directly to set needs_epoch_start_sync = true.
+        overlay.reset(); // signals: next sync_cursor_from_confirmed captures epoch_start_col
+
+        // Server advances cursor to col 5 (new prompt "user> ").
         let diff = make_diff_with_char(1, 0, 5, ' ');
         screen.apply(&diff);
         overlay.cull(&screen, 1, 5);
@@ -1778,8 +1818,7 @@ mod tests {
     ///
     /// Before the fix, `PredictCursorLeft` clamped at col 0 — the predictor had no
     /// knowledge of the prompt boundary. After the fix, it clamps at the epoch-start
-    /// column recorded by `sync_cursor_from_confirmed` at the start of each fresh input
-    /// epoch.
+    /// column recorded by `sync_cursor_from_confirmed` after a fresh epoch reset.
     #[test]
     fn bug_e_cursor_left_clamps_at_epoch_start_col() {
         // FAIL BEFORE FIX: cursor-left walks past col 5 (epoch start) toward col 0.
@@ -1787,7 +1826,10 @@ mod tests {
         let mut screen = make_screen(80, 24);
         let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
 
-        // Server confirms cursor at col 5 (after a prompt "user> ").
+        // Simulate user pressing Enter on the previous command → epoch reset.
+        overlay.reset(); // signals: next sync_cursor_from_confirmed captures epoch_start_col
+
+        // Server advances cursor to col 5 (new prompt "user> ").
         let diff = make_diff_with_char(1, 0, 5, ' ');
         screen.apply(&diff);
         overlay.cull(&screen, 1, 5);
