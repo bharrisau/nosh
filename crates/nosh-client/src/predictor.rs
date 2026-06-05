@@ -603,13 +603,16 @@ impl PredictionOverlay {
         self.pending.clear();
         self.become_tentative();
         self.cursor_motion_pending = false;
-        // D-05 (BUG-F): force-sync the predicted caret so the post-`read -s` Enter
-        // advances the line from the correct position. Direct assignment bypasses CR-01
-        // (pending IS empty — we just cleared it) and supersedes needs_epoch_start_sync
-        // for this epoch's floor (both cursor and floor are known from confirmed here).
+        // D-05 (BUG-F): force-sync predicted caret directly (bypasses CR-01 guard;
+        // pending is empty so the guard's purpose does not apply).
         self.predicted_cursor = confirmed;
-        self.epoch_start_col = confirmed.col;
-        self.needs_epoch_start_sync = false;
+        // D-01 (CR-01 fix): re-arm needs_epoch_start_sync so the NEXT
+        // sync_cursor_from_confirmed (after the server confirms the new prompt
+        // position post-Enter) captures the correct epoch_start_col. Do NOT use
+        // confirmed.col here — that is the pre-Enter cursor position, not the
+        // new prompt boundary. The reset() path already does this correctly;
+        // reset_with_cursor must mirror it.
+        self.needs_epoch_start_sync = true;
     }
 
     /// Remove all predictions with the given `tentative_until_epoch`.
@@ -2216,5 +2219,88 @@ mod tests {
         let cursor2 = screen.confirmed_cursor();
         assert_eq!(cursor2.row, 3, "confirmed_cursor.row must be 3 after apply");
         assert_eq!(cursor2.col, 15, "confirmed_cursor.col must be 15 after apply");
+    }
+
+    // ── CR-01 adversarial: reset_with_cursor → sync_cursor_from_confirmed chain ─
+
+    /// CR-01 adversarial regression: `reset_with_cursor` must NOT lock `epoch_start_col`
+    /// to the stale pre-Enter cursor position. The clamp floor for the NEXT epoch must
+    /// be captured from the NEW prompt position delivered by `sync_cursor_from_confirmed`.
+    ///
+    /// This test exercises the real call chain from `run_pump`:
+    ///   `reset_with_cursor(prev_cursor)` → `sync_cursor_from_confirmed(new_prompt_cursor)`
+    ///   → `PredictBackspace` (repeat)
+    ///
+    /// The backspace clamp floor must follow the NEW prompt column (6), NOT the stale
+    /// pre-Enter column (9). Before the fix, `epoch_start_col` was set to `confirmed.col`
+    /// at `reset_with_cursor` time (col 9) and `needs_epoch_start_sync` was set to false,
+    /// preventing the subsequent sync from correcting it — so PredictBackspace stopped at
+    /// col 9 instead of col 6.
+    ///
+    /// Before the fix: backspace clamps at col 9 (stale pre-Enter position).
+    /// After the fix:  backspace clamps at col 6 (new prompt boundary, from post-Enter sync).
+    #[test]
+    fn cr01_reset_with_cursor_epoch_start_col_follows_new_prompt_not_pre_enter() {
+        // FAIL BEFORE FIX: backspace stops at col 9 (stale epoch_start_col from reset_with_cursor).
+        // PASS AFTER FIX:  backspace stops at col 6 (epoch_start_col from post-Enter sync).
+        let mut screen = make_screen(80, 24);
+        let mut overlay = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
+
+        // Step 1: establish a pre-Enter session state.
+        // The user typed "abc" after a prompt at col 6 (e.g. "user> abc").
+        // Confirmed cursor is now at col 9 (6 + 3 chars).
+        let diff_before_enter = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 9 },
+            runs: vec![],
+        };
+        screen.apply(&diff_before_enter);
+        overlay.cull(&screen, 1, 5);
+        // Simulate that epoch_start_col was correctly set to 6 earlier (user was typing
+        // at prompt col 6). We set it directly to mirror what reset() + sync would set.
+        overlay.epoch_start_col = 6;
+        overlay.needs_epoch_start_sync = false;
+
+        // Step 2: user presses Enter. run_pump calls on_input(b"\r", &screen) which
+        // triggers EpochReset → reset_with_cursor(screen.confirmed_cursor()).
+        // At this moment, confirmed cursor is at col 9 (the pre-Enter position).
+        // The bug: reset_with_cursor sets epoch_start_col = 9 and needs_epoch_start_sync = false.
+        // The fix: reset_with_cursor sets needs_epoch_start_sync = true (leaves epoch_start_col alone).
+        overlay.on_input(b"\r", &screen); // EpochReset → reset_with_cursor({row:0, col:9})
+
+        // Step 3: server processes Enter and advances cursor to the new prompt on row 1 col 6.
+        let diff_after_enter = StateDiff {
+            epoch: 2,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 1, col: 6 },
+            runs: vec![],
+        };
+        screen.apply(&diff_after_enter);
+        overlay.cull(&screen, 2, 5);
+        // The datagram arm calls sync_cursor_from_confirmed after cull.
+        // With the fix, needs_epoch_start_sync is still true here → epoch_start_col = 6.
+        // Without the fix, needs_epoch_start_sync is false → epoch_start_col stays at 9 (stale).
+        overlay.sync_cursor_from_confirmed(screen.confirmed_cursor());
+
+        // Step 4: user types "hello" (5 chars from col 6 → cursor at col 11), then
+        // presses backspace 20 times. The clamp floor must stop at col 6, not col 9.
+        overlay.on_input(b"h", &screen);
+        overlay.on_input(b"e", &screen);
+        overlay.on_input(b"l", &screen);
+        overlay.on_input(b"l", &screen);
+        overlay.on_input(b"o", &screen);
+        for _ in 0..20 {
+            overlay.on_input(&[0x7f], &screen); // backspace
+        }
+
+        assert_eq!(
+            overlay.predicted_cursor.col,
+            6,
+            "CR-01: backspace clamp floor must be col 6 (new prompt boundary from post-Enter sync), \
+             not col 9 (stale pre-Enter cursor position from reset_with_cursor)"
+        );
     }
 }
