@@ -121,6 +121,8 @@ pub enum InputAction {
     PredictLineEnd,
     /// Reset the prediction epoch; display nothing until server confirms.
     EpochReset,
+    /// Enter/newline — predict cursor line-advance (col 0 of next row), Mosh-style. // filled in Task 2
+    PredictEnter,
     /// Begin bracketed paste — suppress all prediction.
     BracketedPasteStart,
     /// End bracketed paste — re-enable prediction (still tentative until server confirms).
@@ -324,7 +326,9 @@ impl PredictionOverlay {
     /// The keystroke is still forwarded to the server unchanged; this only updates
     /// local display state.
     pub fn on_input(&mut self, bytes: &[u8], screen: &ClientScreen) {
+        let pending_before = self.pending.len(); // D-03: capture before classify/match
         let action = classify_input(bytes);
+        let action_kind = action_kind_tag(&action); // D-03: tag before match (Option b — avoids moving action)
         match action {
             InputAction::PredictChar { ch, col_width } => {
                 if self.in_bracketed_paste {
@@ -421,6 +425,12 @@ impl PredictionOverlay {
                 // predictions exist — does not apply here).
                 self.reset_with_cursor(screen.confirmed_cursor());
             }
+            InputAction::PredictEnter => {
+                // D-02: full handler wired in Task 2; stub matches EpochReset behaviour
+                // so the build stays clean while classify_input still returns EpochReset
+                // for b"\r"/b"\n" (Task 1). Task 2 replaces this arm.
+                self.reset_with_cursor(screen.confirmed_cursor());
+            }
             InputAction::BulkSuppressed => {
                 // Bulk input (large byte batch): reset without cursor sync. There is no
                 // reliable confirmed cursor available at the time a BulkSuppressed fires
@@ -474,6 +484,19 @@ impl PredictionOverlay {
                 }
             }
         }
+        // D-03 decision-trace: one debug event per on_input call, after the match.
+        // No character content logged (T-15-08 — action_kind_tag omits ch/batch content).
+        tracing::debug!(
+            target: "nosh::predict",
+            event = "on_input",
+            batch_len = bytes.len(),
+            action = action_kind,
+            pending_before,
+            pending_after = self.pending.len(),
+            predictions_dropped = pending_before.saturating_sub(self.pending.len()),
+            pred_row = self.predicted_cursor.row,
+            pred_col = self.predicted_cursor.col,
+        );
     }
 
     /// Confirm or cull predictions against the latest confirmed grid state.
@@ -727,6 +750,29 @@ impl Overlay for PredictionOverlay {
 }
 
 // ── Input classifier ──────────────────────────────────────────────────────────
+
+/// Map an `InputAction` to a static string tag for tracing, with NO char/byte content.
+///
+/// Used by the D-03 `event = "on_input"` decision-trace. `PredictBatch` logs as
+/// "PredictBatch" when the batch has >1 char; "PredictChar" for a single-element batch.
+/// Neither case logs any character content (T-15-08).
+fn action_kind_tag(a: &InputAction) -> &'static str {
+    match a {
+        InputAction::PredictChar { .. } => "PredictChar",
+        InputAction::PredictBackspace => "PredictBackspace",
+        InputAction::PredictCursorLeft => "PredictCursorLeft",
+        InputAction::PredictCursorRight => "PredictCursorRight",
+        InputAction::PredictLineStart => "PredictLineStart",
+        InputAction::PredictLineEnd => "PredictLineEnd",
+        InputAction::PredictEnter => "PredictEnter",
+        InputAction::EpochReset => "EpochReset",
+        InputAction::BulkSuppressed => "BulkSuppressed",
+        InputAction::BracketedPasteStart => "BracketedPasteStart",
+        InputAction::BracketedPasteEnd => "BracketedPasteEnd",
+        InputAction::PredictBatch(v) if v.len() > 1 => "PredictBatch",
+        InputAction::PredictBatch(_) => "PredictChar",
+    }
+}
 
 /// Classify a keystroke batch into a predictor action.
 ///
