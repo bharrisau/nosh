@@ -1,0 +1,4 @@
+target
+# corpus/ is tracked (seed inputs committed for reproducibility)
+artifacts
+coverage

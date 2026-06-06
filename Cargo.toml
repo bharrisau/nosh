@@ -7,6 +7,9 @@ members = [
     "crates/nosh-server",
     "crates/nosh-client",
 ]
+# Exclude the fuzz crate so `cargo test/build --workspace` never touches the
+# #[no_main] fuzz binaries (they are nightly-only and break the test runner).
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2021"

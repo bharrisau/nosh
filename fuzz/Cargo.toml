@@ -1,0 +1,60 @@
+[package]
+name = "nosh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nosh-proto  = { path = "../crates/nosh-proto" }
+nosh-server = { path = "../crates/nosh-server" }
+arbitrary   = { version = "1", features = ["derive"] }
+quinn-proto = "0.11"
+quinn       = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls      = { version = "0.23", default-features = false, features = ["ring", "std"] }
+bytes       = "1"
+tokio       = { version = "1", features = ["rt"] }
+rcgen       = "0.14"
+
+# Use independent workspace for fuzz crate.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "codec_decode"
+path = "fuzz_targets/codec_decode.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "read_message"
+path = "fuzz_targets/read_message.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_datagram"
+path = "fuzz_targets/decode_datagram.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_epoch_ack"
+path = "fuzz_targets/decode_epoch_ack.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "osc_accumulation"
+path = "fuzz_targets/osc_accumulation.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "quic_packet"
+path = "fuzz_targets/quic_packet.rs"
+test = false
+doc  = false
