@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: executing
-stopped_at: "Phase 999.1: adaptive deep-fuzz running (run-adaptive.sh pid in driver.pid), RESTARTED 13:48Z with fixed newest-log saturation logic (prior version read stale logs). 9 workers @nice19 quic=5 osc=4, decoders retired, deadline ~04:45Z. Corpus preserved (quic 1.9k, osc 133k). Sentinel bd4exq1tt wakes on crash/stall/deadline. Resume: triage -> docs/999.1-SECURITY.md -> code-review -> opus verify -> complete."
-last_updated: "2026-06-06T13:51:07.622Z"
+stopped_at: "Phase 999.1 COMPLETE — server pre-auth attack-surface hardening. 6 cargo-fuzz targets + QUIC packet fuzzer, ~18h adaptive campaign, ZERO crashes. cargo-audit in CI, deny.toml, docs/999.1-SECURITY.md. Verified passed 4/4. Code review found a post-auth OSC OOM (vte std unbounded osc_raw; Phase-16 mitigation was wrong) -> documented + filed phase 999.7. Operator TODO: push to confirm green audit CI."
+last_updated: "2026-06-06T23:17:57.250Z"
 last_activity: 2026-06-06 -- Phase 999.1 execution started
 progress:
-  total_phases: 15
-  completed_phases: 10
+  total_phases: 16
+  completed_phases: 11
   total_plans: 29
-  completed_plans: 28
-  percent: 67
+  completed_plans: 29
+  percent: 69
 ---
 
 # Project State
@@ -162,9 +162,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-06T13:51:07.590Z
-Stopped at: Phase 999.1: adaptive deep-fuzz running (run-adaptive.sh pid in driver.pid), RESTARTED 13:48Z with fixed newest-log saturation logic (prior version read stale logs). 9 workers @nice19 quic=5 osc=4, decoders retired, deadline ~04:45Z. Corpus preserved (quic 1.9k, osc 133k). Sentinel bd4exq1tt wakes on crash/stall/deadline. Resume: triage -> docs/999.1-SECURITY.md -> code-review -> opus verify -> complete.
-Resume file: fuzz/overnight/status.txt
+Last session: 2026-06-06T23:17:57.220Z
+Stopped at: Phase 999.1 COMPLETE — server pre-auth attack-surface hardening. 6 cargo-fuzz targets + QUIC packet fuzzer, ~18h adaptive campaign, ZERO crashes. cargo-audit in CI, deny.toml, docs/999.1-SECURITY.md. Verified passed 4/4. Code review found a post-auth OSC OOM (vte std unbounded osc_raw; Phase-16 mitigation was wrong) -> documented + filed phase 999.7. Operator TODO: push to confirm green audit CI.
+Resume file: docs/999.1-SECURITY.md
 
 ## Operator Next Steps
 
