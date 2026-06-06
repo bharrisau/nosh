@@ -121,14 +121,20 @@ fuzz_target!(|data: &[u8]| {
     // - None → silently dropped (expected for malformed/short packets)
     // - Some(DatagramEvent::Response { .. }) → Version-Negotiation or
     //   Stateless-Reset; we discard it without further processing
-    // - Some(DatagramEvent::NewConnection(_)) → would need accept() to drain;
-    //   we drop the handle — state accumulation is intentional (Pitfall 5)
+    // - Some(DatagramEvent::NewConnection(incoming)) → release via ep.ignore() so
+    //   the endpoint's Incoming slab / CID index does not grow across iterations
+    //   (WR-01: dropping the Incoming leaks half-open state; quinn warns it "may
+    //   cause memory leak and eventual inability to accept new connections").
     // - Some(DatagramEvent::ConnectionEvent { .. }) → routed to an existing
     //   connection handle; none are open, so this is unreachable in practice
     //
     // NEVER .unwrap() the result — only a panic or OOM fails the fuzzer.
     let pkt = BytesMut::from(data);
-    let _ = ep.handle(now, remote, None, None, pkt, &mut buf);
+    if let Some(quinn_proto::DatagramEvent::NewConnection(incoming)) =
+        ep.handle(now, remote, None, None, pkt, &mut buf)
+    {
+        let _ = ep.ignore(incoming);
+    }
     // `buf` may contain a response (Version-Negotiation, Stateless-Reset).
     // We drain it to avoid unbounded growth across iterations.
     buf.clear();

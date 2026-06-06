@@ -3,7 +3,9 @@
 # NOT wired into CI (D-03 boundary: only cargo-audit is in CI).
 
 [advisories]
-# Report unmaintained crates at the workspace level; treat unsound code as an error.
+# cargo-deny 0.19 denies security vulnerabilities by default (no `vulnerability`
+# key exists in this schema). Treat unsound code as an error; report unmaintained
+# crates workspace-wide.
 unmaintained = "workspace"
 unsound      = "all"
 
