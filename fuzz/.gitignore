@@ -1,4 +1,13 @@
 target
-# corpus/ is tracked (seed inputs committed for reproducibility)
 artifacts
 coverage
+# Seed corpora are tracked (committed for reproducibility); the much larger
+# corpus GROWTH from long fuzzing runs is ignored to keep the repo small.
+corpus/
+# Overnight-run transient state (logs/status/result); the *.sh drivers are kept.
+overnight/*.log
+overnight/status.txt
+overnight/RESULT
+overnight/crashes.*
+overnight/*.pid
+overnight/driver.out
