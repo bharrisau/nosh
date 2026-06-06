@@ -35,7 +35,13 @@ nix = { version = "0.29", default-features = false, features = ["signal", "user"
 # re-mitigated by explicit caps applied in osc_dispatch() BEFORE storing:
 #   - OSC 52 data truncated to OSC_52_MAX_BYTES (65536) before storing in osc52_pending
 #   - OSC 0/2 title only stored when len <= MAX_TITLE_BYTES (1024)
-# The transient vte internal buffer (OS pipe buffer sized) is bounded by POSIX
-# pipe semantics before osc_dispatch() is called. Adversarial large-OSC tests in
-# terminal.rs confirm no panic and bounded output. See 16-RESEARCH.md Pattern 1.
+# WARNING (999.1 review): the Phase-16 claim that vte's internal OSC buffer is
+# "bounded by POSIX pipe semantics before osc_dispatch()" is INCORRECT. With the
+# "std" feature, vte's osc_raw is an unbounded Vec<u8> (vte-0.15.0/src/lib.rs:63),
+# and it accumulates OSC bytes ACROSS advance()/read calls until the terminator —
+# the pipe buffer bounds a single read, not the accumulated buffer. The
+# osc_dispatch() caps (OSC_52_MAX_BYTES / MAX_TITLE_BYTES) only limit what is
+# STORED, not what vte ALLOCATES while parsing. A long OSC in PTY output can OOM
+# the server terminal model (post-auth DoS). Tracked + fix in phase 999.7
+# (bound OSC accumulation before vte). See docs/999.1-SECURITY.md §7 (OSC-OOM).
 vte = { version = "0.15" }
