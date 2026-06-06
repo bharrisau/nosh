@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: executing
-stopped_at: "Phase 999.1: ADAPTIVE deep-fuzz running (run-adaptive.sh, pid in fuzz/overnight/driver.pid). 9 workers @ nice19, ~15h deadline from 11:06Z. 4 decoders retired (saturated); pool concentrated quic=5 osc=4. Auto-retires a target after 2 flat-coverage hours & shifts its workers to the other; soaks to 2 workers if both saturate. Sentinel bd4exq1tt wakes assistant on crash/stall/deadline. Then: triage -> docs/999.1-SECURITY.md -> code-review -> opus verify -> complete."
-last_updated: "2026-06-06T11:07:43.800Z"
+stopped_at: "Phase 999.1: adaptive deep-fuzz running (run-adaptive.sh pid in driver.pid), RESTARTED 13:48Z with fixed newest-log saturation logic (prior version read stale logs). 9 workers @nice19 quic=5 osc=4, decoders retired, deadline ~04:45Z. Corpus preserved (quic 1.9k, osc 133k). Sentinel bd4exq1tt wakes on crash/stall/deadline. Resume: triage -> docs/999.1-SECURITY.md -> code-review -> opus verify -> complete."
+last_updated: "2026-06-06T13:51:07.622Z"
 last_activity: 2026-06-06 -- Phase 999.1 execution started
 progress:
   total_phases: 15
@@ -162,8 +162,8 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-06T11:07:43.783Z
-Stopped at: Phase 999.1: ADAPTIVE deep-fuzz running (run-adaptive.sh, pid in fuzz/overnight/driver.pid). 9 workers @ nice19, ~15h deadline from 11:06Z. 4 decoders retired (saturated); pool concentrated quic=5 osc=4. Auto-retires a target after 2 flat-coverage hours & shifts its workers to the other; soaks to 2 workers if both saturate. Sentinel bd4exq1tt wakes assistant on crash/stall/deadline. Then: triage -> docs/999.1-SECURITY.md -> code-review -> opus verify -> complete.
+Last session: 2026-06-06T13:51:07.590Z
+Stopped at: Phase 999.1: adaptive deep-fuzz running (run-adaptive.sh pid in driver.pid), RESTARTED 13:48Z with fixed newest-log saturation logic (prior version read stale logs). 9 workers @nice19 quic=5 osc=4, decoders retired, deadline ~04:45Z. Corpus preserved (quic 1.9k, osc 133k). Sentinel bd4exq1tt wakes on crash/stall/deadline. Resume: triage -> docs/999.1-SECURITY.md -> code-review -> opus verify -> complete.
 Resume file: fuzz/overnight/status.txt
 
 ## Operator Next Steps
