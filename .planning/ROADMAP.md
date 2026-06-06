@@ -244,13 +244,13 @@ Parking lot for ideas not scheduled into a milestone yet (999.x). Promote via `/
 **Goal**: Be confident the server's UDP/443 QUIC ingress is safe to expose raw to the public internet — via fuzzing and a focused security scan of everything reachable before/at authentication.
 **Scope**: `cargo-fuzz`/libFuzzer harnesses on the `nosh-proto` decoders (datagram `StateDiff`/`DiffRun`, reliable-stream `Message` postcard decode, OSC accumulation), plus a QUIC-packet fuzzer against the server socket (malformed/oversized/truncated packets). Audit half-open / unauthenticated connection memory caps, amplification potential, and pre-auth resource exhaustion (DoS hardening — CLAUDE.md invariant). Output: no panics/OOM/unbounded growth on hostile input; documented residual risk.
 **Origin**: requested 2026-06-02 during M4.
-**Plans:** 4/5 plans executed
+**Plans:** 5/5 plans complete
 Plans:
 - [x] 999.1-01-PLAN.md — Scaffold fuzz/ crate (workspace-excluded), declare six [[bin]] targets, prove harness with codec_decode (D-01)
 - [x] 999.1-02-PLAN.md — Add cargo-audit peer job to CI; no CI fuzz job (D-03)
 - [x] 999.1-03-PLAN.md — read_message / decode_datagram / decode_epoch_ack / osc_accumulation fuzz targets + corpora (D-01)
 - [x] 999.1-04-PLAN.md — Raw QUIC-packet fuzzer via quinn-proto Endpoint::handle, migration(true) (D-02)
-- [ ] 999.1-05-PLAN.md — Residual-risk security doc + deny.toml; resolve amplification A1/A2 from quinn-proto source (D-04)
+- [x] 999.1-05-PLAN.md — Residual-risk security doc + deny.toml; resolve amplification A1/A2 from quinn-proto source (D-04)
 
 ### Phase 999.2: Client trust-boundary hardening (malicious-server resistance)
 **Goal**: Prove a hostile/compromised server cannot extract sensitive local material from the client, cannot escape the terminal, and cannot succeed at MitM.
