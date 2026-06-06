@@ -1,0 +1,29 @@
+# cargo-deny configuration for nosh.
+# Run manually: cargo deny check
+# NOT wired into CI (D-03 boundary: only cargo-audit is in CI).
+
+[advisories]
+# Report unmaintained crates at the workspace level; treat unsound code as an error.
+unmaintained = "workspace"
+unsound      = "all"
+
+[bans]
+# Warn on multiple versions of the same crate to encourage deduplication over time.
+multiple-versions = "warn"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "OpenSSL",
+    # 0BSD (BSD Zero Clause): OSI approved, no restrictions.
+    # Required by: doctest-file (via interprocess → ssh-agent-client-rs) and recvmsg (same path).
+    "0BSD",
+    # MPL-2.0 (Mozilla Public License 2.0): file-level copyleft, widely used, FSF/OSI approved.
+    # Required by: option-ext (via dirs-sys → dirs, used by nosh-client and nosh-server).
+    "MPL-2.0",
+]
