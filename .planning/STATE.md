@@ -4,13 +4,13 @@ milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: executing
 stopped_at: Phase 999.1 context gathered
-last_updated: "2026-06-06T04:48:49.316Z"
+last_updated: "2026-06-06T04:54:51.616Z"
 last_activity: 2026-06-06 -- Phase 999.1 execution started
 progress:
   total_phases: 15
   completed_phases: 10
   total_plans: 29
-  completed_plans: 27
+  completed_plans: 28
   percent: 67
 ---
 
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-01)
 ## Current Position
 
 Phase: 999.1 (server-attack-surface-hardening-expose-to-internet-readiness) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Executing Phase 999.1
 Last activity: 2026-06-06 -- Phase 999.1 execution started
 
 ```
-Progress: [█████████░] 93%
+Progress: [██████████] 97%
 ```
 
 ## Performance Metrics
@@ -82,6 +82,7 @@ Progress: [█████████░] 93%
 | Phase 999.4 P02 | 40 | 3 tasks | 1 files |
 | Phase 999.1 P01 | 12 | 2 tasks | 11 files |
 | Phase 999.1 P02 | 5 | 1 tasks | 1 files |
+| Phase 999.1 P04 | 8 | 1 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -121,6 +122,7 @@ Recent decisions affecting current work:
 - [Phase ?]: D-16-04: native windows-latest MSVC replaces Linux GNU cross-compile for nosh-client Windows CI gate (HARDEN-02)
 - [Phase 17]: Phase 18 (Security Design Pass) deferred to a future milestone — user decision post Phase 17 sign-off
 - [Phase 17]: Platform-agnostic terminal-rendering defects (no clear-on-connect, typematic glitch, etc.) backlogged as 999.3 — not Windows-specific, to be fixed on Linux
+- [Phase ?]: Used minimal rcgen self-signed no-client-auth ServerConfig for QUIC fuzzer (not build_server_config) per RESEARCH Open Question 3
 
 ### Pending Todos
 
@@ -160,7 +162,7 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-06T04:48:49.283Z
+Last session: 2026-06-06T04:54:51.588Z
 Stopped at: Phase 999.1 context gathered
 Resume file: .planning/phases/999.1-server-attack-surface-hardening-expose-to-internet-readiness/999.1-CONTEXT.md
 
