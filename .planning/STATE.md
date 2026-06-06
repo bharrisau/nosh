@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
 status: executing
-stopped_at: "Phase 999.1 mid-execution: plans 01-04 + 05-Task1 done; 18h overnight deep-fuzz RUNNING (18 workers, 6 targets, started 2026-06-06 05:16Z). Sentinel task bfkdij06a wakes the assistant on crash/stall/completion. Then: triage → write docs/999.1-SECURITY.md (Plan 05 Task3) → code-review → opus verify → complete."
-last_updated: "2026-06-06T05:18:55.019Z"
+stopped_at: "Phase 999.1 mid-execution: 18h overnight deep-fuzz RETRY running at HALF capacity — 9 workers (quic=3 osc=2 codec/read/dgram/ack=1) at nice -n 19, started 2026-06-06 08:07Z (first 18-worker run stopped: box load ~67, large non-nosh baseline). Sentinel task bd4exq1tt wakes assistant on crash/stall/completion. Then: triage -> docs/999.1-SECURITY.md (Plan05 T3) -> code-review -> opus verify -> complete."
+last_updated: "2026-06-06T08:09:20.422Z"
 last_activity: 2026-06-06 -- Phase 999.1 execution started
 progress:
   total_phases: 15
@@ -162,8 +162,8 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-06T05:18:54.711Z
-Stopped at: Phase 999.1 mid-execution: plans 01-04 + 05-Task1 done; 18h overnight deep-fuzz RUNNING (18 workers, 6 targets, started 2026-06-06 05:16Z). Sentinel task bfkdij06a wakes the assistant on crash/stall/completion. Then: triage → write docs/999.1-SECURITY.md (Plan 05 Task3) → code-review → opus verify → complete.
+Last session: 2026-06-06T08:09:20.405Z
+Stopped at: Phase 999.1 mid-execution: 18h overnight deep-fuzz RETRY running at HALF capacity — 9 workers (quic=3 osc=2 codec/read/dgram/ack=1) at nice -n 19, started 2026-06-06 08:07Z (first 18-worker run stopped: box load ~67, large non-nosh baseline). Sentinel task bd4exq1tt wakes assistant on crash/stall/completion. Then: triage -> docs/999.1-SECURITY.md (Plan05 T3) -> code-review -> opus verify -> complete.
 Resume file: fuzz/overnight/status.txt
 
 ## Operator Next Steps
