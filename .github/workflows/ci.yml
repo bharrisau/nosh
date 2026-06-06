@@ -50,3 +50,13 @@ jobs:
         # jobs (linux + build-windows) are green in the Actions tab. This cannot
         # be machine-verified from the build sandbox.
         run: cargo build --locked --target x86_64-pc-windows-msvc -p nosh-client
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/audit@v1
+        name: Audit Rust dependencies
+        with:
+          ignore: ""  # Add RUSTSEC-YYYY-NNNN here for accepted/false-positive advisories
