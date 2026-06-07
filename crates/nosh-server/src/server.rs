@@ -1261,6 +1261,12 @@ async fn run_reattach_session(
                     Ok(Message::SessionClose { .. }) => {
                         break SessionEnd::ClientClosed;
                     }
+                    Ok(Message::SessionOpen { .. }) => {
+                        // WR-07 fix: an unexpected SessionOpen mid-reattach is a protocol
+                        // violation (mirrors the run_session behaviour at server.rs:784).
+                        // Treat as ClientClosed rather than silently ignoring it.
+                        break SessionEnd::ClientClosed;
+                    }
                     Ok(Message::Ack { seq }) => {
                         slot.touch();
                         slot.trim_acked(seq);
