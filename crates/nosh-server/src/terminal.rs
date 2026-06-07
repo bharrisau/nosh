@@ -224,6 +224,18 @@ pub struct TerminalState {
     /// vte's internal `State` is private; this mirrors it for the pre-filter.
     /// Set true on ESC ] or 0x9D; set false on BEL (0x07) or ST (ESC \ = 0x1B 0x5C).
     in_osc: bool,
+    /// Pending lone-ESC flag for split-ST detection (CR-01 / D-19-01 fix).
+    ///
+    /// Set true when `osc_prefilter` sees a lone `0x1B` at the very end of a
+    /// slice while `in_osc` is true (the ESC may be the first byte of an
+    /// `ESC \` String Terminator split across two `advance()` calls).
+    ///
+    /// On the next `osc_prefilter` call this flag is checked before the main
+    /// scan: if the first byte is `0x5C` (`\`), the ST is completed and `in_osc`
+    /// is cleared; if not, the pending ESC is counted as a regular payload byte.
+    ///
+    /// Reset to `false` on every path that also resets `in_osc`.
+    pending_esc: bool,
 }
 
 impl TerminalState {
@@ -247,6 +259,7 @@ impl TerminalState {
             saved_primary: None,
             osc_byte_count: 0,
             in_osc: false,
+            pending_esc: false,
         }
     }
 
@@ -331,6 +344,34 @@ impl TerminalState {
         let mut osc_byte_count = self.osc_byte_count;
 
         let mut i = 0;
+
+        // CR-01 fix: if the previous call ended with a lone ESC while in_osc (a
+        // potential ST split across calls), check whether this call begins with
+        // 0x5C (\) to complete the ST terminator.
+        if self.pending_esc && in_osc {
+            if !bytes.is_empty() && bytes[0] == 0x5C {
+                // The ESC from the previous call + this 0x5C = confirmed ST terminator.
+                in_osc = false;
+                osc_byte_count = 0;
+                i = 1; // consume the 0x5C byte
+            } else {
+                // Not an ST: the lone ESC was a real payload byte — count it now.
+                // (We deferred the count in the previous call to handle this case.)
+                osc_byte_count += 1;
+                if osc_byte_count > OSC_ACCUMULATION_MAX {
+                    // Overflow from the deferred ESC count: truncate at byte 0.
+                    self.in_osc = false;
+                    self.osc_byte_count = 0;
+                    self.pending_esc = false;
+                    return &bytes[..0];
+                }
+                // The first byte of this call is NOT 0x5C, so it will be handled
+                // normally in the main loop below (i remains 0).
+            }
+        }
+        // Clear the pending_esc flag — we've handled it above.
+        self.pending_esc = false;
+
         while i < bytes.len() {
             let b = bytes[i];
 
@@ -380,9 +421,16 @@ impl TerminalState {
                     i += 1; // leave the next byte for the main vte advance
                     continue;
                 }
-                // ESC at the very end of the slice: we can't tell if ST follows.
-                // Treat as in-OSC byte (conservative — next advance will see \ or not).
-                // Count this ESC against the accumulation budget.
+                // CR-01 fix: ESC at the very end of the slice — we can't tell if ST
+                // follows in the next call.  Do NOT count it as a payload byte yet;
+                // set pending_esc so the next osc_prefilter call can resolve it.
+                // Commit state and return the full slice (no overflow, no truncation).
+                self.in_osc = in_osc;
+                self.osc_byte_count = osc_byte_count;
+                self.pending_esc = true;
+                i += 1; // advance past the ESC so it is included in bytes_to_feed
+                // Return the full slice including the ESC — vte will handle it.
+                return bytes;
             }
 
             // Regular OSC payload byte: count against the cap.
@@ -394,6 +442,7 @@ impl TerminalState {
                 // feeding this safe prefix (Pitfall 2: reset after, not before, advance).
                 self.in_osc = false;
                 self.osc_byte_count = 0;
+                self.pending_esc = false;
                 return &bytes[..i];
             }
             i += 1;
@@ -1072,6 +1121,7 @@ impl vte::Perform for TerminalState {
                 // Reset OSC accumulation pre-filter state (D-19-01 / SEC-03).
                 self.osc_byte_count = 0;
                 self.in_osc = false;
+                self.pending_esc = false;
             }
             _ => {
                 // Scope fence: other ESC sequences (SI/SO, SS2/SS3, etc.) are ignored.
@@ -2369,6 +2419,65 @@ mod tests {
                 "OSC 52 cap (OSC_52_MAX_BYTES) must still hold after oversized-OSC path"
             );
         }
+    }
+
+    // ── CR-01 regression: split ST terminator across advance() calls ─────────────
+
+    /// CR-01 regression: `ESC \` (String Terminator) split across two `advance()` calls
+    /// must close the OSC, not leave `in_osc` permanently true.
+    ///
+    /// Before the fix: when `osc_prefilter` saw a lone `0x1B` at the end of a slice
+    /// (while `in_osc` was true) it fell through to `osc_byte_count += 1` — counting
+    /// the ESC as payload. On the next call, `0x5C` was also counted as payload rather
+    /// than recognised as the ST second byte. The `in_osc` shadow flag stayed true
+    /// indefinitely, causing all subsequent non-OSC output to be counted against the
+    /// 1 MiB budget and eventually triggering a spurious parser reset (SEC-03 / D-19-01).
+    ///
+    /// After the fix (`pending_esc` field): the lone trailing ESC is flagged rather than
+    /// counted; the next call checks for `0x5C` before the main scan and correctly
+    /// closes the OSC.
+    #[test]
+    fn split_st_terminator_across_advance_calls_closes_osc() {
+        let mut state = ts(80, 24);
+
+        // Feed OSC 2 title start + payload + lone ESC (first byte of ESC \ ST).
+        // The ESC lands at the very end of the first advance() call.
+        state.advance(b"\x1b]2;Hello\x1b"); // ESC at end — potential ST first byte
+
+        // Now feed the second byte of the ST terminator (0x5C = '\').
+        // Before the fix: this would be counted as an OSC payload byte.
+        // After the fix: the pending_esc + 0x5C → confirmed ST → in_osc = false.
+        state.advance(b"\x5c"); // ST second byte: '\'
+
+        // The OSC should now be closed. Feeding plain text must advance the cursor
+        // normally — it must NOT be consumed by the OSC accumulator.
+        state.advance(b"hello");
+        assert_eq!(
+            state.cursor().col, 5,
+            "plain text after split-ST must advance cursor (col must be 5, not 0); \
+             if in_osc stayed true the text was silently swallowed by the OSC accumulator"
+        );
+    }
+
+    /// CR-01 regression: after a split-ST close, a new OSC sequence is still parsed.
+    ///
+    /// Verifies the parser resyncs cleanly: the in_osc shadow tracker is false after
+    /// the split-ST, and the next OSC 2 title sequence is accepted normally.
+    #[test]
+    fn split_st_followed_by_normal_osc_parses_correctly() {
+        let mut state = ts(80, 24);
+
+        // First OSC 2 title, terminated with split ST.
+        state.advance(b"\x1b]2;Title1\x1b");
+        state.advance(b"\x5c");
+
+        // A subsequent normal OSC 2 title (BEL-terminated) must parse.
+        state.advance(b"\x1b]2;Title2\x07");
+        assert_eq!(
+            state.title(),
+            Some("Title2"),
+            "OSC 2 title after split-ST must be accepted and stored"
+        );
     }
 
     // ── TUI-04 grid-assertion regression suite (19-05 D-19-07) ─────────────────
