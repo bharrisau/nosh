@@ -52,7 +52,7 @@ Requirements for this milestone. Each maps to a roadmap phase.
 
 <!-- 999.7 folded into M5 — same TerminalState::advance code path as the alt-screen/unicode work. -->
 
-- [ ] **SEC-03**: Oversized OSC sequences in PTY output cannot exhaust server memory — OSC accumulation is bounded before it reaches vte's unbounded buffer, closing the post-authentication OOM vector; a multi-chunk giant-OSC regression test proves bounded memory while legitimate OSC 52 clipboard and title behaviour still pass
+- [x] **SEC-03**: Oversized OSC sequences in PTY output cannot exhaust server memory — OSC accumulation is bounded before it reaches vte's unbounded buffer, closing the post-authentication OOM vector; a multi-chunk giant-OSC regression test proves bounded memory while legitimate OSC 52 clipboard and title behaviour still pass
 
 ## Future Requirements
 
@@ -110,7 +110,7 @@ Which phases cover which requirements. Populated during roadmap creation.
 | SCROLL-03 | Phase 22 | Pending |
 | SCROLL-04 | Phase 22 | Pending |
 | SCROLL-05 | Phase 22 | Pending |
-| SEC-03 | Phase 19 | Pending |
+| SEC-03 | Phase 19 | Complete |
 
 **Coverage:**
 - v1.3 requirements: 20 total
