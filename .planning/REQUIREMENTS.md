@@ -15,7 +15,7 @@ Requirements for this milestone. Each maps to a roadmap phase.
 
 - [x] **TUI-01**: A full-screen app entering the alternate screen (`?1049h`) sees a cleared alternate buffer with the cursor saved; on exit (`?1049l`) the primary buffer and cursor are restored exactly — a genuine two-grid model in `TerminalState`, not a no-op flag (atomic save+swap+clear / restore+swap)
 - [x] **TUI-02**: Both the primary and alternate grids resize correctly on terminal resize (SIGWINCH) with no loss of the inactive buffer
-- [ ] **TUI-03**: Wide characters (CJK, width 2) occupy two columns without column drift; zero-width combining marks and multi-codepoint grapheme clusters (ZWJ/emoji + variation selectors) render as one cluster without advancing the cursor incorrectly
+- [x] **TUI-03**: Wide characters (CJK, width 2) occupy two columns without column drift; zero-width combining marks and multi-codepoint grapheme clusters (ZWJ/emoji + variation selectors) render as one cluster without advancing the cursor incorrectly
 - [ ] **TUI-04**: Full-screen TUI applications (vim, htop, Claude Code) render correctly over nosh — no garbling, no missing spaces — verified against a reference terminal on a Linux client↔server
 - [ ] **TUI-05**: The predictor suppresses speculative local echo while the alternate screen is active (no overlay inside cursor-addressing apps)
 
@@ -93,7 +93,7 @@ Which phases cover which requirements. Populated during roadmap creation.
 |-------------|-------|--------|
 | TUI-01 | Phase 19 | Complete |
 | TUI-02 | Phase 19 | Complete |
-| TUI-03 | Phase 19 | Pending |
+| TUI-03 | Phase 19 | Complete |
 | TUI-04 | Phase 19 | Pending |
 | TUI-05 | Phase 19 | Pending |
 | PACE-01 | Phase 20 | Pending |

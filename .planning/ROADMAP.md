@@ -74,7 +74,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 
 **Plans**: 5 plans
 - [x] 19-01-PLAN.md — Two-grid alt-screen model: atomic enter/exit, resize both grids, scrollback gate (TUI-01, TUI-02)
-- [ ] 19-02-PLAN.md — Wide-char width: Cell.wide marker, width-aware print_char, server/client continuation skip (TUI-03)
+- [x] 19-02-PLAN.md — Wide-char width: Cell.wide marker, width-aware print_char, server/client continuation skip (TUI-03)
 - [ ] 19-03-PLAN.md — OSC accumulation pre-bound at 1 MiB + parser resync; RED/GREEN multi-chunk regression (SEC-03)
 - [ ] 19-04-PLAN.md — alt_screen on StateDiff + client predictor suppression on alt-screen entry (TUI-05)
 - [ ] 19-05-PLAN.md — Synthetic VT grid-assertion suite + manual visual pass + docs/999.7-SECURITY.md (TUI-04, SEC-03)
@@ -156,7 +156,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 16. QoL Feature Pack + Windows CI Gate | 3/3 | Shipped | 2026-06-02 |
 | 17. Windows-Host Predictive Echo Validation | 1/1 | Shipped | 2026-06-02 |
 | 18. Security Design Pass | 0/? | Deferred | - |
-| 19. Full-Screen TUI Rendering Correctness | 1/5 | In Progress|  |
+| 19. Full-Screen TUI Rendering Correctness | 2/5 | In Progress|  |
 | 20. Repaint Pacing | 0/? | Not started | - |
 | 21. Channel Multiplexing Foundation | 0/? | Not started | - |
 | 22. Scrollback Sync | 0/? | Not started | - |
