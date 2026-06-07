@@ -4,9 +4,21 @@
 
 `nosh` is a roaming-tolerant remote shell built on QUIC — a successor to Mosh and Eternal Terminal that reuses the user's existing SSH keys for mutual authentication and runs over a single UDP/443 port (indistinguishable from HTTP/3 on the wire). It's for developers who SSH from laptops and phones across flaky, NAT'd, or firewalled networks and want sessions that survive IP changes without re-authenticating.
 
-The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux), and v1.1 (M3) added roaming + a native Windows client. v1.2 (M4) built the headline UX differentiator on that foundation — predictive local echo — and hardens nosh into a daily-drivable tool.
+The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux), and v1.1 (M3) added roaming + a native Windows client. v1.2 (M4) built the headline UX differentiator on that foundation — predictive local echo — and hardened nosh into a daily-drivable tool. v1.3 (M5) builds the channel-multiplexing foundation and native scrollback sync, and fixes the rendering/pacing defects that currently make full-screen TUI apps unusable.
 
-## Most Recent Milestone: v1.2 M4 Predictive Echo + Daily-Driver Readiness (shipped 2026-06-07)
+## Current Milestone: v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
+
+**Goal:** Build nosh's channel-multiplexing foundation and native scrollback sync, and fix the rendering/pacing defects that make full-screen TUI apps unusable today — so nosh handles vim/htop/Claude Code and large repaints correctly.
+
+**Target features:**
+- Channel multiplexing + per-channel flow control — control-first OPEN/ACCEPT/REJECT on control channel id 0 before binding a stream, per-channel flow-control windows (the M5 foundation everything else rides on)
+- Scrollback sync — native server-side scrollback synced to the client beyond the live grid (the first consumer of the mux layer)
+- Full-screen TUI rendering correctness (was backlog 999.5) — a genuine alternate-screen buffer (`?1049h`/`?1049l` with save/restore/clear-on-enter, not the current no-op flag) plus a cell-width/grapheme audit; fixes the "garbled, spaces missing" full-screen TUI breakage
+- Repaint pacing (was backlog 999.6) — burst multiple datagrams per tick so full-screen repaints land in ~1 RTT instead of dribbling one MTU per 16 ms tick, without breaking the noecho security invariant (one epoch per tick)
+
+**Key context:** OSC 52 clipboard already shipped in v1.2, so it is out of M5 scope. Port/agent forwarding and file transfer (the rest of M5) are deferred — scrollback sync is the immediate consumer that justifies building the mux layer now; forwarding/transfer become incremental later. 999.6 was reverted once in 999.4 (infinite-spin from recomputing `fresh_runs` during burst drain; noecho-epoch security interaction) — both have documented fixes-by-design to bake in from the first implementation. 999.5 is investigation-first: reproduce on a Linux client↔server before fixing. The 999.x security/OOM backlog (999.7 post-auth OSC OOM, 999.2 client trust-boundary) and Phase 18 security pass stay deferred.
+
+## Previous Milestone: v1.2 M4 Predictive Echo + Daily-Driver Readiness (shipped 2026-06-07)
 
 **Goal:** Deliver the predictive-echo differentiator (datagram state sync + full SSP-style local echo) and harden nosh into a tool the maintainer can daily-drive from the Windows client, with a security design review.
 
@@ -65,12 +77,18 @@ All three foundational/UX milestones are now proven: v1.0 established the QUIC+S
 
 ### Active
 
-<!-- v1.2 (M4) scope — being decomposed into REQUIREMENTS.md / ROADMAP.md. -->
+<!-- v1.3 (M5) scope — being decomposed into REQUIREMENTS.md / ROADMAP.md. -->
 
-- Predictive local echo: datagram state sync carrying terminal diffs + full SSP-style speculative local echo (confirmation tracking, unconfirmed rendering, prediction epochs, conservative fallback)
-- Daily-driver hardening: ~~fix PTY reader-zombie race~~ (✓ Phase 10); wire git remote + run Windows cross-compile CI; resolve `WSAEMSGSIZE` warning
-- QoL UX: connection-loss notifications (reconnecting + abort instructions) + research-selected QoL wins
-- Security design pass: threat-model review + security design doc
+- Channel multiplexing + per-channel flow control: control-first OPEN/ACCEPT/REJECT on control channel id 0 before binding a stream; per-channel flow-control windows
+- Scrollback sync: native server-side scrollback synced to the client beyond the live grid (first consumer of the mux layer)
+- Full-screen TUI rendering correctness (999.5): genuine alternate-screen buffer (`?1049h`/`?1049l` save/restore/clear, not a no-op flag) + cell-width/grapheme audit
+- Repaint pacing (999.6): burst datagrams per tick so full-screen repaints land in ~1 RTT, without breaking the noecho security invariant (one epoch per tick)
+
+<!-- v1.2 (M4) scope — SHIPPED 2026-06-07. Predictive echo + QoL pack + pre-auth fuzz-hardening. See MILESTONES.md and Validated below. -->
+- ✓ Predictive local echo (SSP-style speculative overlay, epoch tracking, noecho suppression, adaptive-RTT, wide-char) — v1.2; live-validated Windows→Linux (PREDICT-07)
+- ✓ Daily-driver hardening (PTY reader-zombie race fix, Windows CI gate, WSAEMSGSIZE) — v1.2
+- ✓ QoL pack (loss banner, OSC 52 clipboard, terminal title, RTT status) — v1.2
+- ⊘ Security design pass — deferred to a future milestone (Phase 18: SEC-01/SEC-02)
 
 ### Out of Scope
 
@@ -132,4 +150,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-07 after v1.2 milestone completion*
+*Last updated: 2026-06-07 after starting milestone v1.3 (M5)*

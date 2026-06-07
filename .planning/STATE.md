@@ -1,17 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.2
-milestone_name: M4 Predictive Echo + Daily-Driver Readiness
-status: Awaiting next milestone
-stopped_at: "Phase 999.1 COMPLETE — server pre-auth attack-surface hardening. 6 cargo-fuzz targets + QUIC packet fuzzer, ~18h adaptive campaign, ZERO crashes. cargo-audit in CI, deny.toml, docs/999.1-SECURITY.md. Verified passed 4/4. Code review found a post-auth OSC OOM (vte std unbounded osc_raw; Phase-16 mitigation was wrong) -> documented + filed phase 999.7. Operator TODO: push to confirm green audit CI."
-last_updated: "2026-06-07T01:44:30.549Z"
-last_activity: 2026-06-07 — Milestone v1.2 completed and archived
+milestone: v1.3
+milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
+status: planning
+last_updated: "2026-06-07T02:23:16.787Z"
+last_activity: 2026-06-07
 progress:
-  total_phases: 16
-  completed_phases: 11
-  total_plans: 29
-  completed_plans: 29
-  percent: 69
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -25,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-06-01)
 
 ## Current Position
 
-Phase: Milestone v1.2 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-06-07 — Milestone v1.2 completed and archived
+Status: Defining requirements
+Last activity: 2026-06-07 — Milestone v1.3 started
 
 ## Performance Metrics
 
