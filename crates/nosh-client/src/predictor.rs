@@ -419,7 +419,12 @@ impl PredictionOverlay {
                 self.cursor_motion_pending = true;
             }
             InputAction::PredictCursorRight => {
-                if self.predicted_cursor.col + 1 < self.term_cols {
+                // WR-04 fix: use saturating_add to prevent u16 overflow when
+                // predicted_cursor.col is near u16::MAX (e.g. if set_size was called
+                // with an uncapped large value). In normal operation term_cols is
+                // bounded by MAX_TERMINAL_COLS=512 so overflow cannot occur, but the
+                // saturating add is the defensive-correct form.
+                if self.predicted_cursor.col.saturating_add(1) < self.term_cols {
                     self.predicted_cursor.col += 1;
                 }
                 self.cursor_motion_pending = true;
