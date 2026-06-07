@@ -93,7 +93,9 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
   3. `burst_drains_when_grid_differs_from_acked_baseline` passes RED-before-fix and GREEN-after â the burst drain loop calls `build_state_diff` exactly once per tick and drains `deferred` via `encode_datagram` only; `last_acked_snapshot` non-advancement during a burst cannot cause infinite spin; `datagram_send_buffer_space()` is the per-tick send budget gate
   4. The `apply()` monotonic guard in `ClientScreen` is changed from `<=` to `<` so same-epoch burst datagrams all apply their runs to the confirmed grid without being discarded after the first
 
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 20-01-PLAN.md — Server burst loop: send_burst() helper in both tick arms, DiffTickResult geometry, RED/GREEN burst-drain + one-epoch-per-tick tests (PACE-01, PACE-03, PACE-02)
+- [ ] 20-02-PLAN.md — Client apply() guard <=→<; same-epoch-burst test, older-epoch no-op test, noecho CI gate non-ignored (PACE-02)
 
 **Security note**: Pitfalls R-1 and R-2 from PITFALLS.md are mandatory architectural constraints, not implementation options. Both caused the 999.4 revert. `burst_drains_when_grid_differs_from_acked_baseline` must be written as a RED-before test. `noecho_read_dash_s_zero_predicted_chars` must pass in CI before merge.
 
@@ -157,6 +159,6 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 17. Windows-Host Predictive Echo Validation | 1/1 | Shipped | 2026-06-02 |
 | 18. Security Design Pass | 0/? | Deferred | - |
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
-| 20. Repaint Pacing | 0/? | Not started | - |
+| 20. Repaint Pacing | 0/2 | Not started | - |
 | 21. Channel Multiplexing Foundation | 0/? | Not started | - |
 | 22. Scrollback Sync | 0/? | Not started | - |
