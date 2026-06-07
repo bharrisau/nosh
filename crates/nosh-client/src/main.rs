@@ -817,6 +817,10 @@ async fn run_pump(
     // Mutably owned here so both stdin arm (on_input) and datagram arm (cull)
     // can drive it, and render_with_predictor receives it by shared ref.
     let mut predictor = PredictionOverlay::new(predict_mode, cols, rows);
+    // TUI-05: track last known alt-screen state so the datagram arm can detect
+    // the false→true transition and flush all pending predictions via
+    // predictor.reset() on entry.  Mirrors the was_cols/was_rows resize pattern.
+    let mut was_alt_screen = false;
     // Connection-loss overlay (Phase 16, QOL-01).
     // Mutably owned here (mirroring predictor) so the silence timer and datagram
     // arm can activate/clear it; render_with_predictor receives it by shared ref.
@@ -1016,6 +1020,16 @@ async fn run_pump(
                                 // WR-01: capture dims before apply so we can detect a resize.
                                 let (cols_before, rows_before) = screen.size();
                                 screen.apply(&diff);
+                                // TUI-05: alt-screen entry suppression.
+                                // When the server signals a false→true alt_screen transition
+                                // (i.e. the user launched vim/htop), flush all speculative
+                                // predictions so no overlay appears inside cursor-addressing apps.
+                                // predictor.reset() clears pending + calls become_tentative() —
+                                // the same path as the bracketed-paste and resize resets.
+                                if diff.alt_screen && !was_alt_screen {
+                                    predictor.reset();
+                                }
+                                was_alt_screen = diff.alt_screen;
                                 // Cull predictions against the new confirmed state and quinn RTT
                                 // (D-17-02a: latency instrumentation hook — see below).
                                 let rtt_ms = conn.rtt().as_millis() as u64;

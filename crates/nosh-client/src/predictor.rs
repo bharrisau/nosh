@@ -971,6 +971,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row, col },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row,
                 start_col: col,
@@ -988,6 +989,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![],
         }
     }
@@ -1856,6 +1858,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 5, col: 2 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff);
@@ -2037,6 +2040,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 5 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 0,
                 start_col: 0,
@@ -2065,6 +2069,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 5 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff2);
@@ -2249,6 +2254,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 1, col: 10 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff);
@@ -2268,6 +2274,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 2, col: 0 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff2);
@@ -2304,6 +2311,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 10 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff);
@@ -2444,6 +2452,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 3, col: 15 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff);
@@ -2488,6 +2497,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 9 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff_before_reset);
@@ -2510,6 +2520,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 1, col: 6 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff_after_reset);

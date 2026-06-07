@@ -639,6 +639,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 0,
                 start_col: 0,
@@ -679,6 +680,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 5 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 0,
                 start_col: 0,
@@ -723,6 +725,7 @@ mod tests {
             cols: 40,
             rows: 10,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&diff_resized);
@@ -744,6 +747,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![
                 DiffRun {
                     row: 999, // WAY out of bounds
@@ -778,6 +782,7 @@ mod tests {
             cols: 5,
             rows: 3,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 0,
                 start_col: 3, // starts at col 3 (valid), but 8 chars → would overflow
@@ -823,6 +828,7 @@ mod tests {
             cols: MAX_TERMINAL_COLS + 1,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![],
         };
         // Must not panic; must be silently discarded.
@@ -845,6 +851,7 @@ mod tests {
             cols: 80,
             rows: MAX_TERMINAL_ROWS + 1,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&oversized);
@@ -861,6 +868,7 @@ mod tests {
             cols: 0,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&zero_cols);
@@ -875,6 +883,7 @@ mod tests {
             cols: 80,
             rows: 0,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&zero_rows);
@@ -890,6 +899,7 @@ mod tests {
             cols: MAX_TERMINAL_COLS,
             rows: MAX_TERMINAL_ROWS,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![],
         };
         screen.apply(&at_cap);
@@ -975,6 +985,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 0,
                 start_col: 0,
@@ -1251,6 +1262,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 5, col: 12 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 0,
                 start_col: 0,
