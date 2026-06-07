@@ -62,6 +62,20 @@ pub const OSC_52_MAX_BYTES: usize = 65_536;
 /// an application emitting an unbounded OSC 2 title sequence.
 pub const MAX_TITLE_BYTES: usize = 1_024;
 
+/// Maximum bytes accumulated for a single OSC sequence before the pre-filter
+/// truncates it and resyncs the parser to ground state (D-19-01 / SEC-03).
+///
+/// This bounds what vte ALLOCATES while parsing, not what is stored.
+/// It is distinct from and larger than `OSC_52_MAX_BYTES` (64 KiB) and
+/// `MAX_TITLE_BYTES` (1 KiB) — those storage caps run in `osc_dispatch`
+/// AFTER vte has already buffered the full sequence; this cap intercepts
+/// BEFORE `parser.advance()` so vte never allocates past 1 MiB per OSC.
+///
+/// On overflow the pre-filter: feeds only the safe prefix to the parser,
+/// replaces the mid-OSC parser with `vte::Parser::default()` (ground state),
+/// and resets `osc_byte_count` to 0 so the next OSC starts fresh.
+pub const OSC_ACCUMULATION_MAX: usize = 1_048_576; // 1 MiB
+
 // ── Cell ──────────────────────────────────────────────────────────────────────
 
 /// A single terminal cell.
@@ -198,6 +212,18 @@ pub struct TerminalState {
     /// full primary grid, cursor position, and SGR pen so that `?1049l` can
     /// restore them exactly (TUI-01, D-19-01..D-19-06, Pitfalls A-1/A-6).
     saved_primary: Option<(Vec<Vec<Cell>>, CursorPos, SgrState)>,
+    /// Running count of bytes accumulated into the current in-flight OSC sequence
+    /// across `advance()` calls (D-19-01 / SEC-03).
+    ///
+    /// Reset to 0 at OSC start (ESC ] / 0x9D) and at OSC end (BEL / ST) during
+    /// normal scanning, and on overflow truncation. Also reset by RIS (ESC c).
+    /// Used by the pre-filter in `advance()` to enforce `OSC_ACCUMULATION_MAX`.
+    osc_byte_count: usize,
+    /// Shadow flag tracking whether the parser is currently inside an OSC string.
+    ///
+    /// vte's internal `State` is private; this mirrors it for the pre-filter.
+    /// Set true on ESC ] or 0x9D; set false on BEL (0x07) or ST (ESC \ = 0x1B 0x5C).
+    in_osc: bool,
 }
 
 impl TerminalState {
@@ -219,6 +245,8 @@ impl TerminalState {
             parser: vte::Parser::default(),
             sgr: SgrState::default(),
             saved_primary: None,
+            osc_byte_count: 0,
+            in_osc: false,
         }
     }
 
@@ -236,10 +264,145 @@ impl TerminalState {
     /// (which implements `vte::Perform` and needs `&mut TerminalState`). The taken
     /// parser is ground-state per `Parser::Default`, and since we restore it
     /// immediately after the advance call, no state is lost across calls.
+    ///
+    /// # OSC accumulation pre-bound (D-19-01 / SEC-03)
+    ///
+    /// Before feeding bytes to vte, a byte scanner tracks the running count of
+    /// bytes accumulated in the current in-flight OSC sequence (`self.osc_byte_count`
+    /// / `self.in_osc`). If the count would exceed `OSC_ACCUMULATION_MAX` (1 MiB),
+    /// only the safe prefix (up to the offending byte) is fed to the parser;
+    /// afterwards the parser is replaced with `vte::Parser::default()` (ground state)
+    /// and the counter is reset. This ensures vte's internal `osc_raw` buffer never
+    /// grows beyond 1 MiB per OSC sequence across multiple `advance()` calls.
+    ///
+    /// The truncation and resync happen AFTER feeding the safe prefix so that any
+    /// OSC bytes below the cap are still dispatched normally (Pitfall 2).
     pub fn advance(&mut self, bytes: &[u8]) {
+        // OSC accumulation pre-bound (D-19-01 / SEC-03 / T-19-06).
+        //
+        // Scan `bytes` byte-by-byte, tracking whether the parser is currently inside
+        // an OSC string (mirroring vte's private State::OscString). We accumulate
+        // `self.osc_byte_count` while inside an OSC; at `OSC_ACCUMULATION_MAX` we
+        // truncate and resync the parser.
+        //
+        // OSC framing (mirroring vte's osc_start / osc_end transitions):
+        //   Start:  single byte 0x9D  OR  two-byte ESC ] (0x1B 0x5D)
+        //   End:    BEL (0x07)  OR  ST = ESC \ (0x1B 0x5C)
+        //
+        // The scanner does not need to track whether the preceding byte was ESC
+        // for ST detection: when `in_osc` is true and we see 0x1B, the next byte
+        // determines whether it is ST (0x5C → close) or starts a new control
+        // sequence (anything else; vte transitions to Escape state and will end
+        // the OSC implicitly). We conservatively treat ESC-as-ST-candidate as the
+        // end of the OSC (resetting in_osc) if the next byte is 0x5C.
+        //
+        // Performance: O(n) per call where n = bytes.len() ≤ OS pipe-buffer size
+        // (typically 4–8 KiB). The overhead is negligible relative to vte itself.
+
+        let bytes_to_feed = self.osc_prefilter(bytes);
+
         let mut parser = std::mem::take(&mut self.parser);
-        parser.advance(self, bytes);
-        self.parser = parser;
+        parser.advance(self, bytes_to_feed);
+
+        // After feeding the (possibly truncated) bytes, check if we overflowed.
+        // `osc_prefilter` sets `self.in_osc = false` and returns a truncated slice
+        // AND signals overflow by returning a slice shorter than `bytes`. On overflow,
+        // we must resync the parser to ground state (Pitfall 2: reset AFTER advance).
+        if bytes_to_feed.len() < bytes.len() {
+            // Overflow: the pre-filter truncated `bytes`. Replace the mid-OSC parser
+            // with a fresh ground-state parser so vte does not stay in OscString.
+            self.parser = vte::Parser::default();
+            // osc_byte_count and in_osc are already reset by osc_prefilter on overflow.
+        } else {
+            self.parser = parser;
+        }
+    }
+
+    /// OSC accumulation pre-filter: scan `bytes` and return the safe prefix to
+    /// feed to vte. Updates `self.in_osc` and `self.osc_byte_count` across calls.
+    ///
+    /// Returns `bytes` unchanged when no overflow occurs. Returns a strict prefix
+    /// (possibly empty) when feeding any more bytes would exceed `OSC_ACCUMULATION_MAX`.
+    /// On overflow, `self.osc_byte_count` and `self.in_osc` are reset to 0/false so
+    /// the next `advance()` call starts from a clean state.
+    fn osc_prefilter<'a>(&mut self, bytes: &'a [u8]) -> &'a [u8] {
+        // Use a local state copy to scan; commit back after each iteration.
+        let mut in_osc = self.in_osc;
+        let mut osc_byte_count = self.osc_byte_count;
+
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+
+            if !in_osc {
+                // Not in OSC: look for OSC start.
+                if b == 0x9D {
+                    // Single-byte OSC introducer (C1 control).
+                    in_osc = true;
+                    osc_byte_count = 0;
+                    i += 1;
+                    continue;
+                }
+                if b == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == 0x5D {
+                    // ESC ] (two-byte OSC introducer).
+                    in_osc = true;
+                    osc_byte_count = 0;
+                    i += 2; // skip both ESC and ]
+                    continue;
+                }
+                // Non-OSC byte: pass through.
+                i += 1;
+                continue;
+            }
+
+            // Inside OSC: accumulate bytes and look for terminator.
+            if b == 0x07 {
+                // BEL: OSC end.
+                in_osc = false;
+                osc_byte_count = 0;
+                i += 1;
+                continue;
+            }
+            if b == 0x1B {
+                // Potential ST: ESC followed by \ (0x5C).
+                if i + 1 < bytes.len() {
+                    if bytes[i + 1] == 0x5C {
+                        // Confirmed ST terminator.
+                        in_osc = false;
+                        osc_byte_count = 0;
+                        i += 2; // skip ESC and \
+                        continue;
+                    }
+                    // ESC followed by something else: vte will leave OscString on the
+                    // next advance anyway; treat as end-of-OSC conservatively.
+                    in_osc = false;
+                    osc_byte_count = 0;
+                    i += 1; // leave the next byte for the main vte advance
+                    continue;
+                }
+                // ESC at the very end of the slice: we can't tell if ST follows.
+                // Treat as in-OSC byte (conservative — next advance will see \ or not).
+                // Count this ESC against the accumulation budget.
+            }
+
+            // Regular OSC payload byte: count against the cap.
+            osc_byte_count += 1;
+            if osc_byte_count > OSC_ACCUMULATION_MAX {
+                // Overflow: we have fed too many bytes into the OSC. Truncate here —
+                // return only [0..i] (the slice up to but NOT including this byte).
+                // The caller will replace the parser with vte::Parser::default() after
+                // feeding this safe prefix (Pitfall 2: reset after, not before, advance).
+                self.in_osc = false;
+                self.osc_byte_count = 0;
+                return &bytes[..i];
+            }
+            i += 1;
+        }
+
+        // No overflow: commit updated state and return the full slice.
+        self.in_osc = in_osc;
+        self.osc_byte_count = osc_byte_count;
+        bytes
     }
 
     /// Resize the terminal grid to the new dimensions (D-12-03: no reflow).
@@ -906,6 +1069,9 @@ impl vte::Perform for TerminalState {
                 // Clear saved_primary so a subsequent ?1049l cannot restore
                 // stale pre-reset content (Pitfall 5 / RIS invariant, D-19-01).
                 self.saved_primary = None;
+                // Reset OSC accumulation pre-filter state (D-19-01 / SEC-03).
+                self.osc_byte_count = 0;
+                self.in_osc = false;
             }
             _ => {
                 // Scope fence: other ESC sequences (SI/SO, SS2/SS3, etc.) are ignored.
