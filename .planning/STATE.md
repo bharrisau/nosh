@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: M4 Predictive Echo + Daily-Driver Readiness
-status: executing
+status: Awaiting next milestone
 stopped_at: "Phase 999.1 COMPLETE — server pre-auth attack-surface hardening. 6 cargo-fuzz targets + QUIC packet fuzzer, ~18h adaptive campaign, ZERO crashes. cargo-audit in CI, deny.toml, docs/999.1-SECURITY.md. Verified passed 4/4. Code review found a post-auth OSC OOM (vte std unbounded osc_raw; Phase-16 mitigation was wrong) -> documented + filed phase 999.7. Operator TODO: push to confirm green audit CI."
-last_updated: "2026-06-06T23:17:57.250Z"
-last_activity: 2026-06-06 -- Phase 999.1 execution started
+last_updated: "2026-06-07T01:44:30.549Z"
+last_activity: 2026-06-07 — Milestone v1.2 completed and archived
 progress:
   total_phases: 16
   completed_phases: 11
@@ -25,14 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-01)
 
 ## Current Position
 
-Phase: 999.1 (server-attack-surface-hardening-expose-to-internet-readiness) — EXECUTING
-Plan: 5 of 5
-Status: Executing Phase 999.1
-Last activity: 2026-06-06 -- Phase 999.1 execution started
-
-```
-Progress: [██████████] 97%
-```
+Phase: Milestone v1.2 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-06-07 — Milestone v1.2 completed and archived
 
 ## Performance Metrics
 
@@ -168,7 +164,4 @@ Resume file: docs/999.1-SECURITY.md
 
 ## Operator Next Steps
 
-1. Run `/gsd:plan-phase 10` to plan the PTY Reader Race Fix (no research phase needed — nix::poll self-pipe is a standard pattern)
-2. Phase 11 and 12 will prompt for research phases at plan time (wire format sparse-diff strategy; vte osc_dispatch verification)
-3. Phase 15 will prompt for a research phase (Mosh terminaloverlay.cc translation — highest complexity)
-4. Before Phase 17: switch to a physical Windows host
+- Start the next milestone with /gsd-new-milestone

@@ -1,5 +1,40 @@
 # Milestones
 
+## v1.2 M4 Predictive Echo + Daily-Driver Readiness (Shipped: 2026-06-07)
+
+**Phases completed:** 12 phases, 29 plans, 24 tasks
+
+**Key accomplishments:**
+
+- Site 1 — run_session (formerly lines ~356-373):
+- Delivers `nosh-proto/src/datagram.rs` — the shared sparse terminal-diff contract (SYNC-01): StateDiff type, tag-byte encode/decode pair with provable STRICT cap, cursor-priority fill with continue-past-rejection, and 16 inline tests.
+- crates/nosh-server/src/registry.rs:
+- 1. [Rule 1 - Bug] Fixed pre-existing clippy::unnecessary_lazy_evaluations in decode_datagram
+- New imports added to server.rs:
+- Test 1 — `sync03_server_emits_datagram_after_pty_output`
+- One-liner:
+- One-liner:
+- One-liner:
+- Mosh PredictionEngine translated to Rust: full epoch/Validity state machine in predictor.rs with 49 unit tests proving noecho suppression, CJK width, dropped-datagram tolerance, and RTT hysteresis
+- Mosh PredictionOverlay wired into the live client: speculative echo renders immediately on keypress through the single display path, predictions cull against StateDiffs using quinn RTT, `--predict always|adaptive|never` selects the mode (adaptive default), keystroke bytes to server unchanged, and Phase 17 latency instrumentation hook in place
+- Full D-15-04 validation matrix in tests/predict.rs: 8 unit cases (vim/CJK/less/paste/Ctrl-C/simulated-loss/Home-End/adaptive-RTT) + 2 live-server integration cases (read -s noecho security gate + e2e echo confirm), all passing
+- One-liner:
+- One-liner:
+- One-liner:
+- Task 1 (doc skeleton):
+- Task 1 — fuzz/ crate scaffold:
+- Task 1 — read_message + decode_datagram + decode_epoch_ack (D-01):
+- Task 1 — quic_packet fuzzer + seed corpus:
+- D-03/D-04. All three tasks complete.
+- One-liner:
+- One-liner:
+- D-03a verification (Task 1):
+- Task 1 — D-03b connect-clear wiring:
+- Path taken: `datagram_send_buffer_space()` (the preferred path).
+- Task 1 — D-03 instrumentation (91bb14b):
+
+---
+
 ## v1.1 M3 Roaming + Windows Client (Shipped: 2026-05-30)
 
 **Phases completed:** 6 phases (4-9)

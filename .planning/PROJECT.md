@@ -4,9 +4,9 @@
 
 `nosh` is a roaming-tolerant remote shell built on QUIC — a successor to Mosh and Eternal Terminal that reuses the user's existing SSH keys for mutual authentication and runs over a single UDP/443 port (indistinguishable from HTTP/3 on the wire). It's for developers who SSH from laptops and phones across flaky, NAT'd, or firewalled networks and want sessions that survive IP changes without re-authenticating.
 
-The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux), and v1.1 (M3) added roaming + a native Windows client. The current milestone (v1.2, M4) builds the headline UX differentiator on that foundation — predictive local echo — and hardens nosh into a daily-drivable tool.
+The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux), and v1.1 (M3) added roaming + a native Windows client. v1.2 (M4) built the headline UX differentiator on that foundation — predictive local echo — and hardens nosh into a daily-drivable tool.
 
-## Current Milestone: v1.2 M4 Predictive Echo + Daily-Driver Readiness
+## Most Recent Milestone: v1.2 M4 Predictive Echo + Daily-Driver Readiness (shipped 2026-06-07)
 
 **Goal:** Deliver the predictive-echo differentiator (datagram state sync + full SSP-style local echo) and harden nosh into a tool the maintainer can daily-drive from the Windows client, with a security design review.
 
@@ -24,19 +24,15 @@ A single QUIC connection on UDP/443 can carry a live interactive shell, authenti
 
 ## Current State
 
-**Shipped:** v1.1 (M3 Roaming + Windows Client) — 2026-05-30. Phases 4-9. Audit 11/11 requirements, 4/4 cross-phase integration invariants, no blockers; validated end-to-end on a live native-Windows client → Linux server (auth, interactive shell, locale, resize, vim/arrows, `~.` quit, Ctrl-C→remote, and real network roaming all confirmed).
+**Shipped:** v1.2 (M4 Predictive Echo + Daily-Driver Readiness) — 2026-06-07. Core phases 10-17. Audit 17/19 requirements satisfied, cross-phase integration 8/8 seams wired (no broken/orphaned), all E2E flows complete. Delivered the headline differentiator — speculative local echo over QUIC state-sync datagrams (Mosh-style SSP: epoch tracking, conservative reset, noecho suppression, adaptive-RTT, wide-char) — on an authoritative server terminal-state model, plus the QoL pack (loss banner, OSC 52 clipboard, terminal title, RTT status) and a Windows CI gate. Predictive echo was live-validated on a native Windows client → Linux server (PREDICT-07). Backlog items 999.1 (server attack-surface fuzz-hardening — ~18h campaign, zero crashes, `docs/999.1-SECURITY.md`), 999.3 and 999.4 also shipped this cycle.
 
-Both foundational milestones are now proven: v1.0 established the QUIC+SSH-key+PTY architecture on Linux; v1.1 added the differentiators that justify nosh over plain SSH — roaming-tolerant session persistence (migration + 1-RTT cold reattach) and a native Windows client.
+All three foundational/UX milestones are now proven: v1.0 established the QUIC+SSH-key+PTY architecture on Linux; v1.1 added roaming-tolerant session persistence (migration + 1-RTT cold reattach) and a native Windows client; v1.2 added predictive echo and daily-driver readiness.
 
-**Carried tech debt (weigh at M4 start):** ~~PTY reader-zombie race (Phase 6, latent — `spawn_blocking`+`abort()` can't interrupt a blocked `read()`)~~ **CLEARED in v1.2 Phase 10** — interruptible reader (self-pipe + nix::poll) with deterministic exit via D-04 completion-barrier test. Windows cross-compile CI gate exists but has never run (no git remote configured — wire one); `WSAEMSGSIZE` quinn_udp warning on Windows (deferred; connection works).
+**Deferred to a future milestone:** Phase 18 — Security Design Pass (SEC-01 threat-model doc, SEC-02 interactive TOFU fingerprint-confirm prompt). (Note: TOFU/known_hosts pinning + host-key-mismatch hard-fail already exist and were re-verified in 999.1; SEC-02 is the interactive first-contact prompt.)
 
-**Phase 10 complete (2026-06-01):** PTY reader-zombie race resolved. Both `server.rs` output-pump sites converted to `crate::pty_io::start_interruptible_reader`; both `TransportLost` arms now await reader exit before `registry.orphan()`. `cargo test` green (25/25).
+**Backlog carried forward (999.x parking-lot):** 999.2 client trust-boundary hardening; 999.5 full-screen TUI / alternate-screen rendering; 999.6 burst repaint-pacing (epoch-under-burst); 999.7 bound OSC accumulation before vte (post-auth OOM — Phase-16's mitigation reasoning was found incorrect in the 999.1 review).
 
-**Phase 11 complete (2026-06-01):** Datagram wire-protocol module delivered. `nosh-proto/src/datagram.rs` — `StateDiff` sparse-diff type, total `encode_datagram` (cursor-priority fill, STRICT payload < cap, continue-past-rejection), hardened `decode_datagram` (TAG_STATE_DIFF, MAX_RUNS guard, never panics on malformed input), 16 inline tests (22 total passing). SYNC-01 satisfied.
-
-**Phase 12 complete (2026-06-01):** Server terminal state model delivered. `crates/nosh-server/src/terminal.rs` — `TerminalState` implementing `vte::Perform` with viewport grid, bounded scrollback (SCROLLBACK_LINE_CAP=10_000), DEC private modes (?25/?1049/?2004/?1), OSC 0/2 title, OSC 52 clipboard detection (D-12-04), and full SGR mapping. `Cell.fg/bg` are `Option<u8>` matching `DiffRun` for zero-conversion Phase 13 extraction. `SessionSlot::push_output_and_parse` feeds both `SequencedOutputBuffer` and `TerminalState`; 3 server.rs callsites converted; 67 lib tests pass. SYNC-02 satisfied.
-
-**Current milestone:** v1.2 (M4) — **in progress.** Phase 12 (server terminal state model) done. Next: Phase 13 (server-datagram-sender) — StateDiff extraction + datagram send loop.
+**Operator follow-ups (post-close):** push to confirm the green Windows `build-windows` + `cargo audit` CI runs; live-test the deferred human_needed visual items and the 999.4 `read -s`/predictive-echo fixes on a Windows client.
 
 ## Requirements
 
@@ -136,4 +132,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-01 after Phase 11 complete — datagram wire format (SYNC-01) delivered; Phase 12 next (server terminal state model)*
+*Last updated: 2026-06-07 after v1.2 milestone completion*
