@@ -3,10 +3,10 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
 status: planning
-last_updated: "2026-06-07T02:23:16.787Z"
+last_updated: "2026-06-07"
 last_activity: 2026-06-07
 progress:
-  total_phases: 0
+  total_phases: 4
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,17 +17,21 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-06-01)
+See: .planning/PROJECT.md (updated 2026-06-07)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 999.1 — server-attack-surface-hardening-expose-to-internet-readiness
+**Current focus:** Phase 19 — Full-Screen TUI Rendering Correctness (first v1.3 phase)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: Not started (roadmap defined; planning begins at Phase 19)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-06-07 — Milestone v1.3 started
+Status: Roadmap created; ready for /gsd:plan-phase 19
+Last activity: 2026-06-07 — Milestone v1.3 roadmap created
+
+```
+Progress: [                    ] 0% (0/4 phases)
+```
 
 ## Performance Metrics
 
@@ -35,27 +39,17 @@ Last activity: 2026-06-07 — Milestone v1.3 started
 
 - v1.0: 3 phases, 11 plans (single day, 2026-05-29)
 - v1.1: 6 phases (2026-05-30)
-- v1.2: 0/9 phases complete
+- v1.2: 8 phases complete (10-17), 1 deferred (18); ~29 plans
+- v1.3: 0/4 phases complete
 
-**By Phase (v1.2):**
+**By Phase (v1.3):**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 10. PTY Reader Race Fix | 0/? | - | - |
-| 11. Datagram Wire Protocol | 0/? | - | - |
-| 12. Server Terminal State Model | 0/? | - | - |
-| 13. Server Datagram Sender | 0/? | - | - |
-| 14. Client Predictor — Confirmed Rendering | 0/? | - | - |
-| 15. Client Predictor — Speculative Overlay | 0/? | - | - |
-| 16. QoL Feature Pack + Windows CI Gate | 0/? | - | - |
-| 17. Windows-Host Predictive Echo Validation | 0/? | - | - |
-| 18. Security Design Pass | 0/? | - | - |
-| 10 | 2 | - | - |
-| 11 | 1 | - | - |
-| 12 | 2 | - | - |
-| 13 | 3 | - | - |
-| 14 | 3 | - | - |
-| 15 | 3 | - | - |
+| 19. Full-Screen TUI Rendering Correctness | 0/? | - | - |
+| 20. Repaint Pacing | 0/? | - | - |
+| 21. Channel Multiplexing Foundation | 0/? | - | - |
+| 22. Scrollback Sync | 0/? | - | - |
 
 **Recent Trend:**
 
@@ -63,21 +57,6 @@ Last activity: 2026-06-07 — Milestone v1.3 started
 - Trend: -
 
 *Updated after each plan completion*
-| Phase 15 P01 | 45 | 2 tasks | 3 files |
-| Phase 15 P02 | 30 | 2 tasks | 2 files |
-| Phase 15 P03 | 45 | 2 tasks | 2 files |
-| Phase 16 P01 | 30 | 3 tasks | 6 files |
-| Phase 16-qol-feature-pack-windows-ci-gate P03 | 5 | 1 tasks | 2 files |
-| Phase 16-qol-feature-pack-windows-ci-gate P02 | 15 | 3 tasks | 4 files |
-| Phase 999.3 P01 | 4 | 2 tasks | 1 files |
-| Phase 999.3 P03 | 20 | 2 tasks | 1 files |
-| Phase 999.3 P02 | 15 | 1 tasks | 1 files |
-| Phase 999.3 P04 | 20 | 2 tasks | 1 files |
-| Phase 999.4 P01 | 12 | 2 tasks | 1 files |
-| Phase 999.4 P02 | 40 | 3 tasks | 1 files |
-| Phase 999.1 P01 | 12 | 2 tasks | 11 files |
-| Phase 999.1 P02 | 5 | 1 tasks | 1 files |
-| Phase 999.1 P04 | 8 | 1 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -86,54 +65,41 @@ Last activity: 2026-06-07 — Milestone v1.3 started
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- v1.0: Cert-pinning path for M1 (not RFC 7250 RPK) — rustls issue #2257 resolution unconfirmed in 0.23.40
-- v1.0: Ed25519-first for auth; RSA must be tested before Phase 2 closes
-- v1.0: `spawn_blocking` bridge for PTY I/O (not AsyncFd)
-- v1.0: Session keyed on SSH identity fingerprint (not QUIC connection ID) — M3 reattach seam
-- v1.1 roadmap: Identity threading is Phase 4 (IDENT-01 only) — prerequisite seam; tiny surface, blocks everything else
-- v1.1 roadmap: `MasterPty` must move into `SessionSlot` and stay open for entire orphan lifetime (SIGHUP prevention — critical correctness requirement for Phase 5)
-- v1.1 roadmap: Reattach token is a session selector, not a credential; full TLS handshake re-runs on every reconnect (two-factor design baked in from Phase 6 first implementation, not retrofitted)
-- v1.1 roadmap: `ServerConfig::migration(true)` set explicitly even though it is the QUIC default — documents intent, guards against future default changes (Phase 7)
-- v1.1 roadmap: Windows client (Phase 8) isolated behind `#[cfg]` gates in nosh-client only; nosh-proto, nosh-auth, nosh-server unchanged
-- v1.2 roadmap: PTY reader fix uses `nix::poll` self-pipe trick on `[PTY fd, shutdown pipe]` — `tokio::io::unix::AsyncFd` is the alternative; verify exact `MasterPty::as_raw_fd()` method name at Phase 10 implementation
-- v1.2 roadmap: `termwiz 0.23.3` added as the single new consequential dep — `Surface` + `get_changes` / `flush_changes_older_than` provides the terminal grid and diff API without owning ~2000 lines of bespoke grid logic
-- v1.2 roadmap: `PtyData` on the reliable stream MUST continue to advance `highest_applied` after datagram path lands — the Ack mechanism and SequencedOutputBuffer trim depend on it; never break this invariant
-- v1.2 roadmap: Keystrokes go on the reliable stream only — never as datagrams; keystroke loss is never acceptable
-- v1.2 roadmap: All output to the local terminal goes through `ClientScreen.render_to_stdout()` — never direct `stdout.write_all` once the predictor exists
-- v1.2 roadmap: Datagrams suppressed on the client during reattach replay window; `ResumeComplete` signal gates fresh datagrams post-replay
-- v1.2 roadmap: Epoch-reset-on-cursor-move is a day-one design gate — predicting in cursor-addressing apps produces screen corruption worse than no prediction; conservative fallback baked into initial speculative overlay design
-- v1.2 roadmap: Noecho-suppression is a security requirement of prediction — engine must track server's confirmed echo state and suppress prediction during `stty -echo` prompts; validated with `read -s` test
-- v1.2 roadmap: Phase 17 (Windows-host validation) must execute from a physical Windows PC — halt Linux execution, run from Windows machine like v1.1 Phase 9; HARDEN-02/03 stay in Phase 16 (authorable from Linux)
-- v1.2 roadmap: 0-RTT cold reattach still deliberately deferred — 1-RTT already ships, replay-safety burden not justified
-- [Phase 15-03]: EpochReset/BulkSuppressed call reset() not become_tentative() — clears all pending predictions so no stale speculative state remains visible after Ctrl-C/ESC/cursor-addressing
-- [Phase 16-01]: TerminalControl appended after Ack (discriminant 9) to preserve postcard discriminant order
-- [Phase 16-01]: vte std re-enabled with explicit osc_dispatch caps (OSC_52_MAX_BYTES=65536, MAX_TITLE_BYTES=1024) to re-mitigate CR-03
-- [Phase 16-01]: OSC 52 read/query form ('?') silently dropped in osc_dispatch before any store (D-16-01a)
-- [Phase 16-01]: drain_terminal_control() uses Option::take semantics to prevent double-forwarding
-- [Phase 16-01]: TerminalControl forwarded via write_message (reliable stream) NEVER via send_datagram
-- [Phase ?]: emit_diff factored as shared private method
-- [Phase ?]: Predictor held in run_pump not overlays Vec
-- [Phase ?]: D-17-02a latency hook uses HashMap in run_pump
-- [Phase ?]: D-16-04: native windows-latest MSVC replaces Linux GNU cross-compile for nosh-client Windows CI gate (HARDEN-02)
-- [Phase 17]: Phase 18 (Security Design Pass) deferred to a future milestone — user decision post Phase 17 sign-off
-- [Phase 17]: Platform-agnostic terminal-rendering defects (no clear-on-connect, typematic glitch, etc.) backlogged as 999.3 — not Windows-specific, to be fixed on Linux
-- [Phase ?]: Used minimal rcgen self-signed no-client-auth ServerConfig for QUIC fuzzer (not build_server_config) per RESEARCH Open Question 3
+- v1.3 roadmap: Alt-screen implementation is atomic — save+swap+clear on `?1049h`, restore+swap on `?1049l`, both grids resized together; a half-built alt-screen is demonstrably worse than the current no-op flag (PITFALLS A-1/A-6)
+- v1.3 roadmap: `Cell.ch` changes from `char` to `String`; `unicode-segmentation 1.12` added to workspace for grapheme cluster splitting; `termwiz::cell::grapheme_column_width()` used for width measurement (transitive via portable-pty, no explicit dep)
+- v1.3 roadmap: SEC-03 (999.7 OSC OOM bound) folds into Phase 19 — shares the `TerminalState::advance` code path with the alt-screen work; if Phase 19 ships without it, `docs/999.7-SECURITY.md` must be created documenting residual risk
+- v1.3 roadmap: Repaint pacing — one epoch per tick shared across all burst datagrams (fixes 999.4 noecho-epoch regression); `build_state_diff` called exactly once per tick; burst drain calls `encode_datagram` only; `datagram_send_buffer_space()` is the send budget gate
+- v1.3 roadmap: `ClientScreen::apply()` monotonic guard changes from `<=` to `<` to allow same-epoch burst datagrams to all apply their runs
+- v1.3 roadmap: New quinn streams per channel (not in-stream framing); control stream (id 0) is the first bidi stream; PTY data moves to a second bidi stream; scrollback gets its own bidi stream — all unanimous from three independent researchers
+- v1.3 roadmap: `message_discriminant_order_is_stable` test is Phase 21's first commit; new `Message` variants appended after `TerminalControl` (discriminant 10); inserting anywhere else silently corrupts the wire format
+- v1.3 roadmap: Channel IDs — client-initiated channels use even IDs, server-initiated use odd IDs (prevents simultaneous-open collision); `ChannelReject` is opaque (no reason-code payload — prevents capability-enumeration oracle)
+- v1.3 roadmap: Channels are ephemeral per-connection — on cold reattach, client re-opens channels via control stream after `ResumeComplete`; `SequencedOutputBuffer` never replays `ChannelOpen`/`ChannelAccept` frames
+- v1.3 roadmap: Scrollback over reliable QUIC stream only (never datagrams); type-level enforcement: scrollback sender accepts `SendStream` only; `ScrollbackCredit` flow-control message paces delivery
+- v1.3 roadmap: Scrollback sender runs as separate tokio task with bounded `mpsc::channel` to avoid stalling the session pump under a slow consumer
+- v1.3 roadmap: `scroll_up()` gates on `!alt_screen` before pushing to `TerminalState.scrollback` — alt-screen content must not contaminate primary scrollback
+- v1.3 roadmap: `epoch_at_snapshot` field in `ScrollbackPage` wire type is mandatory — client uses it to transition from scrollback-replay to live-grid rendering without duplicated or missing lines
+- v1.3 roadmap: `SCROLLBACK_LINE_CAP = 10_000` is not raised; bounded mpsc for scrollback sender; add `tracing::warn!` as per-session scrollback approaches cap
 
 ### Pending Todos
 
-- At Phase 10 start: verify exact `MasterPty::as_raw_fd()` method name in `portable-pty 0.9.0` (STACK.md states `AsRawFd` is available; confirm before wiring shutdown pipe; gate `#[cfg(unix)]`)
-- At Phase 11 start: run per-phase research on sparse-diff encoding strategy — how to handle large-repaint frames (vim file open, `clear`) within QUIC datagram MTU. Three options: cursor-priority partial update, skip-frame-and-wait, reliable-stream fallback for full-screen repaints
-- At Phase 12 start: verify vte 0.15.0 `Perform` trait `osc_dispatch` exact parameter signature at docs.rs before committing to the API (MEDIUM confidence — `fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool)` expected but not verified)
-- At Phase 15 start: run per-phase research on Mosh `terminaloverlay.cc` — epoch model, `Validity` enum, `cull()` logic, `PendingPrediction` lifecycle; budget 2-3 planning passes; this is the hardest UX step in M4
-- At Phase 16 start: add `osc52` feature flag to `nosh-client/Cargo.toml` for crossterm; confirm `crossterm::clipboard::CopyToClipboard` API surface
-- At Phase 17: HALT — execute from a physical Windows host, not a Linux machine
-- At Phase 18: use PITFALLS.md "Looks Done But Isn't" checklist as sign-off criteria for the security doc
+- At Phase 19 start: investigation-first — reproduce the garbled-TUI bug on a Linux client↔server before implementing any fix (PITFALLS A-1 mandate); confirm `grapheme_column_width` pub surface in transitive termwiz version
+- At Phase 19 start: decide wire-format strategy for `StateDiff` width field (adding `width: u8` to cell runs is a v1.2-breaking change; treat as milestone-level breaking change or add version field — document decision before coding)
+- At Phase 20 start: write `burst_drains_when_grid_differs_from_acked_baseline` as RED-before test before any burst code touches server.rs
+- At Phase 21 start: `message_discriminant_order_is_stable` is the first commit; confirm `TerminalControl` is currently discriminant 10 (not 9 — the v1.2 ROADMAP says discriminant 9 in some places and 10 in others; verify in `messages.rs` before writing the test)
+- At Phase 21 start: confirm `datagram_send_buffer_space()` is still public on quinn 0.11.9 at implementation time
+- At Phase 21 start: decide exact who-reopens-TTY-channel-on-reattach contract (suggested: client sends `ChannelOpen { type: Tty }` after `ReattachOk`; server does not proactively re-open)
+- At Phase 22 start: decide keystrokes-while-in-scrollback behaviour: (a) buffer and deliver on return to live, (b) immediately return to live — SUMMARY.md says TBD; decide before client state machine is coded
+- At Phase 22 start: decide scrollback resume sequence number on cold reattach — `ScrollbackRequest { resume_seq: u64 }` after `ReattachOk` is the suggested shape
+- At Phase 22 start: decide whether per-line column-width metadata in `ScrollbackPage` is mandatory for v1.3 or deferred (PITFALLS S-3); SUMMARY.md flags this as "should-have, not blocking"
 
 ### Blockers/Concerns
 
-- Phase 15 (Speculative Overlay): RESOLVED — adversarial tests (vim, `read -s`, CJK) all pass; noecho security gate proven adversarially against live PTY in Always mode
-- Phase 17 (Windows validation): RESOLVED — validated 2026-06-02 on physical Windows host (10.0.26100) against Linux server `sandstorm`; all C1–C6 PASSED; PREDICT-07 satisfied
-- Phase 11 (wire format): sparse-diff encoding strategy for large repaints is an open design decision that blocks all prediction work; must be resolved as Phase 11's first task
+None at roadmap time. Concerns to watch during execution:
+
+- Phase 19: alt-screen atomicity invariant — do not ship a half-built implementation (Pitfall A-1)
+- Phase 20: both 999.4 traps (R-1 infinite-spin, R-2 noecho-epoch) must be designed out before first burst line ships
+- Phase 21: discriminant stability test is the gating first commit; any insertion before `TerminalControl` corrupts deployed connections
+- Phase 22: scrollback sender must be a separate tokio task (Pitfall M-6); inline implementation in the pump stalls PTY output under a slow consumer
 
 ## Deferred Items
 
@@ -141,26 +107,25 @@ Items acknowledged and carried forward:
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| v2 (M5) | Channel multiplexing, forwarding (MUX-01/02, FWD-01/02) | Deferred to M5 | Init |
-| v2 (M5) | Full native scrollback sync (SCROLL-01) | Deferred to M5 | Init |
-| v2 (M5) | Named/numbered session selection | Deferred to M5 | v1.1 scoping |
-| v2 (M5) | File transfer (XFER-01) | Deferred to M5 | Init |
+| Phase 18 | Security Design Pass (SEC-01 threat-model doc, SEC-02 TOFU prompt) | Deferred | v1.2 user decision |
+| Future milestone | SEC-04 client trust-boundary hardening (999.2) | Deferred | v1.2 backlog |
+| v1.4+ | Port forwarding (FWD-01), Agent forwarding (FWD-02) | Declared in mux registry, rejected by v1.3 peers | v1.3 scoping |
+| v1.4+ | File transfer (XFER-01) | Deferred | v1.3 scoping |
+| v1.4+ | Mode 2027 grapheme clustering | Deferred; wcwidth-per-codepoint is safe v1.3 baseline | v1.3 scoping |
+| v1.4+ | Scrollback search / copy-mode text selection | Deferred | v1.3 scoping |
+| v1.4+ | Scrollback reflow on resize (per-line width metadata) | Should-have; may fold into Phase 22 or defer | v1.3 scoping |
 | v2 (M6) | Windows ConPTY / native server (PLAT-01) | Deferred to M6 | Init |
 | v2 (M6) | Windows ssh-agent / Pageant signing (PLAT-02) | Deferred post-v1.1 | v1.1 scoping |
-| v2 (M6) | Encrypted key passphrase prompt | Deferred post-v1.1 | v1.1 scoping |
 | v2 (M7) | WebTransport / NAT topologies | Deferred to M7 | Init |
-| v2 (post-M4) | 0-RTT cold reattach | Deliberately deferred | INIT.md; 1-RTT ships |
-| v2 (post-M4) | RFC 7250 RPK (TLS raw public keys) | Deferred; cert-pinning proven first | v1.0 |
-| v2 (post-M4) | OSC 52 clipboard read (paste remote→local) | Excluded: security hole | v1.2 scoping |
-| v2 (post-M4) | tmux/screen integration | Excluded by maintainer | v1.2 scoping |
-| v2 (post-M4) | Bell/notification passthrough (OSC 9) | Low daily-driver value | v1.2 research |
 
 ## Session Continuity
 
-Last session: 2026-06-06T23:17:57.220Z
-Stopped at: Phase 999.1 COMPLETE — server pre-auth attack-surface hardening. 6 cargo-fuzz targets + QUIC packet fuzzer, ~18h adaptive campaign, ZERO crashes. cargo-audit in CI, deny.toml, docs/999.1-SECURITY.md. Verified passed 4/4. Code review found a post-auth OSC OOM (vte std unbounded osc_raw; Phase-16 mitigation was wrong) -> documented + filed phase 999.7. Operator TODO: push to confirm green audit CI.
-Resume file: docs/999.1-SECURITY.md
+Last session: 2026-06-07
+Stopped at: Roadmap for v1.3 (M5) created — 4 phases (19-22), 20/20 requirements mapped, files written.
+Resume file: .planning/ROADMAP.md
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Start Phase 19: `/gsd:plan-phase 19`
+- Investigation-first: reproduce the garbled-TUI bug on Linux before fixing (PITFALLS mandate)
+- Decide wire-format strategy for `StateDiff` width field before Phase 19 coding begins

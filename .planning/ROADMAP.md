@@ -5,6 +5,7 @@
 - ✅ **v1.0 M0–M2 Architecture-Validation Spike** — Phases 1-3 (shipped 2026-05-29)
 - ✅ **v1.1 M3 Roaming + Windows Client** — Phases 4-9 (shipped 2026-05-30)
 - ✅ **v1.2 M4 Predictive Echo + Daily-Driver Readiness** — Phases 10-18 (shipped 2026-06-07)
+- 📋 **v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness** — Phases 19-22 (in progress)
 
 ## Phases
 
@@ -29,100 +30,128 @@ Full detail archived at `.planning/milestones/v1.0-ROADMAP.md`.
 - [x] Phase 8: Windows Client — native Windows client → Linux server, on-disk key signing, raw mode, resize, locale (completed 2026-05-30)
 - [x] Phase 9: Windows Client Polish & Hardening — VT console-input + `~.` escape, authorized_keys warn+skip, connect timeout, server migration logging (completed 2026-05-30; Windows-host validated)
 
-Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`. Audit: `.planning/milestones/v1.1-MILESTONE-AUDIT.md` (11/11 reqs, 4/4 integration, no blockers; 3 tracked tech-debt items).
+Full detail archived at `.planning/milestones/v1.1-ROADMAP.md`.
 
 </details>
 
 <details>
 <summary>✅ v1.2 M4 Predictive Echo + Daily-Driver Readiness (Phases 10-18) — SHIPPED 2026-06-07</summary>
 
-- [x] Phase 10: PTY Reader Race Fix (completed 2026-06-01)
-- [x] Phase 11: Datagram Wire Protocol (completed 2026-06-01)
-- [x] Phase 12: Server Terminal State Model (completed 2026-06-01)
-- [x] Phase 13: Server Datagram Sender (completed 2026-06-01)
-- [x] Phase 14: Client Predictor — Confirmed Rendering (completed 2026-06-01)
-- [x] Phase 15: Client Predictor — Speculative Overlay (completed 2026-06-02)
-- [x] Phase 16: QoL Feature Pack + Windows CI Gate (completed 2026-06-02)
-- [x] Phase 17: Windows-Host Predictive Echo Validation (completed 2026-06-02; Windows-host validated)
-- [ ] Phase 18: Security Design Pass — DEFERRED to a future milestone (SEC-01/SEC-02)
+- [x] Phase 10: PTY Reader Race Fix (2/2 plans) — completed 2026-06-01
+- [x] Phase 11: Datagram Wire Protocol (1/1 plans) — completed 2026-06-01
+- [x] Phase 12: Server Terminal State Model (2/2 plans) — completed 2026-06-01
+- [x] Phase 13: Server Datagram Sender (3/3 plans) — completed 2026-06-01
+- [x] Phase 14: Client Predictor — Confirmed Rendering (3/3 plans) — completed 2026-06-01
+- [x] Phase 15: Client Predictor — Speculative Overlay (3/3 plans) — completed 2026-06-02
+- [x] Phase 16: QoL Feature Pack + Windows CI Gate (3/3 plans) — completed 2026-06-02
+- [x] Phase 17: Windows-Host Predictive Echo Validation (1/1 plans) — completed 2026-06-02
+- [ ] Phase 18: Security Design Pass — deferred to a future milestone (SEC-01/SEC-02)
 
-Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`. Audit: `.planning/milestones/v1.2-MILESTONE-AUDIT.md` (17/19 reqs; integration 8/8 seams wired; SEC-01/02 deferred with Phase 18). Completed during cycle: backlog 999.1 (server attack-surface fuzz-hardening), 999.3, 999.4.
+Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 
 </details>
-## Backlog
 
-Parking lot for ideas not scheduled into a milestone yet (999.x). Promote via `/gsd:review-backlog`.
+### v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness (Phases 19-22)
 
-### Phase 999.1: Server attack-surface hardening (expose-to-internet readiness)
-**Goal**: Be confident the server's UDP/443 QUIC ingress is safe to expose raw to the public internet — via fuzzing and a focused security scan of everything reachable before/at authentication.
-**Scope**: `cargo-fuzz`/libFuzzer harnesses on the `nosh-proto` decoders (datagram `StateDiff`/`DiffRun`, reliable-stream `Message` postcard decode, OSC accumulation), plus a QUIC-packet fuzzer against the server socket (malformed/oversized/truncated packets). Audit half-open / unauthenticated connection memory caps, amplification potential, and pre-auth resource exhaustion (DoS hardening — CLAUDE.md invariant). Output: no panics/OOM/unbounded growth on hostile input; documented residual risk.
-**Origin**: requested 2026-06-02 during M4.
-**Plans:** 5/5 plans complete
-Plans:
-- [x] 999.1-01-PLAN.md — Scaffold fuzz/ crate (workspace-excluded), declare six [[bin]] targets, prove harness with codec_decode (D-01)
-- [x] 999.1-02-PLAN.md — Add cargo-audit peer job to CI; no CI fuzz job (D-03)
-- [x] 999.1-03-PLAN.md — read_message / decode_datagram / decode_epoch_ack / osc_accumulation fuzz targets + corpora (D-01)
-- [x] 999.1-04-PLAN.md — Raw QUIC-packet fuzzer via quinn-proto Endpoint::handle, migration(true) (D-02)
-- [x] 999.1-05-PLAN.md — Residual-risk security doc + deny.toml; resolve amplification A1/A2 from quinn-proto source (D-04)
+- [ ] **Phase 19: Full-Screen TUI Rendering Correctness** — Real alternate-screen buffer (two-grid model), wide-char/grapheme audit, predictor suppression, OSC OOM bound; makes vim/htop/Claude Code work correctly
+- [ ] **Phase 20: Repaint Pacing** — Burst multiple state-diff datagrams per tick so full-screen repaints land in ~1 RTT; one epoch per tick; both 999.4 traps designed out architecturally
+- [ ] **Phase 21: Channel Multiplexing Foundation** — Control-first OPEN/ACCEPT/REJECT on control stream (id 0); discriminant-stability test first; per-channel flow control; clean lifecycle; scrollback channel type declared
+- [ ] **Phase 22: Scrollback Sync** — Scrollback delivered over the reliable scrollback channel; credit-based paging; alt-screen gate; Shift-PageUp/PageDown UX; consistent live-grid handoff and reattach survival
 
-### Phase 999.2: Client trust-boundary hardening (malicious-server resistance)
-**Goal**: Prove a hostile/compromised server cannot extract sensitive local material from the client, cannot escape the terminal, and cannot succeed at MitM.
-**Scope**: Adversarial malicious-server test harness driving the real client. Verify: (a) no exfiltration of local secrets — OSC 52 clipboard *read* never honored (already a non-goal; prove it), no env-var/file/`SSH_AUTH_SOCK`/agent leakage; (b) no terminal escape via injected control sequences in datagram/stream payloads; (c) MitM resistance — TOFU/known_hosts pinning + the Phase 18 fingerprint-confirm hold, and a *changed* host key hard-fails. Confirms the Phase 18 TOFU work actually closes the MitM gap end-to-end.
-**Origin**: requested 2026-06-02 during M4.
+## Phase Details
 
-### Phase 999.3: Client terminal-rendering correctness pack (platform-agnostic; fix + test on Linux)
-**Goal**: Resolve the terminal-handling defects surfaced during Phase 17 live validation. All items reproduce on a Linux client — fix and test on Linux where the full test suite compiles.
-**Scope** (all flagged platform-agnostic):
-- **No clear-on-connect / blank cells not painted as spaces** → prior terminal content bleeds through on connect; Ctrl-L erases one line at a time instead of clearing the screen (BUG-H family). Root: `crates/nosh-client/src/screen.rs` full-framebuffer diff skips blank cells + no initial physical clear sent on connect; server ED/clear handling in `crates/nosh-server/src/terminal.rs`.
-- **Backspace can move the predicted caret past the prompt start** (BUG-E). Root: `predictor.rs` clamps at col 0 not prompt-start col (`PredictBackspace` / `PredictCursorLeft`).
-- **Enter after a `read -s` noecho prompt doesn't advance the line** (BUG-F). Root: post-noecho-epoch render relies on server StateDiff cursor; predicted caret may be stale after the noecho epoch ends.
-- **Typematic / fast-typing glitch in vim** — `BulkSuppressed` fires on >4-byte stdin batches in `predictor.rs`; threshold may be too aggressive for fast typists.
-- **D-17-02a latency instrumentation measures epoch-confirmation time** (inclusive of think-time), not per-keystroke RTT — too coarse for measured-timing evidence; consider per-keystroke timing hooks.
-**Origin**: surfaced during Phase 17 live validation 2026-06-02.
-**Plans:** 4/4 plans complete
-Plans:
-- [x] 999.3-01-PLAN.md — D-01 BUG-E epoch-start clamp + D-05 BUG-F noecho cursor sync (predictor.rs)
-- [x] 999.3-02-PLAN.md — D-02 typematic content-inspection batch classification (predictor.rs)
-- [x] 999.3-03-PLAN.md — D-03 BUG-H blank-cell painting + emit_connect_clear (screen.rs)
-- [x] 999.3-04-PLAN.md — D-04 per-keystroke RTT instrumentation + D-03b connect-clear wiring (main.rs)
+### Phase 19: Full-Screen TUI Rendering Correctness
+**Goal**: Full-screen TUI apps (vim, htop, Claude Code) render correctly over nosh — a genuine two-grid alternate-screen model replaces the current no-op flag, wide characters and grapheme clusters are width-accurate, the predictor is suppressed in cursor-addressing mode, and the post-auth OSC OOM vector is bounded
+**Depends on**: Nothing (first v1.3 phase; server-side terminal model change with no protocol or client dependencies)
+**Requirements**: TUI-01, TUI-02, TUI-03, TUI-04, TUI-05, SEC-03
+**Success Criteria** (what must be TRUE):
+  1. `vim --noplugin -c q` over a Linux nosh client↔server opens to a blank canvas (not shell text bleeding through) and leaves the primary buffer and cursor exactly where they were before vim launched — primary content survives `?1049h`/`?1049l` atomically (save+swap+clear on enter, restore+swap on exit)
+  2. Resizing the terminal while a full-screen app is open resizes both the active alt grid and the saved primary grid — no stale-sized buffer is restored on `?1049l` and no content is lost from the inactive buffer
+  3. CJK wide characters (width 2) advance the cursor by two columns and write a placeholder at `col + 1`; ZWJ sequences and combining marks (width 0) do not advance the cursor — a unit test with `\u{4e2d}` and a ZWJ emoji sequence proves both
+  4. Running Claude Code or htop over nosh produces no garbled output and no missing spaces when compared against a reference terminal — verified against a Linux client↔server (investigation-first: reproduce before fixing)
+  5. The speculative predictor is suppressed while the alternate screen is active — no overlay appears inside vim or htop; `predictor.pending` is empty after `?1049h` is processed
+  6. A multi-chunk oversized OSC sequence in PTY output (e.g. a 10 MB OSC payload across many `advance()` calls) does not exhaust server memory — OSC accumulation is bounded before vte's internal buffer, and a RED-before/GREEN-after regression test confirms bounded memory while OSC 52 clipboard and title sequences still pass
 
-### Phase 999.4: Predictive-echo & repaint-pacing live-fix round 2
-**Goal**: Resolve the daily-driver UX defects surfaced during the 999.3 live validation round (2026-06-05, Windows client vs Linux server at ~150 ms RTT). Predictor fixes are platform-agnostic (fix + test on Linux); the repaint-pacing change is server-side.
-**Scope**:
-- **`read -s` newline not predicted** (BUG-F round 2). The Enter that runs a `read -s`/noecho command does not visibly drop the line until the shell reprints (after the *second* Enter). Root: Enter is classified purely as `EpochReset` (`predictor.rs:415`) with NO positive prediction of the line-advance, and during noecho `confirmed_epoch` never advances (structural suppression), so nothing confirms the drop. 999.3 D-05 synced the caret from confirmed but did not predict the newline itself. Fix: positively predict the Enter line-advance (cursor → col 0 of next row, with scroll-at-bottom handling), Mosh-style, only at an echoing prompt; reconcile with the noecho/tentative-epoch machinery so it does not mispredict during the hidden secret entry.
-- **Startup typing glitch** — a larger prediction glitch occurs at the very beginning of a session (first keystrokes / first epoch) but not later. Needs reproduction; suspected `awaiting_first_cull` / initial `epoch_start_col` / first-epoch baseline interaction in `predictor.rs`.
-- **Slow / progressive full-screen repaint** — vim TUI startup paints top-down and a pasted multi-line block paints bottom-up in visible waves at 150 ms RTT. Root: the server session pump (`nosh-server/src/server.rs:580`) emits at most ONE state-diff datagram per 16 ms tick, MTU-capped (`conn.max_datagram_size()`), deferring overflow cells to later ticks (`server.rs:684-703`); a full-screen repaint is many MTUs so it drips over many ticks × RTT. NOT QUIC flow control (datagrams are not ack-gated; send buffer is 1 MiB). Design decision required: burst multiple datagrams per tick (congestion-bounded) vs raise per-tick byte budget vs reliable-stream fallback for full-screen repaints (the Phase 11 deferred large-repaint strategy). Direction artefact (top-down/bottom-up) is the `build_state_diff` cell-walk + deferral order.
-**Origin**: surfaced during 999.3 live validation, 2026-06-05.
-**Plans**: 2 plans
-Plans:
-- [~] 999.4-01-PLAN.md — D-01 burst datagram send: implemented then REVERTED (infinite-spin + noecho-epoch security interaction); DEFERRED to phase 999.6
-- [x] 999.4-02-PLAN.md — D-02 PredictEnter line-advance + D-03 on_input decision-trace instrumentation & BulkSuppressed preserves-pending fix (predictor.rs)
+**Plans**: TBD
 
-### Phase 999.5: Full-screen TUI rendering correctness (alternate-screen buffer + cell width)
-**Goal**: Make complex full-screen TUI applications (Claude Code, vim, htop) render correctly over nosh. Investigation-first — reproduce on a Linux client↔server before fixing.
-**Symptom**: running the Claude Code TUI over nosh is unusable — "spaces are all missing, the screen is horribly garbled" (reported 2026-06-05, Windows client; expected to reproduce on Linux).
-**Suspected root causes** (to confirm by repro, not assume):
-- **Alternate screen is a no-op flag, not a real buffer.** `crates/nosh-server/src/terminal.rs:504` handles `?1049h`/`?1049l` as just `self.echo_state.alt_screen = enable` — there is NO separate alternate-screen grid, no save/restore of the primary buffer, no clear-on-enter. Full-screen TUIs assume a fresh, correctly-sized alt buffer with real semantics. This likely needs a genuine alternate-screen buffer in the server terminal model.
-- **Cell width / grapheme handling** — box-drawing, wide (CJK/emoji) glyphs, or combining marks may drift columns in the model, consistent with "spaces missing + garbled". Audit the model's width tracking vs a reference terminal.
-- NOT the simple blank-cell diff path (that was fixed in 999.3; `compute_diff_runs` emits spaces over changed cells correctly — verified).
-**Approach**: live Linux reproduction (run a TUI through a Linux nosh client↔server, diff the server model grid against a reference terminal / capture the datagram run stream) → pin the root cause → fix in `nosh-server/src/terminal.rs` (terminal model) with adversarial tests; client `screen.rs`/`emit_diff` only if the repro implicates it.
-**Origin**: surfaced during 999.4 discussion / 999.3 live validation follow-up, 2026-06-05.
+**Security note**: Pitfalls A-1 through A-6 and SEC-2/SEC-3 from PITFALLS.md govern this phase. Alt-screen must be atomic — a half-built implementation (swap without clear, or clear without restore) is demonstrably worse than the current no-op. SEC-03 shares the `TerminalState::advance` code path and must land here; 999.7 mitigation must be in place or `docs/999.7-SECURITY.md` updated before this phase closes.
 
-### Phase 999.6: Repaint pacing — burst datagrams per tick (epoch-under-burst redesign)
-**Goal**: Make full-screen repaints (vim startup, multi-line paste) land in ~1 RTT instead of dribbling one MTU per 16 ms tick — WITHOUT breaking the noecho security invariant. This is D-01 from 999.4, reverted there because the first implementation surfaced two bugs.
-**Why it was deferred from 999.4** (lessons — design these in, don't re-discover):
-- **Infinite spin**: `build_state_diff` (`nosh-server/src/server.rs`) computes `fresh_runs` against `last_acked_snapshot`, which does NOT advance within a burst (epoch-acks are processed in a different `select!` arm). Re-merging `fresh_runs` every burst iteration refills the deferred queue → it never drains → the pump task spins (hung `mutual_auth_inprocess_happy_path`). Mitigation proven in 999.4: when draining (pending_deferred non-empty) do NOT recompute fresh_runs.
-- **Noecho-epoch security interaction**: the burst incremented `current_epoch` once PER datagram and changed delivery timing, so the client's `confirmed_epoch` advanced during a `read -s` window — tripping `noecho_read_dash_s_zero_predicted_chars` (the literal secret chars stayed suppressed; the confirmed-state proxy moved). Likely fix: ONE epoch per tick (all burst datagrams of one screen state share an epoch), restoring the per-tick epoch cadence but delivered faster.
-**Mandatory gates**: `crates/nosh-client/tests/predict.rs::noecho_read_dash_s_zero_predicted_chars` and the `auth.rs` integration tests MUST pass; add a burst-drain unit test that fails-before/passes-after against a non-empty grid vs an empty acked baseline (see the reverted 999.4 `burst_drains_when_grid_differs_from_acked_baseline`). `datagram_send_buffer_space()` (public on quinn 0.11.9) is the per-tick budget gate; fixed-count fallback if needed.
-**Confirmed mechanism (from 999.4 investigation)**: the server terminal model is already decoupled from the send (PTY output feeds the model on the `out_rx.recv()` arm via `push_output_and_parse`, `server.rs:612`), so the full final state is available at tick time. There is no QUIC flow-control ceiling (datagrams are not ack-gated; send buffer is 1 MiB). The only limiter is the one-datagram-per-tick policy.
-**Origin**: deferred from phase 999.4 D-01, 2026-06-05.
+---
 
-### Phase 999.7: Bound OSC accumulation before vte (post-auth OOM / CR-03 done right)
-**Goal**: Close the unbounded-OSC-accumulation DoS in the server terminal model. A long OSC sequence in PTY output (e.g. `ESC]52;c;<hundreds of MB>`) can OOM the server because vte (with the default `std` feature) buffers OSC bytes in an unbounded `Vec<u8>` (`vte-0.15.0/src/lib.rs:63-64`) and accumulates them ACROSS `advance()`/read calls until the terminator — before `osc_dispatch` (where our `OSC_52_MAX_BYTES`/`MAX_TITLE_BYTES` caps live) ever runs.
-**Why it exists**: surfaced by the 999.1 code review. The Phase-16 CR-03 "re-mitigation" reasoning was WRONG — it assumed vte's buffer was bounded by the OS pipe-buffer size, but the buffer accumulates across reads, not per read (see the corrected comment in `crates/nosh-server/Cargo.toml` and `docs/999.1-SECURITY.md` §7 OSC-OOM). The osc_dispatch caps only bound what is STORED, not what vte ALLOCATES while parsing.
-**Scope**:
-- Add an OSC-length guard in `TerminalState::advance` (`crates/nosh-server/src/terminal.rs`) that detects an in-progress OSC sequence (ESC] … ST/BEL) across chunks and DROPS bytes once the sequence exceeds a cap (a few × OSC_52_MAX_BYTES) before they reach vte — a small cross-chunk state machine (vte's `std` Vec can't be capped directly; no-std vte's fixed OSC_RAW_BUF_SIZE is too small for legitimate large OSC 52 clipboard, which is why std was chosen).
-- Strengthen the `osc_accumulation` fuzz target / add a deterministic regression test that feeds a multi-chunk OSC FAR larger than libFuzzer's default `max_len` (4096) and asserts bounded memory (RED before fix / GREEN after).
-**Mandatory gate**: a multi-chunk giant-OSC test proves bounded server memory; existing OSC 52 clipboard + title behaviour (and the Phase-16 caps) must still pass.
-**Reachability**: post-authentication (PTY output from a live session) — NOT the pre-auth surface 999.1 cleared; matters for exposed / multi-user servers (terminal model lives in the shared server process).
-**Origin**: surfaced during 999.1 code review, 2026-06-07.
+### Phase 20: Repaint Pacing
+**Goal**: Full-screen repaints land in roughly one round-trip instead of dribbling one MTU per 16 ms tick — multiple state-diff datagrams burst within a single tick, the two 999.4 failure modes are designed out architecturally, and the noecho security invariant is proven by a required CI gate
+**Depends on**: Phase 19 (alt-screen correct so burst delivers correct content from day one; the most visible payoff of pacing is full-screen TUI startup)
+**Requirements**: PACE-01, PACE-02, PACE-03
+**Success Criteria** (what must be TRUE):
+  1. `vim --noplugin` startup over a simulated 150 ms RTT connection renders the full interface within two round-trips (roughly 300 ms) rather than progressively over many ticks — the full 80×24 repaint is delivered in a single tick's burst of datagrams
+  2. `noecho_read_dash_s_zero_predicted_chars` passes as a required, non-`#[ignore]` CI gate with burst code active — all burst datagrams within a tick share the same epoch value; `confirmed_epoch` does not advance during a `read -s` window
+  3. `burst_drains_when_grid_differs_from_acked_baseline` passes RED-before-fix and GREEN-after — the burst drain loop calls `build_state_diff` exactly once per tick and drains `deferred` via `encode_datagram` only; `last_acked_snapshot` non-advancement during a burst cannot cause infinite spin; `datagram_send_buffer_space()` is the per-tick send budget gate
+  4. The `apply()` monotonic guard in `ClientScreen` is changed from `<=` to `<` so same-epoch burst datagrams all apply their runs to the confirmed grid without being discarded after the first
+
+**Plans**: TBD
+
+**Security note**: Pitfalls R-1 and R-2 from PITFALLS.md are mandatory architectural constraints, not implementation options. Both caused the 999.4 revert. `burst_drains_when_grid_differs_from_acked_baseline` must be written as a RED-before test. `noecho_read_dash_s_zero_predicted_chars` must pass in CI before merge.
+
+---
+
+### Phase 21: Channel Multiplexing Foundation
+**Goal**: Logical channels are negotiated over a dedicated control stream using OPEN/ACCEPT/REJECT before any data stream is bound — the discriminant-stability enforcement test is the first commit, and the layer is proven with a simple echo channel before scrollback adds complexity
+**Depends on**: Phase 19 (discriminant-stability test complements the SEC-03 advance path changes; mux does not depend on repaint pacing — the two can proceed in parallel but sequencing after Phase 20 is cleanest for the verify-before-build pattern)
+**Requirements**: MUX-01, MUX-02, MUX-03, MUX-04, MUX-05, MUX-06
+**Success Criteria** (what must be TRUE):
+  1. `message_discriminant_order_is_stable` test passes — encodes every `Message` variant and asserts its discriminant byte matches a hardcoded expected value; new `ChannelOpen`/`ChannelAccept`/`ChannelReject` variants are appended after `TerminalControl` (discriminant 10+) and added to the test; this test is the first commit of this phase
+  2. A `ChannelOpen` on the control stream (stream id 0) is followed by `ChannelAccept` or `ChannelReject` before any data stream is bound; `ChannelReject` carries no reason-code payload (opaque); client-initiated channels use even IDs and server-initiated channels use odd IDs to prevent simultaneous-open collisions
+  3. PTY input latency stays below 5 ms while a second channel is saturated at its flow-control window — per-channel application-level credit windows prevent a slow scrollback consumer from stalling the shell
+  4. Channel teardown (half-close → full-close) releases all associated resources on both ends; a rejected or closed channel leaks no state; `ChannelAccept`/`ChannelReject` for an unknown or already-closed ID is a logged no-op, not a panic
+  5. After a cold reattach, channels are re-established via the control stream (not replayed from the byte-stream buffer) — a reattach test opens a channel, triggers orphan, reattaches, and confirms the channel is re-opened and operational; QUIC migration preserves all open streams transparently at the transport layer with no application-layer work
+  6. A concurrent simultaneous-open test fires client-open and server-open at the same time and confirms the session survives with non-colliding IDs
+
+**Plans**: TBD
+
+**Security note**: Pitfalls M-1 through M-6 from PITFALLS.md govern this phase. The discriminant test (M-1) is the first commit. The secondary stream accept loop must not open streams before authentication completes and must not bypass the `AuthLimits` semaphore (pre-auth cap). `SSH_AUTH_SOCK` must never be forwarded via any new channel type. Port/agent forwarding types (PFWD/AFWD) are declared in the registry but must be rejected by v1.3 peers.
+
+---
+
+### Phase 22: Scrollback Sync
+**Goal**: Users can view shell history that has scrolled off the visible grid, served from the server's existing scrollback buffer over a dedicated reliable channel, paged on demand, gated to exclude alt-screen content, and surviving both QUIC migration and cold reattach
+**Depends on**: Phase 19 (alt-screen suppression gate — `scroll_up()` must check `!alt_screen` before scrollback sync is correct), Phase 21 (scrollback channel rides the mux layer)
+**Requirements**: SCROLL-01, SCROLL-02, SCROLL-03, SCROLL-04, SCROLL-05
+**Success Criteria** (what must be TRUE):
+  1. Pressing Shift-PageUp in the client displays terminal history that has scrolled off the visible grid — the server streams lines from `TerminalState.scrollback` over the dedicated scrollback reliable channel; the client renders them above the current viewport
+  2. Scrollback is delivered over a reliable QUIC stream (the scrollback channel), never over datagrams; the scrollback sender runs as a separate tokio task with a bounded `mpsc::channel`; a `ScrollbackCredit` application-level flow-control message paces delivery so a slow client cannot stall the session pump; PTY input responsiveness is unaffected during a scrollback transfer
+  3. Alt-screen content (vim, htop output) never appears in the scrollback view — `scroll_up()` is gated on `!alt_screen`; a unit test writes to the primary buffer, activates alt screen, forces scroll lines, deactivates alt screen, and asserts that only the primary lines appear in `TerminalState.scrollback`
+  4. Pressing any key while in scrollback view immediately returns the display to the live viewport and delivers the keystroke to the shell; Shift-PageDown pages forward through history; reaching the live view automatically exits scrollback mode
+  5. The scrollback↔live-grid handoff contains no duplicate or missing lines — the `ScrollbackPage` wire type carries an `epoch_at_snapshot` field so the client knows at which epoch to stop replaying history and resume live datagrams; scrollback content is viewable immediately after a cold reattach (the server's `TerminalState.scrollback` survives in the `SessionSlot`)
+
+**Plans**: TBD
+
+**Security note**: Pitfalls S-1 through S-5 and M-6 from PITFALLS.md govern this phase. Scrollback must never travel over datagrams (type-level enforcement: scrollback sender accepts only `SendStream`). The `SCROLLBACK_LINE_CAP = 10_000` constant must not be raised without a measured reason. The scrollback sender task must use a bounded channel and drop oldest lines rather than blocking the pump. On cold reattach, the client re-opens the scrollback channel after `ResumeComplete` — channel state is never replayed from the byte buffer.
+
+---
+
+## Progress Table
+
+| Phase | Plans Complete | Status | Completed |
+|-------|----------------|--------|-----------|
+| 1. QUIC Transport Skeleton | 4/4 | Shipped | 2026-05-29 |
+| 2. SSH-Key Mutual Auth | 4/4 | Shipped | 2026-05-29 |
+| 3. PTY Session Core | 3/3 | Shipped | 2026-05-29 |
+| 4. Identity Threading | — | Shipped | 2026-05-30 |
+| 5. Session Persistence | — | Shipped | 2026-05-30 |
+| 6. Cold Reattach Protocol | — | Shipped | 2026-05-30 |
+| 7. Connection Migration Validation | — | Shipped | 2026-05-30 |
+| 8. Windows Client | — | Shipped | 2026-05-30 |
+| 9. Windows Client Polish & Hardening | — | Shipped | 2026-05-30 |
+| 10. PTY Reader Race Fix | 2/2 | Shipped | 2026-06-01 |
+| 11. Datagram Wire Protocol | 1/1 | Shipped | 2026-06-01 |
+| 12. Server Terminal State Model | 2/2 | Shipped | 2026-06-01 |
+| 13. Server Datagram Sender | 3/3 | Shipped | 2026-06-01 |
+| 14. Client Predictor — Confirmed Rendering | 3/3 | Shipped | 2026-06-01 |
+| 15. Client Predictor — Speculative Overlay | 3/3 | Shipped | 2026-06-02 |
+| 16. QoL Feature Pack + Windows CI Gate | 3/3 | Shipped | 2026-06-02 |
+| 17. Windows-Host Predictive Echo Validation | 1/1 | Shipped | 2026-06-02 |
+| 18. Security Design Pass | 0/? | Deferred | - |
+| 19. Full-Screen TUI Rendering Correctness | 0/? | Not started | - |
+| 20. Repaint Pacing | 0/? | Not started | - |
+| 21. Channel Multiplexing Foundation | 0/? | Not started | - |
+| 22. Scrollback Sync | 0/? | Not started | - |

@@ -91,32 +91,32 @@ Which phases cover which requirements. Populated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TUI-01 | TBD | Pending |
-| TUI-02 | TBD | Pending |
-| TUI-03 | TBD | Pending |
-| TUI-04 | TBD | Pending |
-| TUI-05 | TBD | Pending |
-| PACE-01 | TBD | Pending |
-| PACE-02 | TBD | Pending |
-| PACE-03 | TBD | Pending |
-| MUX-01 | TBD | Pending |
-| MUX-02 | TBD | Pending |
-| MUX-03 | TBD | Pending |
-| MUX-04 | TBD | Pending |
-| MUX-05 | TBD | Pending |
-| MUX-06 | TBD | Pending |
-| SCROLL-01 | TBD | Pending |
-| SCROLL-02 | TBD | Pending |
-| SCROLL-03 | TBD | Pending |
-| SCROLL-04 | TBD | Pending |
-| SCROLL-05 | TBD | Pending |
-| SEC-03 | TBD | Pending |
+| TUI-01 | Phase 19 | Pending |
+| TUI-02 | Phase 19 | Pending |
+| TUI-03 | Phase 19 | Pending |
+| TUI-04 | Phase 19 | Pending |
+| TUI-05 | Phase 19 | Pending |
+| PACE-01 | Phase 20 | Pending |
+| PACE-02 | Phase 20 | Pending |
+| PACE-03 | Phase 20 | Pending |
+| MUX-01 | Phase 21 | Pending |
+| MUX-02 | Phase 21 | Pending |
+| MUX-03 | Phase 21 | Pending |
+| MUX-04 | Phase 21 | Pending |
+| MUX-05 | Phase 21 | Pending |
+| MUX-06 | Phase 21 | Pending |
+| SCROLL-01 | Phase 22 | Pending |
+| SCROLL-02 | Phase 22 | Pending |
+| SCROLL-03 | Phase 22 | Pending |
+| SCROLL-04 | Phase 22 | Pending |
+| SCROLL-05 | Phase 22 | Pending |
+| SEC-03 | Phase 19 | Pending |
 
 **Coverage:**
 - v1.3 requirements: 20 total
-- Mapped to phases: 0 (set by roadmapper)
-- Unmapped: 20 ⚠️ (resolved at roadmap step)
+- Mapped to phases: 20
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-06-07*
-*Last updated: 2026-06-07 after initial definition*
+*Last updated: 2026-06-07 — traceability filled by roadmapper*
