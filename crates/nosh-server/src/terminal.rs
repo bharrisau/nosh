@@ -2121,4 +2121,87 @@ mod tests {
             "?1049l after RIS must not restore pre-reset primary content"
         );
     }
+
+    // ── Task 1 (19-03): SEC-03 OSC accumulation pre-bound (TDD RED → GREEN) ──────
+
+    /// SEC-03 / T-19-06 / T-19-07: A multi-chunk OSC payload exceeding 1 MiB must
+    /// be intercepted BEFORE vte allocates the full buffer.
+    ///
+    /// RED gate: before the `OSC_ACCUMULATION_MAX` pre-filter exists in `advance()`,
+    /// feeding a ~10 MiB OSC 2 title across thousands of `advance()` calls would grow
+    /// vte's internal `osc_raw` Vec to the full payload size, exhausting server memory.
+    /// The test also asserts parser resync: after the truncated oversized OSC, a normal
+    /// OSC 0/2 title and an OSC 52 sequence must still dispatch and store correctly.
+    ///
+    /// GREEN gate (post-fix): the pre-filter intercepts at `OSC_ACCUMULATION_MAX` bytes,
+    /// resets the parser to ground state via `vte::Parser::default()`, and subsequent
+    /// legitimate OSC sequences still parse and dispatch correctly.
+    #[test]
+    fn oversized_multi_chunk_osc_is_bounded_then_resyncs() {
+        let mut state = ts(80, 24);
+
+        // Build a 10 MiB OSC 2 title sequence delivered in 4096-byte chunks.
+        // ESC ] 2 ; <10 * OSC_ACCUMULATION_MAX bytes of 'A'> BEL
+        // After the fix: accumulation is capped at OSC_ACCUMULATION_MAX (1 MiB),
+        // the oversized sequence is discarded, and the parser resyncs to ground.
+        const CHUNK: usize = 4096;
+        const TOTAL: usize = OSC_ACCUMULATION_MAX * 10; // 10 MiB
+        let chunks = TOTAL / CHUNK;
+
+        // Feed OSC 2 start sequence.
+        state.advance(b"\x1b]2;");
+
+        // Feed payload in chunks — after the fix, accumulation is bounded.
+        // Without the fix, this would grow vte's osc_raw to ~10 MiB (OOM risk).
+        let chunk_data = vec![b'A'; CHUNK];
+        for _ in 0..chunks {
+            state.advance(&chunk_data);
+        }
+
+        // Feed BEL terminator — triggers osc_dispatch (or is discarded after resync).
+        state.advance(b"\x07");
+
+        // After the oversized OSC, the title must NOT be a 10 MiB string.
+        // Either it is None (discarded) or very small (bounded by MAX_TITLE_BYTES).
+        if let Some(title) = state.title() {
+            assert!(
+                title.len() <= MAX_TITLE_BYTES,
+                "title after 10 MiB OSC must be bounded by MAX_TITLE_BYTES ({}), got {} bytes",
+                MAX_TITLE_BYTES,
+                title.len()
+            );
+        }
+
+        // D-19-02 / T-19-07: After the oversized OSC, the parser must have resynced
+        // to ground state so subsequent legitimate OSC sequences still parse correctly.
+
+        // A normal OSC 0/2 title must now be accepted and stored.
+        state.advance(b"\x1b]2;OK\x07");
+        assert_eq!(
+            state.title(),
+            Some("OK"),
+            "after oversized-OSC resync, a normal OSC 2 title must be accepted (D-19-02)"
+        );
+
+        // A legitimate OSC 52 clipboard sequence must also still dispatch correctly.
+        state.advance(b"\x1b]52;c;SGVsbG8=\x07");
+        let pending = state.osc52_pending();
+        assert!(
+            pending.is_some(),
+            "after oversized-OSC resync, OSC 52 clipboard must still dispatch (D-19-03)"
+        );
+        let (_, data) = pending.unwrap();
+        assert_eq!(
+            data, b"SGVsbG8=",
+            "OSC 52 payload must be intact after resync"
+        );
+
+        // Existing storage caps must still hold after the oversized-OSC path.
+        if let Some((_sel, payload)) = state.osc52_pending() {
+            assert!(
+                payload.len() <= OSC_52_MAX_BYTES,
+                "OSC 52 cap (OSC_52_MAX_BYTES) must still hold after oversized-OSC path"
+            );
+        }
+    }
 }
