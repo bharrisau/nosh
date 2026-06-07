@@ -320,14 +320,18 @@ fn build_state_diff(
 
     // Snapshot terminal state under the lock (released when closure returns).
     // NEVER perform any async operation inside this closure (Pitfall 1 / Anti-Pattern #2).
-    let (cols, rows, cursor, cells) = slot.with_terminal_state(|ts| {
+    let (cols, rows, cursor, alt_screen, cells) = slot.with_terminal_state(|ts| {
         let (cols, rows) = ts.size();
         let cursor = ts.cursor();
+        // TUI-05: propagate server alt-screen flag to client via StateDiff.
+        // ts.echo_state() returns &EchoState; .alt_screen is a bool (Copy).
+        // This closure stays synchronous — no .await (Anti-Pattern #2 guard).
+        let alt_screen = ts.echo_state().alt_screen;
         let cells: Vec<Vec<Cell>> = ts
             .viewport_rows()
             .map(|(_, row)| row.to_vec())
             .collect();
-        (cols, rows, cursor, cells)
+        (cols, rows, cursor, alt_screen, cells)
     });
 
     // D-13-02a: skip if grid unchanged AND client is caught up.
@@ -361,7 +365,7 @@ fn build_state_diff(
     }
 
     let sent_epoch = *current_epoch;
-    let diff = StateDiff { epoch: sent_epoch, cols, rows, cursor, runs: all_runs };
+    let diff = StateDiff { epoch: sent_epoch, cols, rows, cursor, alt_screen, runs: all_runs };
     match encode_datagram(&diff, cap) {
         Ok((payload, deferred)) => Some(DiffTickResult {
             payload,

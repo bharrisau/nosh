@@ -66,6 +66,15 @@ pub struct StateDiff {
     pub rows: u16,
     /// Cursor position at the time this diff was encoded.
     pub cursor: CursorPos,
+    /// `true` when the server's terminal is in the `?1049` alternate screen
+    /// (e.g. vim, htop).  Carried in every datagram snapshot so the client can
+    /// suppress speculative local-echo predictions on alt-screen entry (TUI-05).
+    ///
+    /// **Wire-format note:** adding this field is an intentional postcard
+    /// breaking change for v1.3.  Client and server are always built from the
+    /// same source tree, so cross-version compat is not required (REQUIREMENTS.md
+    /// "Out of Scope").
+    pub alt_screen: bool,
     /// Changed cells encoded as run-length runs (sparse; only changed cells).
     ///
     /// May be a subset of all changed cells if the full set exceeded the
@@ -282,6 +291,7 @@ pub fn encode_datagram(
         cols: diff.cols,
         rows: diff.rows,
         cursor: diff.cursor,
+        alt_screen: diff.alt_screen,
         runs: vec![],
     };
 
@@ -502,6 +512,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: vec![run],
         };
         // Measure size of just the single-run diff; subtract the empty-run-list
@@ -541,6 +552,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 12, col: 40 },
+            alt_screen: false,
             runs,
         }
     }
@@ -616,6 +628,30 @@ mod tests {
             }],
         );
         assert_eq!(decode_datagram(&tag_encode(&diff)).unwrap(), diff);
+    }
+
+    // ── TUI-05: alt_screen round-trip ────────────────────────────────────────
+
+    #[test]
+    fn round_trip_alt_screen_true_survives_encode_decode() {
+        // Verify the alt_screen field survives postcard encode→decode (TUI-05).
+        // This is the regression test for the intentional StateDiff wire-format
+        // breaking change (Pitfall 6 / v1.3 same-version build).
+        let mut diff = make_diff(99, vec![]);
+        diff.alt_screen = true;
+        let encoded = tag_encode(&diff);
+        let decoded = decode_datagram(&encoded).expect("round-trip must succeed");
+        assert!(decoded.alt_screen, "alt_screen=true must survive encode→decode");
+        assert_eq!(decoded, diff);
+    }
+
+    #[test]
+    fn round_trip_alt_screen_false_is_default() {
+        // Verify alt_screen=false (normal mode) also round-trips correctly.
+        let diff = make_diff(100, vec![]);
+        assert!(!diff.alt_screen, "make_diff default must have alt_screen=false");
+        let decoded = decode_datagram(&tag_encode(&diff)).expect("round-trip must succeed");
+        assert!(!decoded.alt_screen, "alt_screen=false must survive encode→decode");
     }
 
     // ── Task B: tag byte contract ─────────────────────────────────────────────
@@ -697,6 +733,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs: over_limit_runs,
         };
         let payload = tag_encode(&diff);
@@ -729,6 +766,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 },
+            alt_screen: false,
             runs,
         };
         let (encoded, deferred) = encode_datagram(&diff, 1100).expect("encode_datagram");
@@ -762,6 +800,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 23, col: 0 },
+            alt_screen: false,
             runs: rows,
         };
         let (encoded, _deferred) = encode_datagram(&diff, 1100).expect("encode_datagram");
@@ -832,6 +871,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 0 }, // cursor at row 0 = large row sorts first
+            alt_screen: false,
             runs: all_runs,
         };
 
@@ -887,6 +927,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 12, col: 40 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 12,
                 start_col: 40,
@@ -918,6 +959,7 @@ mod tests {
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 12, col: 40 },
+            alt_screen: false,
             runs: vec![DiffRun {
                 row: 12,
                 start_col: 40,
