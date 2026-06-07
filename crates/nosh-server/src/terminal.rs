@@ -428,8 +428,8 @@ impl TerminalState {
                 self.in_osc = in_osc;
                 self.osc_byte_count = osc_byte_count;
                 self.pending_esc = true;
-                i += 1; // advance past the ESC so it is included in bytes_to_feed
                 // Return the full slice including the ESC — vte will handle it.
+                // (i is at the ESC position; returning `bytes` passes the ESC through.)
                 return bytes;
             }
 
