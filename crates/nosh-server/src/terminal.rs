@@ -2370,4 +2370,229 @@ mod tests {
             );
         }
     }
+
+    // ── TUI-04 grid-assertion regression suite (19-05 D-19-07) ─────────────────
+    //
+    // Deterministic synthetic VT grid-assertion tests covering cursor-addressing paths
+    // representative of real TUI rendering. These complement the per-feature tests from
+    // plans 01–03 (alt-screen toggle, wide chars, OSC) — they do NOT duplicate those;
+    // they exercise the cursor-addressing integration path that full-screen TUIs rely on.
+    //
+    // No sleeps, no network, no live-app invocation (D-19-07).
+
+    /// TUI-04 (a): CUP absolute positioning followed by printing places glyphs at the
+    /// exact addressed cells, independent of the cursor's prior position.
+    ///
+    /// This exercises the core rendering path that htop uses to paint its CPU bars:
+    /// repeated CUP + text sequences where every glyph must land at a specific cell.
+    #[test]
+    fn cup_addressed_write_lands_glyphs_at_exact_cells() {
+        let mut state = ts(80, 24);
+
+        // CUP to (row=5, col=10) (1-based), write "HTOP".
+        // Expected: 'H' at (4,9), 'T' at (4,10), 'O' at (4,11), 'P' at (4,12).
+        state.advance(b"\x1b[6;11H"); // 1-based row=6 col=11 → 0-based row=5 col=10
+        state.advance(b"HTOP");
+        assert_eq!(state.cell(5, 10).ch, 'H', "CUP-addressed 'H' must land at (5,10)");
+        assert_eq!(state.cell(5, 11).ch, 'T', "CUP-addressed 'T' must land at (5,11)");
+        assert_eq!(state.cell(5, 12).ch, 'O', "CUP-addressed 'O' must land at (5,12)");
+        assert_eq!(state.cell(5, 13).ch, 'P', "CUP-addressed 'P' must land at (5,13)");
+        // Cursor must be positioned immediately after the last written character.
+        assert_eq!(state.cursor(), CursorPos { row: 5, col: 14 },
+            "cursor must be at (5,14) after 'HTOP'");
+
+        // Second CUP to a different row — prior content must be undisturbed.
+        state.advance(b"\x1b[3;1H"); // row=3, col=1 (1-based) → (2,0)
+        state.advance(b"VIM");
+        assert_eq!(state.cell(2, 0).ch, 'V', "second CUP 'V' must land at (2,0)");
+        assert_eq!(state.cell(2, 1).ch, 'I');
+        assert_eq!(state.cell(2, 2).ch, 'M');
+        // Original row 5 content must be undisturbed.
+        assert_eq!(state.cell(5, 10).ch, 'H', "row 5 must be undisturbed after second CUP");
+
+        // CUP to (1,1) (home position) is a special case — must also work.
+        state.advance(b"\x1b[1;1H");
+        state.advance(b"Z");
+        assert_eq!(state.cell(0, 0).ch, 'Z', "CUP home position must write to (0,0)");
+        assert_eq!(state.cursor(), CursorPos { row: 0, col: 1 });
+    }
+
+    /// TUI-04 (b): Alt-screen enter → CUP-addressed full-screen paint → exit round trip.
+    ///
+    /// This is the integration-level atomicity test for the two-grid model.  A real vim
+    /// session does exactly this: fill the alt-screen via CUP sequences, then exit and
+    /// expect the primary shell scrollback to be exactly as it was. The test verifies
+    /// that: the alt-screen paint is isolated to the alt grid, the primary content at
+    /// specific CUP-addressed positions is preserved intact, and the cursor is restored.
+    ///
+    /// This is distinct from the unit-level toggle tests in plan 01 (`alt_screen_enter_
+    /// presents_blank_grid_at_origin`, `alt_screen_exit_restores_primary_grid_cursor_sgr`)
+    /// — those verify the raw save/restore mechanism; this verifies the full vim-like
+    /// workflow including CUP-addressed painting on the alt grid.
+    #[test]
+    fn alt_screen_cup_fullscreen_paint_exit_restores_primary_exactly() {
+        let mut state = ts(80, 24);
+
+        // ── Phase 1: establish primary content at known CUP-addressed positions ──
+        // Use CUP to write at three distinct positions so we can verify each survives.
+        state.advance(b"\x1b[1;1H");  // home
+        state.advance(b"shell prompt $");
+        state.advance(b"\x1b[10;5H"); // (9,4)
+        state.advance(b"primary-line-9");
+        state.advance(b"\x1b[20;40H"); // (19,39)
+        state.advance(b"anchor");
+        // Save primary cursor position (after last write).
+        let primary_cursor_after_writes = state.cursor();
+
+        // ── Phase 2: enter alt-screen — primary must be saved atomically ──
+        state.advance(b"\x1b[?1049h");
+        assert!(state.echo_state().alt_screen,
+            "alt_screen flag must be true after ?1049h");
+        // Alt grid must be blank — no primary content bleeds through.
+        assert_eq!(state.cell(0, 0).ch, ' ',
+            "alt grid (0,0) must be blank after enter");
+        assert_eq!(state.cell(9, 4).ch, ' ',
+            "alt grid (9,4) must be blank — primary-line-9 must not bleed through");
+
+        // ── Phase 3: paint the alt screen with CUP-addressed content ──
+        // Simulate what vim does: CUP to every "important" position and write.
+        state.advance(b"\x1b[1;1H");
+        state.advance(b"-- INSERT MODE --");
+        state.advance(b"\x1b[12;30H");
+        state.advance(b"vim content here");
+        state.advance(b"\x1b[24;1H"); // bottom status bar (row 24 = 0-based 23)
+        state.advance(b"\"file.txt\" 1L");
+        // Verify alt content is visible.
+        assert_eq!(state.cell(0, 0).ch, '-',
+            "alt screen (0,0) must show vim INSERT MODE '-'");
+        assert_eq!(state.cell(11, 29).ch, 'v',
+            "alt screen (11,29) must show vim content 'v'");
+        assert_eq!(state.cell(23, 0).ch, '"',
+            "alt screen status bar (23,0) must show '\"'");
+
+        // ── Phase 4: exit alt-screen — primary must be restored exactly ──
+        state.advance(b"\x1b[?1049l");
+        assert!(!state.echo_state().alt_screen,
+            "alt_screen flag must be false after ?1049l");
+
+        // Primary content at all three original positions must be restored.
+        assert_eq!(state.cell(0, 0).ch, 's',
+            "primary (0,0) 's' from 'shell prompt $' must be restored after alt exit");
+        assert_eq!(state.cell(9, 4).ch, 'p',
+            "primary (9,4) 'p' from 'primary-line-9' must be restored");
+        assert_eq!(state.cell(19, 39).ch, 'a',
+            "primary (19,39) 'a' from 'anchor' must be restored");
+
+        // Alt content must NOT appear on the primary grid.
+        // Row 0, col 0 has 's' (from "shell prompt"), not '-' (from vim INSERT MODE).
+        assert_ne!(state.cell(0, 0).ch, '-',
+            "vim INSERT MODE '-' must not bleed into primary grid after exit");
+
+        // Cursor must be restored to the position it was at when ?1049h was issued.
+        assert_eq!(state.cursor(), primary_cursor_after_writes,
+            "cursor must be restored to its pre-?1049h position after exit");
+    }
+
+    /// TUI-04 (c): Wide char written at a CUP-addressed position advances cursor by 2
+    /// and the continuation cell at col+1 is present as a wide marker.
+    ///
+    /// This tests the combination of CUP positioning and wide-char rendering — the path
+    /// used by apps that display CJK text at specific column offsets (e.g. status bars).
+    /// Complements the unit-level tests in plan 02 (`wide_char_cjk_advances_cursor_by_
+    /// two_and_writes_continuation`) — this adds CUP addressing as the antecedent.
+    #[test]
+    fn cup_addressed_wide_char_advances_correctly_and_has_continuation() {
+        let mut state = ts(80, 24);
+
+        // CUP to (row=3, col=10) (1-based 4,11 → 0-based 3,10), write U+4E2D '中' (width 2).
+        state.advance(b"\x1b[4;11H"); // 1-based row=4 col=11 → 0-based row=3 col=10
+        state.advance("中".as_bytes());
+
+        // Primary cell at (3,10): the CJK glyph.
+        let glyph = state.cell(3, 10);
+        assert_eq!(glyph.ch, '中', "CUP-addressed '中' must be at (3,10)");
+        assert!(!glyph.wide, "primary CJK cell must not have wide:true");
+
+        // Continuation cell at (3,11): wide marker.
+        let cont = state.cell(3, 11);
+        assert!(cont.wide, "continuation cell (3,11) must have wide:true after CUP-write of '中'");
+
+        // Cursor must have advanced by 2 columns from the addressed position.
+        assert_eq!(state.cursor(), CursorPos { row: 3, col: 12 },
+            "cursor must be at col 12 after CUP(3,10) + wide '中'");
+
+        // Writing ASCII after the wide char must land at the correct column (12, not 11).
+        state.advance(b"X");
+        assert_eq!(state.cell(3, 12).ch, 'X',
+            "ASCII after CUP-wide-char must land at col 12 (cursor was at 12)");
+        assert_eq!(state.cursor().col, 13,
+            "cursor must advance to col 13 after ASCII at col 12");
+
+        // Row 2 must be untouched (CUP addressed row 3 only).
+        assert_eq!(state.cell(2, 10).ch, ' ',
+            "row 2 col 10 must be blank — CUP targeted row 3");
+    }
+
+    /// TUI-04 (d): Erase-in-display and erase-in-line after CUP positioning clears the
+    /// expected region precisely, leaving cells outside the region undisturbed.
+    ///
+    /// This exercises the combined CUP + ED/EL path that full-screen TUIs use to clear
+    /// regions before redrawing — the correctness of region boundaries is critical for
+    /// apps like htop that rely on ED/EL to clear only the portion they intend to repaint.
+    #[test]
+    fn cup_then_ed_el_clears_correct_region_only() {
+        let mut state = ts(20, 5); // small terminal to make assertions manageable
+
+        // Paint every cell with a distinctive character so we can verify clears precisely.
+        // Fill row by row using CUP + text.
+        for r in 0u16..5 {
+            state.advance(format!("\x1b[{};1H", r + 1).as_bytes()); // CUP to row r, col 0
+            state.advance(b"XXXXXXXXXXXXXXXXXXXX"); // 20 X's
+        }
+        // Verify a cell in row 2 is 'X' before any erase.
+        assert_eq!(state.cell(2, 0).ch, 'X', "sanity: row 2 col 0 must be 'X' before erase");
+
+        // ── EL 0 (erase to end of line) after CUP ──
+        // CUP to (row=2, col=10) then EL 0: cols 9..19 on row 2 must clear; cols 0..8 intact.
+        state.advance(b"\x1b[3;10H"); // 1-based row=3 col=10 → 0-based row=2 col=9
+        state.advance(b"\x1b[K");     // EL 0 (default = 0): erase from cursor to end of line
+        // Cursor is at (2,9). EL 0 clears from col 9 to end of row.
+        for c in 0u16..9 {
+            assert_eq!(state.cell(2, c).ch, 'X',
+                "col {c} on row 2 must still be 'X' (before cursor pos 9)");
+        }
+        for c in 9u16..20 {
+            assert_eq!(state.cell(2, c).ch, ' ',
+                "col {c} on row 2 must be ' ' after EL 0 from col 9");
+        }
+        // Other rows must be undisturbed.
+        assert_eq!(state.cell(1, 0).ch, 'X', "row 1 col 0 must be undisturbed after EL on row 2");
+        assert_eq!(state.cell(3, 0).ch, 'X', "row 3 col 0 must be undisturbed after EL on row 2");
+
+        // ── ED 0 (erase to end of screen) after CUP ──
+        // CUP to (row=4, col=5) then ED 0: from (3,4) to end-of-screen must clear.
+        // Row 2 already has partial 'X' content from above; row 1 is all 'X'.
+        state.advance(b"\x1b[4;5H"); // 1-based row=4 col=5 → 0-based row=3 col=4
+        state.advance(b"\x1b[J");    // ED 0: erase from cursor to end of screen
+        // Row 3: cols 0..3 must remain 'X'; cols 4..19 must be cleared.
+        for c in 0u16..4 {
+            assert_eq!(state.cell(3, c).ch, 'X',
+                "row 3 col {c} must be 'X' (before cursor col 4)");
+        }
+        for c in 4u16..20 {
+            assert_eq!(state.cell(3, c).ch, ' ',
+                "row 3 col {c} must be ' ' after ED 0 from col 4");
+        }
+        // Row 4 (index 4) must be fully cleared (it is below the cursor row).
+        for c in 0u16..20 {
+            assert_eq!(state.cell(4, c).ch, ' ',
+                "row 4 col {c} must be ' ' after ED 0 (entirely below cursor)");
+        }
+        // Rows 0 and 1 must be undisturbed (they are above the cursor row).
+        assert_eq!(state.cell(0, 0).ch, 'X', "row 0 must be undisturbed after ED 0");
+        assert_eq!(state.cell(1, 0).ch, 'X', "row 1 must be undisturbed after ED 0");
+        // Row 2 mixed content (from EL above) must be undisturbed by ED 0.
+        assert_eq!(state.cell(2, 0).ch, 'X', "row 2 col 0 must still be 'X' after ED 0");
+        assert_eq!(state.cell(2, 9).ch, ' ', "row 2 col 9 must still be ' ' after ED 0");
+    }
 }
