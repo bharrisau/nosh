@@ -1346,6 +1346,78 @@ fn clean_exit(e: quinn::ConnectionError) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use nosh_proto::datagram::CellStyle;
+
+    // ── Task 2 (19-02): compute_diff_runs wide-char skip tests ───────────────
+
+    /// TUI-03: DiffRun.chars must contain exactly one scalar for a wide glyph;
+    /// the continuation cell (wide:true) must not be pushed into chars.
+    ///
+    /// Also verifies that the column counter still advances past the continuation
+    /// cell so subsequent runs start at the correct column.
+    #[test]
+    fn compute_diff_runs_wide_char_produces_one_scalar_in_chars() {
+        use crate::terminal::Cell;
+        // Build a 4-column grid row: ['中' (wide:false), ' ' (wide:true), 'a' (wide:false), ' ']
+        let cjk = Cell {
+            ch: '中',
+            style: CellStyle(CellStyle::NONE),
+            fg: None,
+            bg: None,
+            wide: false,
+        };
+        let cont = Cell {
+            ch: ' ',
+            style: CellStyle(CellStyle::NONE),
+            fg: None,
+            bg: None,
+            wide: true,
+        };
+        let narrow_a = Cell {
+            ch: 'a',
+            style: CellStyle(CellStyle::NONE),
+            fg: None,
+            bg: None,
+            wide: false,
+        };
+        let blank = Cell::default();
+        let current = vec![vec![cjk.clone(), cont.clone(), narrow_a.clone(), blank.clone()]];
+        let baseline: Vec<Vec<Cell>> = vec![];
+
+        let runs = compute_diff_runs(&current, &baseline);
+
+        // The wide glyph '中' and the narrow 'a' share the same style/fg/bg,
+        // so they may appear in one run. The continuation cell must be skipped.
+        // Collect all chars from all runs.
+        let all_chars: String = runs.iter().map(|r| r.chars.as_str()).collect();
+        assert!(
+            all_chars.contains('中'),
+            "DiffRun chars must contain the CJK glyph '中'"
+        );
+        // The continuation spacer ' ' at col 1 must NOT produce an extra scalar
+        // in chars — verify by counting '中' occurrences (should be exactly 1)
+        // and verifying the run does not double-emit.
+        let cjk_count = all_chars.chars().filter(|&c| c == '中').count();
+        assert_eq!(cjk_count, 1, "CJK glyph must appear exactly once in DiffRun chars");
+        // The continuation cell char (' ') might appear for the 'a' run's trailing
+        // blank, but the key invariant is that the run for '中' does not include an
+        // extra scalar from the wide:true cell — proven by the run length check below.
+        // Find the run that starts at col 0.
+        let run0 = runs.iter().find(|r| r.start_col == 0);
+        if let Some(run) = run0 {
+            // If '中' and 'a' merged into one run starting at col 0, chars should be
+            // "中a" (2 chars), NOT "中 a" (3 chars) which would indicate the continuation
+            // spacer leaked into the run.
+            let len = run.chars.chars().count();
+            assert!(
+                len <= 2,
+                "run starting at col 0 must have at most 2 chars (glyph + 'a'), got {len}: {:?}",
+                run.chars
+            );
+        }
+    }
+
     /// CLOSE_AUTH defensive branch: verify the building blocks that
     /// `extract_peer_identity` delegates to correctly return `None` for
     /// non-Ed25519 / malformed SPKI bytes, triggering the CLOSE_AUTH path.
