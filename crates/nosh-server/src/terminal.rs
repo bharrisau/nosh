@@ -1992,6 +1992,64 @@ mod tests {
         assert!(!state.echo_state().alt_screen, "alt_screen must be false after bare exit");
     }
 
+    // ── Task 1 (19-02): Wide-character and zero-width tests (TDD RED gate) ──────
+
+    /// TUI-03: A CJK width-2 char advances cursor.col by 2 and writes a wide
+    /// continuation marker at col+1 (D-19-05, D-19-06).
+    #[test]
+    fn wide_char_cjk_advances_cursor_by_two_and_writes_continuation() {
+        let mut state = ts(80, 24);
+        // U+4E2D '中' is CJK, width 2.
+        state.advance("中".as_bytes());
+        // Cursor must have advanced 2 columns.
+        assert_eq!(
+            state.cursor(),
+            CursorPos { row: 0, col: 2 },
+            "CJK width-2 char must advance cursor by 2"
+        );
+        // Primary cell at col 0: the glyph itself.
+        let primary = state.cell(0, 0);
+        assert_eq!(primary.ch, '中', "col 0 must hold the CJK glyph");
+        assert!(!primary.wide, "primary cell must not be wide:true");
+        // Continuation cell at col 1: wide:true.
+        let cont = state.cell(0, 1);
+        assert!(cont.wide, "col 1 must be the wide continuation marker (wide:true)");
+    }
+
+    /// TUI-03: A zero-width combining mark (U+0301 combining acute) must not
+    /// advance the cursor (D-19-05).
+    #[test]
+    fn zero_width_combining_mark_does_not_advance_cursor() {
+        let mut state = ts(80, 24);
+        // Write 'a' first so cursor is at col 1.
+        state.advance(b"a");
+        assert_eq!(state.cursor().col, 1, "after 'a' cursor must be at col 1");
+        // U+0301 COMBINING ACUTE ACCENT — width 0.
+        state.advance("\u{0301}".as_bytes());
+        // Cursor must NOT advance.
+        assert_eq!(
+            state.cursor().col, 1,
+            "zero-width combining mark must not advance cursor"
+        );
+    }
+
+    /// TUI-03: A width-2 char at the right edge (col == cols-1) must not panic
+    /// and must not write the continuation cell out of bounds (T-19-04).
+    #[test]
+    fn wide_char_at_right_edge_does_not_panic() {
+        let mut state = ts(4, 1);
+        // Move cursor to col 3 (last column in a 4-wide terminal).
+        state.advance(b"   "); // 3 ASCII chars → cursor at col 3
+        assert_eq!(state.cursor().col, 3, "cursor should be at col 3");
+        // Writing '中' (width 2) at col 3: col+1 = 4 which is out of bounds.
+        // Must not panic; continuation cell write is suppressed.
+        state.advance("中".as_bytes());
+        // Cursor must have advanced without panicking (wraps or clamps — exact
+        // wrap behaviour is implementation-defined; the key invariant is no panic
+        // and no out-of-bounds grid write).
+        let _ = state.cursor(); // just verifying no panic
+    }
+
     /// TUI-01: RIS (ESC c) while in alt-screen clears saved_primary so a subsequent
     /// ?1049l does not restore stale pre-reset content (Pitfall 5 / RIS invariant).
     #[test]
