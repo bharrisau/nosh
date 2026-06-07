@@ -478,14 +478,22 @@ impl TerminalState {
         let new_rows = rows as usize;
 
         if current_rows > new_rows {
-            // Shrink: top rows scroll into scrollback.
+            // Shrink: top rows scroll into scrollback — but ONLY for the primary screen.
+            // D-19-09 gate (consistent with scroll_up): while the alt-screen is active
+            // the active grid IS the alt grid; pushing its rows to self.scrollback would
+            // contaminate primary scrollback with alt-screen content (same bug as CR-03
+            // for the saved_primary path). Discard alt rows on shrink; they were ephemeral.
             let excess = current_rows - new_rows;
             for _ in 0..excess {
                 let top_row = self.grid.remove(0);
-                self.scrollback.push_back(top_row);
-                if self.scrollback.len() > SCROLLBACK_LINE_CAP {
-                    self.scrollback.pop_front();
+                if !self.echo_state.alt_screen {
+                    // Primary screen: preserve rows in scrollback (same cap as scroll_up).
+                    self.scrollback.push_back(top_row);
+                    if self.scrollback.len() > SCROLLBACK_LINE_CAP {
+                        self.scrollback.pop_front();
+                    }
                 }
+                // Alt screen: top_row is dropped — alt content must not enter scrollback.
             }
         } else if current_rows < new_rows {
             // Grow: add blank rows at the bottom.
@@ -522,14 +530,25 @@ impl TerminalState {
             let current_prim_rows = prim_grid.len();
             let new_rows_usize = rows as usize;
             if current_prim_rows > new_rows_usize {
-                // Shrink: top rows go into primary scrollback (not lost, T-19-02).
+                // CR-03 fix: while the alt-screen is active, the saved primary grid is
+                // NOT the active viewport. Excess top rows that fall off during a shrink
+                // must be DISCARDED, not pushed to self.scrollback. The active screen's
+                // scrollback (self.scrollback) belongs to whichever screen is currently
+                // visible; pushing primary rows here while alt-screen is active would
+                // contaminate the scrollback the user can actually scroll through
+                // (same gate as scroll_up's D-19-09 check).
+                //
+                // The primary was not visible during the alt-screen session, so its
+                // truncated rows have not been shown to the user and do not belong in
+                // scrollback (consistent with D-19-09: alt-screen content never goes to
+                // primary scrollback, and primary off-screen rows during alt-screen
+                // are equally invisible to the user).
                 let excess = current_prim_rows - new_rows_usize;
                 for _ in 0..excess {
-                    let top = prim_grid.remove(0);
-                    self.scrollback.push_back(top);
-                    if self.scrollback.len() > SCROLLBACK_LINE_CAP {
-                        self.scrollback.pop_front();
-                    }
+                    let _discarded = prim_grid.remove(0);
+                    // Intentionally dropped: the primary grid was not visible while the
+                    // alt screen was active, so these rows were never presented to the
+                    // user and must not appear in the scrollback they can scroll through.
                 }
             } else if current_prim_rows < new_rows_usize {
                 // Grow: add blank rows at the bottom.
@@ -2061,10 +2080,14 @@ mod tests {
         }
     }
 
-    /// TUI-02: shrinking rows while alt-screen active pushes excess saved primary
-    /// rows into self.scrollback (not lost), bounded by SCROLLBACK_LINE_CAP.
+    /// CR-03 / TUI-02: shrinking rows while alt-screen active discards excess saved primary
+    /// rows (they must NOT be pushed to self.scrollback, which belongs to the active screen).
+    ///
+    /// The saved primary was not visible during the alt-screen session, so its truncated
+    /// rows have not been presented to the user and must not appear in the scrollback the
+    /// user can scroll through (consistent with D-19-09 gate in scroll_up).
     #[test]
-    fn resize_shrink_while_alt_screen_pushes_saved_primary_rows_to_scrollback() {
+    fn resize_shrink_while_alt_screen_discards_saved_primary_rows_not_to_scrollback() {
         let mut state = ts(80, 10);
         // Write content on all 10 primary rows before entering alt-screen.
         for _ in 0..10 {
@@ -2074,18 +2097,30 @@ mod tests {
 
         // Enter alt-screen.
         state.advance(b"\x1b[?1049h");
+        let scroll_on_enter = state.scrollback.len();
 
-        // Shrink from 10 rows to 5 rows — the top 5 primary rows should go to scrollback.
+        // Shrink from 10 rows to 5 rows while alt-screen is active.
+        // CR-03 fix: the excess saved primary rows must be DISCARDED, not pushed to scrollback.
         state.resize(80, 5);
+
+        // Scrollback must NOT have grown during the resize — the active screen's scrollback
+        // must not be contaminated with primary rows that were never shown to the user.
+        assert_eq!(
+            state.scrollback.len(), scroll_on_enter,
+            "scrollback must not grow during alt-screen resize (CR-03 gate): {} != {}",
+            state.scrollback.len(),
+            scroll_on_enter
+        );
 
         // Exit — primary restored at 5 rows.
         state.advance(b"\x1b[?1049l");
         assert_eq!(state.size(), (80, 5), "primary must be 5 rows after shrink");
 
-        // Scrollback must have grown (the 5 excess saved primary rows were pushed).
-        assert!(
-            state.scrollback.len() > scroll_before,
-            "scrollback must grow when saved primary shrinks: {} > {}",
+        // Scrollback must be identical to what it was before the resize — the primary
+        // off-screen rows were discarded, not merged into scrollback.
+        assert_eq!(
+            state.scrollback.len(), scroll_before,
+            "scrollback must equal pre-resize value after alt-screen exit (CR-03): {} != {}",
             state.scrollback.len(),
             scroll_before
         );
