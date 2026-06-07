@@ -57,6 +57,14 @@ pub struct Cell {
     pub fg: Option<u8>,
     /// ANSI 256-color background. `None` = terminal default.
     pub bg: Option<u8>,
+    /// Wide-character continuation marker (D-19-06).
+    ///
+    /// Mirrors the server-side `Cell.wide` field (field-for-field parity
+    /// required by T-19-05). `true` at `col+1` means that col belongs to the
+    /// width-2 glyph at `col`. The client render path (`emit_diff`) skips
+    /// `wide:true` cells — the terminal already advanced two columns when the
+    /// primary glyph was written.
+    pub wide: bool,
 }
 
 impl Default for Cell {
@@ -66,6 +74,7 @@ impl Default for Cell {
             style: CellStyle(CellStyle::NONE),
             fg: None,
             bg: None,
+            wide: false,
         }
     }
 }
@@ -135,6 +144,7 @@ impl Overlay for ConnectionLossOverlay {
             style: CellStyle(CellStyle::REVERSE),
             fg: None,
             bg: None,
+            wide: false,
         })
     }
 }
@@ -255,6 +265,7 @@ impl ClientScreen {
                     style: run.style,
                     fg: run.fg,
                     bg: run.bg,
+                    wide: false,
                 };
             }
         }
@@ -448,6 +459,14 @@ impl ClientScreen {
                 let col = c as u16;
                 if want == have {
                     continue; // idempotent: skip unchanged cells (Pitfall 5)
+                }
+
+                // D-19-06: skip wide-char continuation cells — the terminal already
+                // advanced two columns when the primary glyph was written.  The
+                // unconditional physical-grid commit below still syncs *phys_cell so
+                // no spurious diff persists across renders (T-19-05).
+                if want.wide {
+                    continue;
                 }
 
                 // Move cursor only when not already positioned at (row, col).

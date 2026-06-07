@@ -799,6 +799,7 @@ impl Overlay for PredictionOverlay {
                     style: style_bits,
                     fg: None,
                     bg: None,
+                    wide: false,
                 });
             }
         }
