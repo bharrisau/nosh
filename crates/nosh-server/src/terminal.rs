@@ -280,6 +280,46 @@ impl TerminalState {
         // Clamp cursor to new bounds.
         self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
+
+        // TUI-02: also resize the saved primary grid if the alternate screen is active.
+        // Applies the same column truncate/resize and row remove-top-to-scrollback /
+        // push-blank logic as the active grid above. Excess rows on shrink go to
+        // `self.scrollback` (not lost, obeying SCROLLBACK_LINE_CAP). Cursor in
+        // saved_primary is clamped to the new bounds.
+        if let Some((ref mut prim_grid, ref mut prim_cursor, _)) = self.saved_primary {
+            // Resize columns.
+            for row in prim_grid.iter_mut() {
+                let current_len = row.len();
+                let new_len = cols as usize;
+                if current_len > new_len {
+                    row.truncate(new_len);
+                } else if current_len < new_len {
+                    row.resize(new_len, Cell::default());
+                }
+            }
+            // Grow or shrink rows.
+            let current_prim_rows = prim_grid.len();
+            let new_rows_usize = rows as usize;
+            if current_prim_rows > new_rows_usize {
+                // Shrink: top rows go into primary scrollback (not lost, T-19-02).
+                let excess = current_prim_rows - new_rows_usize;
+                for _ in 0..excess {
+                    let top = prim_grid.remove(0);
+                    self.scrollback.push_back(top);
+                    if self.scrollback.len() > SCROLLBACK_LINE_CAP {
+                        self.scrollback.pop_front();
+                    }
+                }
+            } else if current_prim_rows < new_rows_usize {
+                // Grow: add blank rows at the bottom.
+                for _ in current_prim_rows..new_rows_usize {
+                    prim_grid.push(vec![Cell::default(); cols as usize]);
+                }
+            }
+            // Clamp saved cursor to new bounds (T-19-02 saturating clamp).
+            prim_cursor.row = prim_cursor.row.min(rows.saturating_sub(1));
+            prim_cursor.col = prim_cursor.col.min(cols.saturating_sub(1));
+        }
     }
 
     // ── Alt-screen two-grid model (TUI-01, D-19-01..D-19-06) ─────────────────
@@ -338,15 +378,24 @@ impl TerminalState {
     /// Scroll the viewport up by one line: push the top row into scrollback (with
     /// cap enforcement) and append a blank row at the bottom. Cursor stays at the
     /// last row (unchanged by scroll_up — the viewport moved, not the cursor).
+    ///
+    /// **D-19-09 gate**: while the alternate screen is active, the removed top row
+    /// is discarded (not pushed to scrollback). Alt-screen content must never
+    /// contaminate primary scrollback history. The blank-row push at the bottom
+    /// always runs regardless. Phase 22 scrollback sync depends on this gate.
     fn scroll_up(&mut self) {
         if self.rows == 0 {
             return;
         }
         let top_row = self.grid.remove(0);
-        self.scrollback.push_back(top_row);
-        if self.scrollback.len() > SCROLLBACK_LINE_CAP {
-            self.scrollback.pop_front();
+        if !self.echo_state.alt_screen {
+            // Primary screen: push to scrollback with cap enforcement.
+            self.scrollback.push_back(top_row);
+            if self.scrollback.len() > SCROLLBACK_LINE_CAP {
+                self.scrollback.pop_front();
+            }
         }
+        // Alt screen: top_row is dropped here (no scrollback for alt grid).
         self.grid.push(vec![Cell::default(); self.cols as usize]);
     }
 
@@ -1703,6 +1752,112 @@ mod tests {
         assert!(
             state.take_title().is_none(),
             "take_title must return None on second call (drain-once semantics)"
+        );
+    }
+
+    // ── Task 2: Resize both grids and scroll_up gate (TUI-02, D-19-09) ───────
+
+    /// TUI-02: resize while alt-screen is active resizes both the active alt grid
+    /// and the saved primary grid. On ?1049l the restored primary has the new
+    /// dimensions, not the old ones from before the resize.
+    #[test]
+    fn resize_while_alt_screen_active_resizes_both_grids() {
+        let mut state = ts(80, 24);
+        // Write distinctive primary content at known positions (avoiding bottom-right
+        // which would trigger wrap+scroll and lose (0,0) content to scrollback).
+        state.advance(b"P"); // 'P' at (0,0), cursor moves to (0,1)
+        state.advance(b"\x1b[10;20HR"); // cursor to row=9, col=19 (1-based 10,20); write 'R'
+        // Verify primary content is present.
+        assert_eq!(state.cell(0, 0).ch, 'P', "sanity: P at (0,0) before alt-screen");
+        assert_eq!(state.cell(9, 19).ch, 'R', "sanity: R at (9,19) before alt-screen");
+
+        // Enter alt-screen at 80x24.
+        state.advance(b"\x1b[?1049h");
+        assert!(state.echo_state().alt_screen);
+        assert_eq!(state.size(), (80, 24));
+
+        // Resize to 100x30 while alt-screen is active.
+        state.resize(100, 30);
+        assert_eq!(state.size(), (100, 30), "active alt grid must have new size after resize");
+
+        // Exit alt-screen — primary grid must be restored at new dimensions.
+        state.advance(b"\x1b[?1049l");
+        assert!(!state.echo_state().alt_screen);
+        let (cols, rows) = state.size();
+        assert_eq!(cols, 100, "restored primary grid must have new cols after resize");
+        assert_eq!(rows, 30, "restored primary grid must have new rows after resize");
+        // Primary content at both positions must survive.
+        assert_eq!(state.cell(0, 0).ch, 'P', "primary content at (0,0) must survive resize+exit");
+        assert_eq!(state.cell(9, 19).ch, 'R', "primary content at (9,19) must survive resize+exit");
+        // Each row must have the new column count — accessing col 99 must not panic.
+        for r in 0..30u16 {
+            let _ = state.cell(r, 99);
+        }
+    }
+
+    /// TUI-02: shrinking rows while alt-screen active pushes excess saved primary
+    /// rows into self.scrollback (not lost), bounded by SCROLLBACK_LINE_CAP.
+    #[test]
+    fn resize_shrink_while_alt_screen_pushes_saved_primary_rows_to_scrollback() {
+        let mut state = ts(80, 10);
+        // Write content on all 10 primary rows before entering alt-screen.
+        for _ in 0..10 {
+            state.advance(b"DATA\n");
+        }
+        let scroll_before = state.scrollback.len();
+
+        // Enter alt-screen.
+        state.advance(b"\x1b[?1049h");
+
+        // Shrink from 10 rows to 5 rows — the top 5 primary rows should go to scrollback.
+        state.resize(80, 5);
+
+        // Exit — primary restored at 5 rows.
+        state.advance(b"\x1b[?1049l");
+        assert_eq!(state.size(), (80, 5), "primary must be 5 rows after shrink");
+
+        // Scrollback must have grown (the 5 excess saved primary rows were pushed).
+        assert!(
+            state.scrollback.len() > scroll_before,
+            "scrollback must grow when saved primary shrinks: {} > {}",
+            state.scrollback.len(),
+            scroll_before
+        );
+    }
+
+    /// D-19-09: scroll_up while alt-screen active must NOT push to scrollback.
+    ///
+    /// This is the gate Phase 22 (scrollback sync) depends on — alt-screen content
+    /// must never contaminate primary scrollback history.
+    #[test]
+    fn scroll_up_in_alt_screen_does_not_push_to_scrollback() {
+        let mut state = ts(80, 3); // small terminal to force scrolling quickly
+
+        // Write to primary and scroll — scrollback must grow.
+        state.advance(b"line1\nline2\nline3\nline4\n"); // forces scrollback on primary
+        let scroll_after_primary = state.scrollback.len();
+        assert!(scroll_after_primary > 0, "primary scrollback must be non-empty");
+
+        // Enter alt-screen.
+        state.advance(b"\x1b[?1049h");
+        let scroll_on_enter = state.scrollback.len();
+
+        // Force scrolling on the alt grid by filling it with newlines.
+        state.advance(b"alt1\nalt2\nalt3\nalt4\nalt5\n");
+
+        // Scrollback length must be UNCHANGED — alt content is discarded (D-19-09).
+        assert_eq!(
+            state.scrollback.len(), scroll_on_enter,
+            "scrollback must not grow while alt-screen is active (D-19-09 gate)"
+        );
+
+        // Exit alt-screen.
+        state.advance(b"\x1b[?1049l");
+
+        // Primary scrollback must still be intact (unchanged by alt-screen activity).
+        assert_eq!(
+            state.scrollback.len(), scroll_after_primary,
+            "primary scrollback must be intact after exiting alt-screen"
         );
     }
 
