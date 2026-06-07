@@ -76,7 +76,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 - [x] 19-01-PLAN.md — Two-grid alt-screen model: atomic enter/exit, resize both grids, scrollback gate (TUI-01, TUI-02)
 - [x] 19-02-PLAN.md — Wide-char width: Cell.wide marker, width-aware print_char, server/client continuation skip (TUI-03)
 - [x] 19-03-PLAN.md — OSC accumulation pre-bound at 1 MiB + parser resync; RED/GREEN multi-chunk regression (SEC-03)
-- [ ] 19-04-PLAN.md — alt_screen on StateDiff + client predictor suppression on alt-screen entry (TUI-05)
+- [x] 19-04-PLAN.md — alt_screen on StateDiff + client predictor suppression on alt-screen entry (TUI-05)
 - [ ] 19-05-PLAN.md — Synthetic VT grid-assertion suite + manual visual pass + docs/999.7-SECURITY.md (TUI-04, SEC-03)
 
 **Security note**: Pitfalls A-1 through A-6 and SEC-2/SEC-3 from PITFALLS.md govern this phase. Alt-screen must be atomic â a half-built implementation (swap without clear, or clear without restore) is demonstrably worse than the current no-op. SEC-03 shares the `TerminalState::advance` code path and must land here; 999.7 mitigation must be in place or `docs/999.7-SECURITY.md` updated before this phase closes.
@@ -156,7 +156,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 16. QoL Feature Pack + Windows CI Gate | 3/3 | Shipped | 2026-06-02 |
 | 17. Windows-Host Predictive Echo Validation | 1/1 | Shipped | 2026-06-02 |
 | 18. Security Design Pass | 0/? | Deferred | - |
-| 19. Full-Screen TUI Rendering Correctness | 3/5 | In Progress|  |
+| 19. Full-Screen TUI Rendering Correctness | 4/5 | In Progress|  |
 | 20. Repaint Pacing | 0/? | Not started | - |
 | 21. Channel Multiplexing Foundation | 0/? | Not started | - |
 | 22. Scrollback Sync | 0/? | Not started | - |

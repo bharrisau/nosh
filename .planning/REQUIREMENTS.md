@@ -17,7 +17,7 @@ Requirements for this milestone. Each maps to a roadmap phase.
 - [x] **TUI-02**: Both the primary and alternate grids resize correctly on terminal resize (SIGWINCH) with no loss of the inactive buffer
 - [x] **TUI-03**: Wide characters (CJK, width 2) occupy two columns without column drift; zero-width combining marks and multi-codepoint grapheme clusters (ZWJ/emoji + variation selectors) render as one cluster without advancing the cursor incorrectly
 - [ ] **TUI-04**: Full-screen TUI applications (vim, htop, Claude Code) render correctly over nosh — no garbling, no missing spaces — verified against a reference terminal on a Linux client↔server
-- [ ] **TUI-05**: The predictor suppresses speculative local echo while the alternate screen is active (no overlay inside cursor-addressing apps)
+- [x] **TUI-05**: The predictor suppresses speculative local echo while the alternate screen is active (no overlay inside cursor-addressing apps)
 
 ### Repaint Pacing (PACE)
 
@@ -95,7 +95,7 @@ Which phases cover which requirements. Populated during roadmap creation.
 | TUI-02 | Phase 19 | Complete |
 | TUI-03 | Phase 19 | Complete |
 | TUI-04 | Phase 19 | Pending |
-| TUI-05 | Phase 19 | Pending |
+| TUI-05 | Phase 19 | Complete |
 | PACE-01 | Phase 20 | Pending |
 | PACE-02 | Phase 20 | Pending |
 | PACE-03 | Phase 20 | Pending |
