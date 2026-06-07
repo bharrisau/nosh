@@ -4,12 +4,12 @@ milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
 status: "Roadmap created; ready for /gsd:plan-phase 19"
 stopped_at: Phase 19 context gathered
-last_updated: "2026-06-07T04:39:38.018Z"
+last_updated: "2026-06-07T05:07:00.273Z"
 last_activity: 2026-06-07 — Milestone v1.3 roadmap created
 progress:
   total_phases: 4
   completed_phases: 0
-  total_plans: 0
+  total_plans: 5
   completed_plans: 0
   percent: 0
 ---
