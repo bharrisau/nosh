@@ -83,6 +83,14 @@ pub struct Cell {
     /// ANSI 256-color background. `None` = terminal default; `Some(n)` = palette index `n`.
     /// `Some(0)` (explicit black) is DISTINCT from `None` (default).
     pub bg: Option<u8>,
+    /// Wide-character continuation marker (D-19-06).
+    ///
+    /// `false` for normal cells and for the primary cell of a width-2 glyph.
+    /// `true` for the phantom spacer at `col+1` that belongs to the width-2 glyph
+    /// at `col`. Both the diff encoder and the client renderer skip `wide:true` cells
+    /// so the glyph is never double-written. The `ch` value of a continuation cell is
+    /// always `' '` and carries no semantic meaning.
+    pub wide: bool,
 }
 
 impl Default for Cell {
@@ -92,6 +100,7 @@ impl Default for Cell {
             style: CellStyle(CellStyle::NONE),
             fg: None,
             bg: None,
+            wide: false,
         }
     }
 }
@@ -401,22 +410,63 @@ impl TerminalState {
 
     /// Write a character at the current cursor position, advance the cursor right,
     /// wrapping and scrolling as needed.
+    ///
+    /// Width is determined via `UnicodeWidthChar::width()` (D-19-04: default policy,
+    /// East Asian Ambiguous → 1, matching the client predictor):
+    ///
+    /// - `Some(0)` (combining/ZWJ/zero-width) → return immediately; no cell write, no advance.
+    /// - `Some(2)` (CJK wide) → write primary cell with `wide: false` at `col`, write a
+    ///   continuation cell `Cell { ch: ' ', wide: true, .. }` at `col+1` if in bounds
+    ///   (T-19-04: suppressed at right edge to avoid OOB), advance cursor by 2.
+    /// - `Some(1)` or `None` (narrow / control-ish printable) → unchanged single-column
+    ///   behaviour; `wide: false`.
     fn print_char(&mut self, c: char) {
+        use unicode_width::UnicodeWidthChar;
+
+        // Determine column width of this codepoint (D-19-04: use default width()).
+        let col_width: u16 = match UnicodeWidthChar::width(c) {
+            Some(0) => {
+                // Zero-width combining mark or ZWJ: do not advance cursor, do not write.
+                // D-19-05: cursor position unchanged.
+                return;
+            }
+            Some(2) => 2,
+            // Some(1) or None (control-ish printables that reach print_char): treat as 1.
+            _ => 1,
+        };
+
         // Clamp cursor to grid bounds (adversarial-safety).
         let row = (self.cursor.row as usize).min(self.rows.saturating_sub(1) as usize);
         let col = (self.cursor.col as usize).min(self.cols.saturating_sub(1) as usize);
 
         if !self.grid.is_empty() && row < self.grid.len() && col < self.grid[row].len() {
+            // Write primary cell with wide: false.
             self.grid[row][col] = Cell {
                 ch: c,
                 style: self.sgr.style,
                 fg: self.sgr.fg,
                 bg: self.sgr.bg,
+                wide: false,
             };
+
+            // For width-2 glyphs, write a continuation marker at col+1 if in bounds.
+            // T-19-04: right-edge guard — col+1 may be out of bounds; suppress silently.
+            if col_width == 2 {
+                let cont_col = col + 1;
+                if cont_col < self.grid[row].len() {
+                    self.grid[row][cont_col] = Cell {
+                        ch: ' ',
+                        style: self.sgr.style,
+                        fg: self.sgr.fg,
+                        bg: self.sgr.bg,
+                        wide: true,
+                    };
+                }
+            }
         }
 
-        // Advance cursor.
-        self.cursor.col += 1;
+        // Advance cursor by col_width (saturating to avoid u16 overflow).
+        self.cursor.col = self.cursor.col.saturating_add(col_width);
         if self.cursor.col >= self.cols {
             // Wrap to next line.
             self.cursor.col = 0;

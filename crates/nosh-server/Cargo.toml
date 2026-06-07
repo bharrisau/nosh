@@ -45,3 +45,4 @@ nix = { version = "0.29", default-features = false, features = ["signal", "user"
 # the server terminal model (post-auth DoS). Tracked + fix in phase 999.7
 # (bound OSC accumulation before vte). See docs/999.1-SECURITY.md §7 (OSC-OOM).
 vte = { version = "0.15" }
+unicode-width = "0.2"
