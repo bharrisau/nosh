@@ -267,6 +267,22 @@ impl ClientScreen {
                     bg: run.bg,
                     wide: false,
                 };
+                // CR-02 fix: derive width from the char and set wide:true on the
+                // continuation cell (col+1) for width-2 glyphs (D-19-06 / T-19-05).
+                // unicode_width is already a client dep. Ambiguous width → 1 (D-19-04).
+                use unicode_width::UnicodeWidthChar;
+                if UnicodeWidthChar::width(ch) == Some(2) {
+                    let cont_col = col + 1;
+                    if cont_col < row_cells.len() {
+                        row_cells[cont_col] = Cell {
+                            ch: ' ',
+                            style: run.style,
+                            fg: run.fg,
+                            bg: run.bg,
+                            wide: true,
+                        };
+                    }
+                }
             }
         }
 
@@ -810,6 +826,122 @@ mod tests {
         assert_eq!(screen.confirmed_cell(0, 200).ch, ' ');
         // Both out of bounds.
         assert_eq!(screen.confirmed_cell(999, 999).ch, ' ');
+    }
+
+    // ── CR-02: wide-char continuation cell marked wide:true in apply ─────────
+
+    /// CR-02 regression: apply must set wide:true on the continuation cell (col+1)
+    /// for width-2 glyphs so emit_diff correctly skips double-writing and the client
+    /// physical model stays in sync with the actual terminal (D-19-06 / T-19-05).
+    ///
+    /// Before the fix: apply always constructed Cell { wide: false }, so the
+    /// wide-skip guard in emit_diff was permanently dead code — the client could
+    /// generate a spurious space write at col+1 on a subsequent render.
+    #[test]
+    fn apply_wide_char_sets_continuation_cell_wide_true() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 2 },
+            alt_screen: false,
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: "中".to_string(), // U+4E2D, unicode width 2
+            }],
+        };
+        screen.apply(&diff);
+
+        // Primary cell at col 0: the CJK glyph, wide:false.
+        let primary = screen.confirmed_cell(0, 0);
+        assert_eq!(primary.ch, '中', "primary cell must hold the CJK glyph");
+        assert!(!primary.wide, "primary cell must have wide:false");
+
+        // Continuation cell at col 1: spacer, wide:true.
+        let cont = screen.confirmed_cell(0, 1);
+        assert!(
+            cont.wide,
+            "continuation cell at col+1 must have wide:true after applying a width-2 glyph"
+        );
+        assert_eq!(cont.ch, ' ', "continuation cell ch must be space");
+    }
+
+    /// CR-02: continuation cell wide:true causes emit_diff to skip it (no double-write).
+    ///
+    /// After CR-02 fix, the wide-skip guard in emit_diff becomes active. A second
+    /// render after applying a wide char must not emit a spurious write at col+1
+    /// (the continuation cell must be skipped by the guard).
+    #[test]
+    fn apply_wide_char_cont_cell_not_double_written() {
+        let mut screen = ClientScreen::new(80, 24);
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 2 },
+            alt_screen: false,
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: "中".to_string(),
+            }],
+        };
+        screen.apply(&diff);
+
+        // First render: emits the glyph. Captures rendered output.
+        let mut buf1 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf1).unwrap();
+        // Verify '中' is present in the first render.
+        let out1 = String::from_utf8_lossy(&buf1);
+        assert!(out1.contains('中'), "first render must include the wide glyph");
+
+        // Second render: nothing changed — must be minimal (only final cursor MoveTo).
+        let mut buf2 = Vec::<u8>::new();
+        screen.render_to_stdout(&mut buf2).unwrap();
+        // The second render must be shorter (no cell rewrites).
+        assert!(
+            buf2.len() < buf1.len(),
+            "second render after wide-char apply must be minimal (no double-write); \
+             buf1.len()={}, buf2.len()={}",
+            buf1.len(),
+            buf2.len()
+        );
+    }
+
+    /// CR-02: OOB guard — continuation cell at right edge (col+1 == cols) must not panic.
+    #[test]
+    fn apply_wide_char_at_right_edge_no_continuation_no_panic() {
+        let mut screen = ClientScreen::new(4, 1); // 4-col terminal
+        let diff = StateDiff {
+            epoch: 1,
+            cols: 4,
+            rows: 1,
+            cursor: CursorPos { row: 0, col: 3 },
+            alt_screen: false,
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 3, // last column — cont_col 4 is OOB
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: "中".to_string(),
+            }],
+        };
+        // Must not panic.
+        screen.apply(&diff);
+        let primary = screen.confirmed_cell(0, 3);
+        assert_eq!(primary.ch, '中', "primary cell at right edge must be written");
+        assert!(!primary.wide, "primary must have wide:false");
+        // No col 4 to check — OOB access returns default.
+        assert_eq!(screen.confirmed_cell(0, 4).ch, ' ');
     }
 
     // ── CR-01: dimension bounds guard (T-14-02 OOM guard) ────────────────────
