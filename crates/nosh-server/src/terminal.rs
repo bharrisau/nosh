@@ -182,6 +182,13 @@ pub struct TerminalState {
     parser: vte::Parser,
     /// Current SGR running attributes (applied to each printed cell).
     sgr: SgrState,
+    /// Saved primary screen state when the alternate screen is active.
+    ///
+    /// `None` when the primary screen is the active screen.
+    /// `Some((grid, cursor, sgr))` when `?1049h` has been received — holds the
+    /// full primary grid, cursor position, and SGR pen so that `?1049l` can
+    /// restore them exactly (TUI-01, D-19-01..D-19-06, Pitfalls A-1/A-6).
+    saved_primary: Option<(Vec<Vec<Cell>>, CursorPos, SgrState)>,
 }
 
 impl TerminalState {
@@ -202,6 +209,7 @@ impl TerminalState {
             osc52_pending: None,
             parser: vte::Parser::default(),
             sgr: SgrState::default(),
+            saved_primary: None,
         }
     }
 
@@ -272,6 +280,47 @@ impl TerminalState {
         // Clamp cursor to new bounds.
         self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
+    }
+
+    // ── Alt-screen two-grid model (TUI-01, D-19-01..D-19-06) ─────────────────
+
+    /// Enter the alternate screen buffer (?1049h / DECSET 1049).
+    ///
+    /// Atomically saves the primary grid, cursor, and SGR pen into `saved_primary`,
+    /// then replaces `self.grid` with a fresh blank grid and resets cursor/SGR.
+    /// Uses `std::mem::replace` to avoid cloning the grid into a temporary — the
+    /// primary grid is moved into `saved_primary.0` and the blank alt grid is
+    /// installed in one operation (Pitfall A-1: all three enter operations land
+    /// together — save, blank-swap, cursor/SGR reset).
+    ///
+    /// Nested enter (second `?1049h` while already in alt-screen): safe — the current
+    /// (alt) grid is saved, overwriting any prior `saved_primary`. Memory is bounded
+    /// to one saved grid. This is xterm-divergent but avoids panic (T-19-03).
+    fn enter_alt_screen(&mut self) {
+        // Atomically swap the primary grid out, install a blank alt grid.
+        let alt_grid = Self::make_grid(self.cols, self.rows);
+        let prim_grid = std::mem::replace(&mut self.grid, alt_grid);
+        // Save primary state (grid already moved via replace).
+        self.saved_primary = Some((prim_grid, self.cursor, self.sgr.clone()));
+        // Reset cursor and SGR pen for the alt screen.
+        self.cursor = CursorPos { row: 0, col: 0 };
+        self.sgr.reset();
+        self.echo_state.alt_screen = true;
+    }
+
+    /// Exit the alternate screen buffer (?1049l / DECRST 1049).
+    ///
+    /// Restores the primary grid, cursor, and SGR pen from `saved_primary` if
+    /// present. If `saved_primary` is `None` (bare exit with no prior enter —
+    /// T-19-01), leaves the grid unchanged and just clears the flag (graceful no-op).
+    fn exit_alt_screen(&mut self) {
+        if let Some((prim_grid, prim_cursor, prim_sgr)) = self.saved_primary.take() {
+            self.grid = prim_grid;
+            self.cursor = prim_cursor;
+            self.sgr = prim_sgr;
+        }
+        // Always clear the flag, even on a bare exit (saved_primary was None).
+        self.echo_state.alt_screen = false;
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -501,7 +550,13 @@ impl vte::Perform for TerminalState {
                     let mode = param[0]; // u16; subparams are irrelevant for mode numbers
                     match mode {
                         25 => self.echo_state.cursor_visible = enable,
-                        1049 => self.echo_state.alt_screen = enable,
+                        1049 => {
+                            if enable {
+                                self.enter_alt_screen();
+                            } else {
+                                self.exit_alt_screen();
+                            }
+                        }
                         2004 => self.echo_state.bracketed_paste = enable,
                         1 => self.echo_state.app_cursor_keys = enable,
                         _ => { /* scope fence: unknown private mode */ }
@@ -749,6 +804,9 @@ impl vte::Perform for TerminalState {
                 self.echo_state = EchoState::default();
                 self.title = None;
                 self.osc52_pending = None;
+                // Clear saved_primary so a subsequent ?1049l cannot restore
+                // stale pre-reset content (Pitfall 5 / RIS invariant, D-19-01).
+                self.saved_primary = None;
             }
             _ => {
                 // Scope fence: other ESC sequences (SI/SO, SS2/SS3, etc.) are ignored.
@@ -1645,6 +1703,159 @@ mod tests {
         assert!(
             state.take_title().is_none(),
             "take_title must return None on second call (drain-once semantics)"
+        );
+    }
+
+    // ── Task 1: Two-grid alt-screen model (TUI-01) ───────────────────────────
+
+    /// TUI-01: entering alt-screen presents a blank grid at cursor (0,0).
+    ///
+    /// ?1049h must: clear grid to blank, move cursor to (0,0), reset SGR, set
+    /// echo_state.alt_screen = true. Primary content written before enter must not
+    /// be visible on the alt grid.
+    #[test]
+    fn alt_screen_enter_presents_blank_grid_at_origin() {
+        let mut state = ts(80, 24);
+        // Write distinctive primary content and move cursor.
+        state.advance(b"\x1b[5;10H"); // cursor at row=4, col=9 (0-based)
+        state.advance(b"\x1b[31mX");  // write 'X' with red fg at (4,9)
+        assert_eq!(state.cell(4, 9).ch, 'X');
+
+        // Enter alternate screen.
+        state.advance(b"\x1b[?1049h");
+
+        // After enter: alt_screen flag must be set.
+        assert!(state.echo_state().alt_screen, "alt_screen flag must be true after ?1049h");
+        // Cursor must be at (0,0).
+        assert_eq!(state.cursor(), CursorPos { row: 0, col: 0 }, "cursor must be at (0,0) after ?1049h");
+        // The grid must be all-blank (primary content must not bleed through).
+        for row in 0..24u16 {
+            for col in 0..80u16 {
+                assert_eq!(
+                    state.cell(row, col).ch, ' ',
+                    "alt grid cell ({row},{col}) must be blank after ?1049h"
+                );
+                assert_eq!(
+                    state.cell(row, col).fg, None,
+                    "alt grid cell ({row},{col}) fg must be None after ?1049h"
+                );
+            }
+        }
+    }
+
+    /// TUI-01: exiting alt-screen restores primary grid, cursor, and SGR pen exactly.
+    ///
+    /// The round-trip ?1049h/?1049l must restore: the full primary grid content,
+    /// the exact cursor position at the time of enter, and the SGR pen state.
+    #[test]
+    fn alt_screen_exit_restores_primary_grid_cursor_sgr() {
+        let mut state = ts(80, 24);
+
+        // Write distinctive primary content: 'P' at (3,5) with bold fg=Some(1).
+        state.advance(b"\x1b[1;31m"); // SGR bold + fg=1 (red)
+        state.advance(b"\x1b[4;6HP"); // cursor to row=3, col=5 (1-based 4,6), write 'P'
+        // Verify primary content is written.
+        assert_eq!(state.cell(3, 5).ch, 'P');
+        // Cursor should now be at (3,6) after writing 'P'.
+        assert_eq!(state.cursor(), CursorPos { row: 3, col: 6 });
+
+        // Enter alternate screen — save cursor at (3,6).
+        state.advance(b"\x1b[?1049h");
+        assert!(state.echo_state().alt_screen);
+        // Scribble on alt grid — must not affect primary on exit.
+        state.advance(b"ALTCONTENT");
+        assert_eq!(state.cell(0, 0).ch, 'A', "alt content must be written");
+
+        // Exit alternate screen — restore primary.
+        state.advance(b"\x1b[?1049l");
+
+        // Flag cleared.
+        assert!(!state.echo_state().alt_screen, "alt_screen flag must be false after ?1049l");
+        // Primary content at (3,5) must be restored.
+        assert_eq!(
+            state.cell(3, 5).ch, 'P',
+            "primary grid content must be restored after ?1049l"
+        );
+        // Alt content must not appear on the primary grid.
+        assert_ne!(
+            state.cell(0, 0).ch, 'A',
+            "alt grid content must not bleed into primary after ?1049l"
+        );
+        // Cursor must be restored to (3,6) — position at the time of ?1049h.
+        assert_eq!(
+            state.cursor(), CursorPos { row: 3, col: 6 },
+            "cursor must be restored to its ?1049h position after ?1049l"
+        );
+        // SGR pen must be restored: fg=Some(1), bold. Write a cell and check its attrs.
+        state.advance(b"Q");
+        assert_eq!(
+            state.cell(3, 6).fg, Some(1),
+            "SGR fg must be restored after ?1049l"
+        );
+        assert_ne!(
+            state.cell(3, 6).style.0 & CellStyle::BOLD, 0,
+            "SGR BOLD must be restored after ?1049l"
+        );
+    }
+
+    /// TUI-01: nested ?1049h (second enter while already in alt-screen) must not panic.
+    ///
+    /// xterm-divergent safe behaviour: overwrite saved_primary with current (alt) grid.
+    /// Memory is bounded (one saved grid max). Thread T-19-03 (DoS).
+    #[test]
+    fn alt_screen_nested_enter_no_panic() {
+        let mut state = ts(80, 24);
+        // First enter.
+        state.advance(b"\x1b[?1049h");
+        assert!(state.echo_state().alt_screen);
+        state.advance(b"FIRST_ALT");
+        // Second enter while already in alt-screen — must not panic.
+        state.advance(b"\x1b[?1049h");
+        // Still in alt-screen.
+        assert!(state.echo_state().alt_screen, "still in alt-screen after nested enter");
+        // Exit — must not panic (saved_primary now holds the first alt grid).
+        state.advance(b"\x1b[?1049l");
+        assert!(!state.echo_state().alt_screen, "alt_screen cleared after exit");
+    }
+
+    /// TUI-01: bare ?1049l with no prior ?1049h is a graceful no-op (T-19-01).
+    ///
+    /// Grid must be unchanged; only the flag is cleared.
+    #[test]
+    fn alt_screen_bare_exit_no_prior_enter_is_noop() {
+        let mut state = ts(80, 24);
+        state.advance(b"hello");
+        assert_eq!(state.cell(0, 0).ch, 'h');
+        // Exit without a prior enter — must not panic or corrupt state.
+        state.advance(b"\x1b[?1049l");
+        // Grid unchanged.
+        assert_eq!(
+            state.cell(0, 0).ch, 'h',
+            "grid must be unchanged after bare ?1049l"
+        );
+        // Flag cleared (it was false to begin with, still false).
+        assert!(!state.echo_state().alt_screen, "alt_screen must be false after bare exit");
+    }
+
+    /// TUI-01: RIS (ESC c) while in alt-screen clears saved_primary so a subsequent
+    /// ?1049l does not restore stale pre-reset content (Pitfall 5 / RIS invariant).
+    #[test]
+    fn alt_screen_ris_clears_saved_primary() {
+        let mut state = ts(80, 24);
+        // Write primary content, enter alt-screen.
+        state.advance(b"PRIMARY");
+        state.advance(b"\x1b[?1049h");
+        assert!(state.echo_state().alt_screen);
+        // RIS while in alt-screen.
+        state.advance(b"\x1bc");
+        // After RIS: alt_screen flag should be cleared (EchoState reset).
+        assert!(!state.echo_state().alt_screen, "alt_screen must be false after RIS");
+        // A bare ?1049l after RIS must not restore pre-reset primary content.
+        state.advance(b"\x1b[?1049l");
+        // Grid must not contain 'P' from "PRIMARY" — RIS cleared saved_primary.
+        assert_eq!(
+            state.cell(0, 0).ch, ' ',
+            "?1049l after RIS must not restore pre-reset primary content"
         );
     }
 }
