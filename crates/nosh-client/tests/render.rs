@@ -185,6 +185,7 @@ fn confirmed_grid_matches_terminal_state_after_diff() {
             row: server_cursor.row,
             col: server_cursor.col,
         },
+        alt_screen: false,
         runs,
     };
 
@@ -262,6 +263,7 @@ fn duplicate_datagram_is_idempotent() {
         cols: 80,
         rows: 24,
         cursor: CursorPos { row: 0, col: 5 },
+        alt_screen: false,
         runs: vec![DiffRun {
             row: 0,
             start_col: 0,

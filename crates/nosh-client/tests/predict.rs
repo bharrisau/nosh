@@ -69,6 +69,7 @@ fn make_diff(epoch: u64, chars: &str, cursor: CursorPos) -> StateDiff {
         cols: 80,
         rows: 24,
         cursor,
+        alt_screen: false,
         runs: if chars.is_empty() {
             vec![]
         } else {
@@ -92,6 +93,7 @@ fn make_diff_at(epoch: u64, row: u16, col: u16, ch: char) -> StateDiff {
         cols: 80,
         rows: 24,
         cursor: CursorPos { row, col: col + 1 },
+        alt_screen: false,
         runs: vec![DiffRun {
             row,
             start_col: col,
