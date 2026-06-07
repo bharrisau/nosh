@@ -568,14 +568,22 @@ impl PredictionOverlay {
     pub fn cull(&mut self, screen: &ClientScreen, new_epoch: u64, rtt_ms: u64) {
         self.update_rtt_thresholds(rtt_ms);
 
-        // Collect indices of predictions to remove (confirmed or no-credit).
+        // WR-01 fix: use stable identity sets rather than indices to avoid the
+        // index-shift hazard that arises when kill_epoch() calls retain() after
+        // to_remove indices have been collected. Collecting (row, col, epoch_required)
+        // as a stable key uniquely identifies each PendingPrediction and remains valid
+        // after any reordering by retain().
+        //
+        // Two sets:
+        //  - epochs_to_kill: tentative epochs to prune via kill_epoch (retain-based).
+        //  - to_remove_keys: (row, col, epoch_required) of confirmed/credit predictions
+        //    to remove in the second pass.
+        //
         // On a non-tentative mismatch: full reset and early return (Pitfall 1).
-        // WR-02 fix: epochs_to_kill collected inline (single pass) so the second loop
-        // (with O(n²) to_remove.contains(&i)) is eliminated.
-        let mut to_remove: Vec<usize> = Vec::new();
+        let mut to_remove_keys: Vec<(u16, u16, u64)> = Vec::new();
         let mut epochs_to_kill: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-        for (i, pred) in self.pending.iter().enumerate() {
+        for pred in self.pending.iter() {
             // Pitfall 4: >= check, NOT ==. Tolerates dropped datagrams.
             if pred.epoch_required <= new_epoch {
                 let confirmed_ch = screen.confirmed_cell(pred.row, pred.col).ch;
@@ -586,18 +594,19 @@ impl PredictionOverlay {
                         if pred.tentative_until_epoch > self.confirmed_epoch {
                             self.confirmed_epoch = pred.tentative_until_epoch;
                         }
-                        to_remove.push(i);
+                        to_remove_keys.push((pred.row, pred.col, pred.epoch_required));
                     }
                     Validity::CorrectNoCredit => {
                         // Trivially correct (blank→blank) — remove without advancing epoch.
-                        to_remove.push(i);
+                        to_remove_keys.push((pred.row, pred.col, pred.epoch_required));
                     }
                     Validity::IncorrectOrExpired => {
                         if self.is_tentative(pred) {
                             // Tentative mismatch: prune only this epoch's predictions.
-                            // Collect epoch inline (WR-02 fix — no second pass needed).
                             epochs_to_kill.insert(pred.tentative_until_epoch);
-                            to_remove.push(i);
+                            // Also mark this prediction for removal by stable key so the
+                            // retain pass below handles it alongside kill_epoch.
+                            to_remove_keys.push((pred.row, pred.col, pred.epoch_required));
                         } else {
                             // Non-tentative mismatch: full reset (Pitfall 1).
                             self.reset();
@@ -611,20 +620,17 @@ impl PredictionOverlay {
             }
         }
 
-        // Kill tentative-mismatch epochs (prunes related predictions).
-        for epoch in epochs_to_kill {
-            self.kill_epoch(epoch);
-        }
-
-        // Remove confirmed/credited predictions in reverse index order.
-        to_remove.sort_unstable();
-        to_remove.dedup();
-        for &i in to_remove.iter().rev() {
-            // Guard: index may have shifted after kill_epoch removed some entries.
-            if i < self.pending.len() {
-                self.pending.remove(i);
+        // Single retain pass: remove confirmed/credited predictions and all predictions
+        // belonging to tentative-mismatch epochs. Using retain avoids the index-shift
+        // hazard (WR-01) — no index arithmetic, no post-kill_epoch recount needed.
+        self.pending.retain(|p| {
+            // Keep if this prediction's epoch is not being killed.
+            if epochs_to_kill.contains(&p.tentative_until_epoch) {
+                return false;
             }
-        }
+            // Keep if this prediction is not in the confirmed/credited set.
+            !to_remove_keys.contains(&(p.row, p.col, p.epoch_required))
+        });
     }
 
     // ── Display gate ──────────────────────────────────────────────────────────
