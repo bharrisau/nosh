@@ -1,6 +1,7 @@
 //! `nosh-client` library surface — connection setup and round-trip helpers
 //! exposed so integration tests can drive a client in-process.
 
+pub mod channel; // Phase 21: per-channel drain task + even-id allocator
 pub mod client;
 pub mod platform;
 pub mod predictor; // NEW: PredictionOverlay, PendingPrediction, Validity, InputAction
