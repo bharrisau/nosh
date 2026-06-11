@@ -557,7 +557,12 @@ for ch_type in channels_to_restore {
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All questions below carry inline recommendations that are locked in 21-CONTEXT.md
+> and implemented by the Phase 21 plans (ChannelType in nosh-proto; credit on the
+> control stream via mpsc; PTY stays on stream 0 this phase; TerminalControl=9 so
+> first mux variant=10). No question remains open going into execution.
 
 1. **Exact `ChannelType` enum variants for v1.3**
    - What we know: Echo (test-only), Scrollback (Phase 22 consumer), PortForward (declared/rejected), AgentForward (declared/rejected) are the v1.3 variants.

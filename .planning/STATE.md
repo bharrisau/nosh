@@ -4,12 +4,12 @@ milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
 status: planning
 stopped_at: Phase 21 context gathered
-last_updated: "2026-06-11T13:11:40.633Z"
-last_activity: 2026-06-11
+last_updated: "2026-06-11T13:39:32.562Z"
+last_activity: 2026-06-11 -- Phase 21 planning complete
 progress:
   total_phases: 4
   completed_phases: 2
-  total_plans: 7
+  total_plans: 11
   completed_plans: 7
   percent: 50
 ---
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-06-07)
 Phase: 21
 Plan: Not started
 Status: Ready to plan
-Last activity: 2026-06-11
+Last activity: 2026-06-11 -- Phase 21 planning complete
 
 ```
 Progress: [██████████] 100%
