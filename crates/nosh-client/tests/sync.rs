@@ -178,6 +178,36 @@ async fn sync03_acked_epoch_advances_baseline() {
         }
     }
 
+    // Helper: read until a non-empty StateDiff with epoch > `min_epoch` arrives.
+    //
+    // Phase 20 (PACE-01) makes the server burst multiple datagrams per tick, all
+    // sharing one epoch (D-20-04). A single epoch therefore appears on the wire as
+    // several datagrams. After acking E1 we must drain the leftover E1 burst
+    // backlog before the genuinely-new post-ack diff is observable — otherwise we
+    // read a stale E1 datagram. This still fails (via the 5s timeout) if the
+    // server genuinely never advances its epoch after the ack, so it cannot mask
+    // a real epoch-advance regression.
+    async fn read_diff_epoch_above(
+        conn: &quinn::Connection,
+        min_epoch: u64,
+    ) -> nosh_proto::datagram::StateDiff {
+        let deadline = Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(deadline, conn.read_datagram()).await {
+                Ok(Ok(bytes)) => match decode_datagram(&bytes) {
+                    Ok(d) if !d.runs.is_empty() && d.epoch > min_epoch => return d,
+                    Ok(_) => continue,
+                    Err(_) => continue,
+                },
+                Ok(Err(e)) => panic!("connection error: {e}"),
+                Err(_) => panic!(
+                    "timed out after 5s waiting for a StateDiff with epoch > {min_epoch}; \
+                     server did not advance its epoch after the ack"
+                ),
+            }
+        }
+    }
+
     // Step 1: send "echo A\n" and capture the first StateDiff (epoch E1).
     client::send_input(&mut send, b"echo A\n")
         .await
@@ -190,11 +220,13 @@ async fn sync03_acked_epoch_advances_baseline() {
     conn.send_datagram(encode_epoch_ack(e1))
         .expect("send epoch-ack");
 
-    // Step 3: send "echo B\n" and read the next StateDiff.
+    // Step 3: send "echo B\n" and read the next StateDiff whose epoch is past E1.
+    // Drains any leftover E1 burst datagrams (PACE-01) so we observe the genuinely
+    // new post-ack diff rather than a stale same-epoch burst datagram.
     client::send_input(&mut send, b"echo B\n")
         .await
         .expect("send_input B");
-    let diff_e2 = read_nonempty_diff(&conn).await;
+    let diff_e2 = read_diff_epoch_above(&conn, e1).await;
     let e2 = diff_e2.epoch;
 
     // Weak robust assertion: epoch advanced after the ack (D-13-01c).
