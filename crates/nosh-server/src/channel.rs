@@ -20,11 +20,14 @@
 //! are sent back to the session pump via `control_tx` — the pump holds the sole
 //! writer handle.
 
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use nosh_proto::Message;
+use nosh_proto::messages::ScrollbackLine;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -44,6 +47,13 @@ pub enum ChannelEvent {
 
 /// Initial per-channel send-credit window (256 KiB, MUX-03).
 pub const INITIAL_CREDIT: u64 = 256 * 1024;
+
+/// Maximum number of scrollback lines returned in a single `ScrollbackPage` response.
+///
+/// Caps the allocation from a single client `ScrollbackRequest{count: u32::MAX}` to
+/// 1024 lines × (column width × cell size), preventing a multi-gigabyte server-side
+/// allocation (T-22-08 / V5 input validation).
+pub const MAX_PAGE_SIZE: usize = 1024;
 
 // ── Varint helper ─────────────────────────────────────────────────────────────
 
@@ -188,6 +198,212 @@ async fn run_channel_task_inner(
     }
 }
 
+// ── Scrollback sender task (Phase 22 SCROLL-01/02, S-1/S-4/S-5) ─────────────
+
+/// Serve scrollback pages over a reliable `SendStream` on demand (SCROLL-01/02).
+///
+/// This function is the production server-side scrollback handler. It reads
+/// `ScrollbackRequest` frames from the channel's own `RecvStream` (`ch_recv`)
+/// and writes `ScrollbackPage` frames to the channel's `SendStream` (`ch_send`).
+///
+/// # Security invariants
+///
+/// - **S-1 reliable-only at the type level:** the signature accepts only
+///   `&mut quinn::SendStream` — there is no `&quinn::Connection` parameter and
+///   therefore no datagram-send path is reachable from this function body.
+///   A grep over the function body for the datagram token is the falsifiable proof.
+///
+/// - **S-4 / M-6 bounded back-pressure:** byte credit controls how much may be
+///   written. When `remaining_credit == 0` the task blocks on `events.recv()` for
+///   a `ChannelEvent::Credit` — it never busy-loops and never blocks the session
+///   pump's select! loop (the pump and this task are separate `tokio::spawn`).
+///
+/// - **S-5 atomic epoch capture:** `epoch_at_snapshot` is read from `epoch_src`
+///   with `Ordering::Acquire` into a local variable immediately before entering
+///   the synchronous `with_terminal_state` closure. There is no `.await` between
+///   the `load` and the closure, so the epoch and the scrollback lines are
+///   mutually consistent (no torn read between what the scrollback reports and
+///   what the datagram stream is doing). The end-to-end concurrency proof that
+///   no gap or duplicate exists across a concurrent diff tick is the integration
+///   test `scrollback_epoch_handoff_no_gap` in plan 22-04 — that test is the
+///   falsifiable S-5 proof obligation. This plan asserts only the code structure.
+///
+/// - **V5 allocation cap:** `count` from the client request is clamped to
+///   `MAX_PAGE_SIZE` (1024) before calling `scrollback_lines`. A
+///   `ScrollbackRequest { count: u32::MAX }` cannot force a multi-gigabyte
+///   allocation (T-22-08).
+///
+/// - **M-2 deadlock avoidance:** `ScrollbackRequest` is read on the channel's
+///   own `ch_recv`, never the control stream. `ScrollbackPage` is written on
+///   `ch_send`. `ChannelClose` is routed via `control_tx` (A4 invariant) —
+///   never written to `ch_send` or any shared stream directly.
+pub async fn run_scrollback_sender_task(
+    channel_id: u32,
+    slot: Arc<crate::registry::SessionSlot>,
+    ch_send: &mut quinn::SendStream,
+    ch_recv: &mut quinn::RecvStream,
+    events: &mut mpsc::Receiver<ChannelEvent>,
+    control_tx: &mpsc::Sender<Message>,
+    epoch_src: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let mut remaining_credit: u64 = INITIAL_CREDIT;
+
+    loop {
+        if remaining_credit == 0 {
+            // Credit exhausted: wait for a replenishment event before attempting
+            // any further sends (S-4 / MUX-03 back-pressure).
+            // IMPORTANT: do NOT use read(&mut buf[..0]) here — that returns
+            // Ok(None) which is misread as EOF. Block until credit arrives.
+            match events.recv().await {
+                Some(ChannelEvent::Credit(n)) => {
+                    remaining_credit = remaining_credit.saturating_add(n);
+                }
+                Some(ChannelEvent::Close) | None => break,
+                Some(ChannelEvent::Stream(_, _)) => { /* unexpected; ignore */ }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            // Read the next ScrollbackRequest from the channel's own RecvStream
+            // (M-2: never the control stream).
+            msg = nosh_proto::codec::read_message(ch_recv) => {
+                match msg {
+                    Ok(Message::ScrollbackRequest { channel_id: req_cid, from_line, count }) => {
+                        // Ignore requests for a different channel_id (protocol error; logged,
+                        // not fatal — keep serving the correct channel).
+                        if req_cid != channel_id {
+                            tracing::debug!(
+                                channel_id,
+                                req_cid,
+                                "ScrollbackRequest for wrong channel_id; ignoring"
+                            );
+                            continue;
+                        }
+                        // V5 / T-22-08: cap count before calling scrollback_lines to prevent
+                        // a u32::MAX request forcing a multi-gigabyte allocation.
+                        let count = (count as usize).min(MAX_PAGE_SIZE);
+
+                        // S-5 atomic epoch + scrollback snapshot:
+                        // Read epoch_at_snapshot into a local with Acquire ordering
+                        // immediately before the synchronous with_terminal_state closure.
+                        // There is NO .await between this load and the closure, so the
+                        // epoch and the lines are mutually consistent.
+                        //
+                        // Concurrency-correctness proof: the integration test
+                        // `scrollback_epoch_handoff_no_gap` in plan 22-04 is the
+                        // falsifiable S-5 proof that no gap or duplicate occurs across
+                        // a concurrent diff tick during a scrollback request.
+                        let epoch_at_snapshot = epoch_src.load(Ordering::Acquire);
+                        let (raw_lines, total_available) = slot.with_terminal_state(|ts| {
+                            ts.scrollback_lines(from_line, count)
+                        });
+
+                        // Convert server-side Cell values to ScrollbackLine wire types.
+                        // Cell.ch: char; Cell.style: CellStyle; Cell.fg/bg: Option<u8>.
+                        // ScrollbackCell field types match Cell exactly (zero-copy assembly).
+                        let lines: Vec<ScrollbackLine> = raw_lines
+                            .into_iter()
+                            .map(|row| {
+                                let width = row.len() as u16;
+                                let cells = row
+                                    .into_iter()
+                                    .map(|cell| nosh_proto::messages::ScrollbackCell {
+                                        ch: cell.ch,
+                                        style: cell.style,
+                                        fg: cell.fg,
+                                        bg: cell.bg,
+                                    })
+                                    .collect();
+                                ScrollbackLine { width, cells }
+                            })
+                            .collect();
+
+                        let page = Message::ScrollbackPage {
+                            channel_id,
+                            from_line,
+                            total_available,
+                            epoch_at_snapshot,
+                            lines,
+                        };
+
+                        // Encode to measure byte cost before deducting from credit.
+                        let encoded = match nosh_proto::codec::encode(&page) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(channel_id, "ScrollbackPage encode error: {e}; closing");
+                                break;
+                            }
+                        };
+                        let encoded_len = encoded.len() as u64;
+
+                        // If the encoded page exceeds remaining credit, wait for a
+                        // Credit event before writing (back-pressure, S-4 / MUX-03).
+                        // This inner loop only exits on sufficient credit or close.
+                        while remaining_credit < encoded_len {
+                            match events.recv().await {
+                                Some(ChannelEvent::Credit(n)) => {
+                                    remaining_credit = remaining_credit.saturating_add(n);
+                                }
+                                Some(ChannelEvent::Close) | None => {
+                                    // Session or channel closed while waiting for credit.
+                                    let _ = ch_send.finish();
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        ch_send.stopped(),
+                                    ).await;
+                                    let _ = control_tx.send(Message::ChannelClose { channel_id }).await;
+                                    return;
+                                }
+                                Some(ChannelEvent::Stream(_, _)) => { /* unexpected; ignore */ }
+                            }
+                        }
+
+                        // Write the encoded frame directly (already have the bytes).
+                        if ch_send.write_all(&encoded).await.is_err() {
+                            break;
+                        }
+                        remaining_credit = remaining_credit.saturating_sub(encoded_len);
+                    }
+                    Ok(_other) => {
+                        // Non-ScrollbackRequest frame on the scrollback channel data stream:
+                        // ignore (scrollback channel only carries ScrollbackRequest from client).
+                        tracing::debug!(
+                            channel_id,
+                            "unexpected message type on scrollback channel; ignoring"
+                        );
+                    }
+                    Err(_) => {
+                        // ch_recv EOF or decode error — peer closed the channel.
+                        break;
+                    }
+                }
+            }
+
+            // Handle pump events (credit replenishment, close) concurrently.
+            ev = events.recv() => {
+                match ev {
+                    Some(ChannelEvent::Credit(n)) => {
+                        remaining_credit = remaining_credit.saturating_add(n);
+                    }
+                    Some(ChannelEvent::Close) | None => break,
+                    Some(ChannelEvent::Stream(_, _)) => { /* unexpected; ignore */ }
+                }
+            }
+        }
+    }
+
+    // Half-close: finish the send side and give the peer a moment to drain.
+    let _ = ch_send.finish();
+    let _ = tokio::time::timeout(Duration::from_secs(2), ch_send.stopped()).await;
+
+    // Notify the pump to remove this channel from the map (A4: route via control_tx,
+    // never write to a shared stream directly).
+    let _ = control_tx
+        .send(Message::ChannelClose { channel_id })
+        .await;
+}
+
 /// Test-only echo loop: read bytes from the channel's RecvStream and echo them
 /// back on the SendStream, respecting the 256 KiB byte-credit window (MUX-03).
 ///
@@ -321,5 +537,11 @@ mod tests {
     #[test]
     fn initial_credit_is_256_kib() {
         assert_eq!(INITIAL_CREDIT, 256 * 1024, "initial credit must be 256 KiB");
+    }
+
+    /// Verify MAX_PAGE_SIZE is 1024 (T-22-08 / V5 allocation cap).
+    #[test]
+    fn max_page_size_is_1024() {
+        assert_eq!(MAX_PAGE_SIZE, 1024, "MAX_PAGE_SIZE must be 1024 lines (T-22-08)");
     }
 }
