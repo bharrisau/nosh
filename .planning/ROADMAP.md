@@ -164,5 +164,5 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 18. Security Design Pass | 0/? | Deferred | - |
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
 | 20. Repaint Pacing | 2/2 | Complete    | 2026-06-11 |
-| 21. Channel Multiplexing Foundation | 4/4 | Complete   | 2026-06-11 |
+| 21. Channel Multiplexing Foundation | 4/4 | Complete    | 2026-06-11 |
 | 22. Scrollback Sync | 0/? | Not started | - |
