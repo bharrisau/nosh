@@ -251,6 +251,16 @@ pub struct SessionSlot {
     /// slot by the TransportLost path so a reattach pump can reclaim it.
     /// `None` while a pump is running (writer is in the blocking task).
     pub pty_writer: Mutex<Option<crate::session::PtyWriter>>,
+    /// Test-only: sender half of the server-initiated channel-open trigger mpsc.
+    ///
+    /// `run_session` stores its `server_open_tx` here after the select! loop
+    /// infrastructure is set up. Integration tests retrieve it via
+    /// `take_server_open_tx()` to request that the running session send a
+    /// server-originated `ChannelOpen` (odd id, Task 3 / SC#6).
+    ///
+    /// Compiled out entirely in production builds (#[cfg(test)] gating).
+    #[cfg(test)]
+    pub server_open_tx: Mutex<Option<tokio::sync::mpsc::Sender<nosh_proto::messages::ChannelType>>>,
 }
 
 impl SessionSlot {
@@ -274,7 +284,35 @@ impl SessionSlot {
             last_active: Mutex::new(Instant::now()),
             token: Mutex::new(Uuid::new_v4().into_bytes()),
             pty_writer: Mutex::new(None),
+            #[cfg(test)]
+            server_open_tx: Mutex::new(None),
         })
+    }
+
+    /// Store the server-initiated channel-open trigger sender in the slot.
+    ///
+    /// Called by `run_session` (test builds only) after the `server_open_rx`
+    /// receiver is wired into the select! loop. Integration tests retrieve the
+    /// sender via `take_server_open_tx()` and send a `ChannelType` to trigger
+    /// the server to open a channel from its own (odd-id) parity space (SC#6).
+    #[cfg(test)]
+    pub fn store_server_open_tx(
+        &self,
+        tx: tokio::sync::mpsc::Sender<nosh_proto::messages::ChannelType>,
+    ) {
+        *self.server_open_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Retrieve the server-initiated channel-open trigger sender (test builds only).
+    ///
+    /// Returns `None` if the session pump has not yet stored it (e.g. the session
+    /// is still initialising) or if it was already taken. Tests should poll briefly
+    /// after connecting before calling this.
+    #[cfg(test)]
+    pub fn take_server_open_tx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<nosh_proto::messages::ChannelType>> {
+        self.server_open_tx.lock().unwrap().take()
     }
 
     /// Take the PTY writer out of the slot for use by the I/O pump.
@@ -890,6 +928,26 @@ impl SessionRegistry {
             // Drop the Arc — when the last reference drops, MasterPty closes.
             drop(slot);
         }
+    }
+
+    /// Return the first active `SessionSlot` in the registry (test builds only).
+    ///
+    /// Used by integration tests that want to retrieve `server_open_tx` from a
+    /// live session started by `spawn_server*`. Returns `None` if no active slot
+    /// exists. The caller should poll briefly (e.g. 25 ms intervals for up to 2 s)
+    /// after connecting to let the session pump start and store the sender.
+    #[cfg(test)]
+    pub fn first_active_slot(&self) -> Option<std::sync::Arc<SessionSlot>> {
+        let guard = self.inner.lock().unwrap();
+        for slots in guard.values() {
+            for slot in slots {
+                let state = *slot.state.lock().unwrap();
+                if matches!(state, SlotState::Active) {
+                    return Some(slot.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Spawn a background task that calls [`Self::reap_once`] every

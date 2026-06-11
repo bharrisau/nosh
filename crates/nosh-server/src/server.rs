@@ -594,6 +594,21 @@ async fn handle_connection(
     }
 }
 
+/// Receive from an `Option<Receiver>`, returning `std::future::pending()` when the
+/// Option is `None`. Used by the server-initiated channel-open test arm in the
+/// session select! loop (Task 3 / T-21-10): in production the Option is None so
+/// the arm never fires; in test builds the receiver is wired in.
+///
+/// Note: `tokio::select!` does not accept `#[cfg()]` on individual arms, so this
+/// helper makes the arm always syntactically present but semantically absent in
+/// production (the pending future is never woken).
+async fn recv_or_pending<T>(rx: &mut Option<tokio::sync::mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Session-open parameters (collapsed to reduce argument count past clippy's limit).
 struct SessionOpenParams {
     term: String,
@@ -762,6 +777,38 @@ async fn run_session(
     // The session pump drains control_rx and writes to `send` — the sole owner.
     let mut channel_map: HashMap<u32, mpsc::Sender<ChannelEvent>> = HashMap::new();
     let (channel_ctrl_tx, mut channel_ctrl_rx) = mpsc::channel::<Message>(64);
+
+    // Task 3 (test-only): server-initiated channel-open infrastructure.
+    //
+    // The server's parity space is ODD channel ids (1, 3, 5, …). Production does
+    // not open channels from the server side (21-CONTEXT.md defers this). The test
+    // path exists solely so plan 21-04's `channel_simultaneous_open` test can
+    // fire a real server-originated ChannelOpen concurrently with a client one (SC#6).
+    //
+    // next_server_channel_id: starts at 1 and advances by 2 on each allocation so
+    // the sequence is always odd and never zero (control channel reserved).
+    //
+    // server_open_tx: stored in the SessionSlot for integration tests to retrieve.
+    // server_open_rx: wrapped in Option so the select! arm uses recv_or_pending()
+    // which returns std::future::pending() when the Option is None — i.e. in
+    // production builds where the Option is set to None (T-21-10).
+    let mut next_server_channel_id: u32 = 1;
+    let (server_open_tx, server_open_rx_inner) =
+        tokio::sync::mpsc::channel::<ChannelType>(8);
+    // In test builds: store the sender in the slot and wire the receiver.
+    // In production builds: drop both so the Option below is None and the arm never fires.
+    #[cfg(test)]
+    slot.store_server_open_tx(server_open_tx);
+    #[cfg(test)]
+    let mut server_open_rx_opt: Option<tokio::sync::mpsc::Receiver<ChannelType>> =
+        Some(server_open_rx_inner);
+    #[cfg(not(test))]
+    {
+        // Drop the channel immediately; the select! arm stays inert (recv_or_pending None).
+        let _ = (next_server_channel_id, server_open_tx, server_open_rx_inner);
+    }
+    #[cfg(not(test))]
+    let mut server_open_rx_opt: Option<tokio::sync::mpsc::Receiver<ChannelType>> = None;
 
     let session_end: SessionEnd = loop {
         tokio::select! {
@@ -1083,30 +1130,48 @@ async fn run_session(
                         }
                     }
 
-                    Ok(Message::ChannelAccept { channel_id })
-                    | Ok(Message::ChannelReject { channel_id }) => {
-                        // ChannelAccept and ChannelReject are server→client direction.
-                        // Receiving them from the client is a protocol error (production path).
-                        // Under #[cfg(test)], an odd-id reply is the valid client response to
-                        // a server-initiated ChannelOpen (Task 3 server-open path). Handle it
-                        // as a no-op here (the channel task is already spawned and running);
-                        // Task 3 extends this arm with Reject → map removal.
+                    Ok(Message::ChannelAccept { channel_id }) => {
+                        // ChannelAccept is server→client direction.
+                        // Under #[cfg(test)], an odd-id ChannelAccept is the client
+                        // acknowledging a server-initiated ChannelOpen (Task 3).
+                        // The channel task is already running; nothing further is needed.
+                        // Unknown/already-closed odd ids are logged no-ops (Pitfall M-4 / T-21-07).
                         #[cfg(test)]
                         if channel_id % 2 != 0 {
-                            // Valid reply to a server-initiated open (odd id).
-                            // Accept: channel stays alive (task already running).
-                            // Reject: channel stays in map until the task closes itself.
-                            // Task 3 will add map removal on Reject specifically.
                             tracing::debug!(
                                 channel_id,
-                                "received ChannelAccept/Reject for server-initiated (odd) channel; continuing"
+                                "client accepted server-initiated channel"
                             );
                             continue;
                         }
-                        // Production path (or even-id): protocol error.
+                        // Production path (or even-id in test): protocol error.
                         tracing::warn!(
                             channel_id,
-                            "client sent ChannelAccept/ChannelReject (server→client only); closing"
+                            "client sent ChannelAccept (server→client only); closing"
+                        );
+                        break SessionEnd::ClientClosed;
+                    }
+
+                    Ok(Message::ChannelReject { channel_id }) => {
+                        // ChannelReject is server→client direction.
+                        // Under #[cfg(test)], an odd-id ChannelReject is the client
+                        // rejecting a server-initiated ChannelOpen. Drop the map entry
+                        // so the channel task drains and exits cleanly (T-21-07).
+                        #[cfg(test)]
+                        if channel_id % 2 != 0 {
+                            tracing::debug!(
+                                channel_id,
+                                "client rejected server-initiated channel; dropping map entry"
+                            );
+                            if let Some(task_tx) = channel_map.remove(&channel_id) {
+                                let _ = task_tx.try_send(ChannelEvent::Close);
+                            }
+                            continue;
+                        }
+                        // Production path (or even-id in test): protocol error.
+                        tracing::warn!(
+                            channel_id,
+                            "client sent ChannelReject (server→client only); closing"
                         );
                         break SessionEnd::ClientClosed;
                     }
@@ -1175,6 +1240,54 @@ async fn run_session(
                 if nosh_proto::write_message(&mut send, &ctrl_msg).await.is_err() {
                     break SessionEnd::TransportLost;
                 }
+            }
+
+            // Task 3: server-initiated channel-open trigger arm.
+            //
+            // In test builds, server_open_rx_opt is Some(rx) and integration tests
+            // write ChannelType values to it via the SessionSlot accessor. In
+            // production builds, server_open_rx_opt is None so recv_or_pending()
+            // returns std::future::pending() — the arm never fires (T-21-10).
+            //
+            // The arm runs on the session pump task which owns `send` — the
+            // single-writer invariant for the control stream is maintained (A4).
+            server_open_req = recv_or_pending(&mut server_open_rx_opt) => {
+                if let Some(ch_type) = server_open_req {
+                    let server_ch_id = next_server_channel_id;
+                    next_server_channel_id += 2; // advance: 1, 3, 5, …
+                    debug_assert!(server_ch_id % 2 != 0, "server channel id must be odd");
+
+                    if channel_map.len() >= MAX_OPEN_CHANNELS {
+                        tracing::warn!(
+                            server_ch_id,
+                            "server-initiated ChannelOpen rejected: channel cap reached"
+                        );
+                        continue;
+                    }
+
+                    let (task_tx, task_rx) = mpsc::channel::<ChannelEvent>(64);
+                    channel_map.insert(server_ch_id, task_tx);
+                    tokio::spawn(run_channel_task(
+                        server_ch_id,
+                        task_rx,
+                        channel_ctrl_tx.clone(),
+                    ));
+
+                    tracing::debug!(server_ch_id, "server-initiated ChannelOpen");
+                    if nosh_proto::write_message(
+                        &mut send,
+                        &Message::ChannelOpen {
+                            channel_id: server_ch_id,
+                            channel_type: ch_type,
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break SessionEnd::TransportLost;
+                    }
+                }
+                // None means the sender was dropped; treat as session-pump signal to stop.
             }
         }
     };
