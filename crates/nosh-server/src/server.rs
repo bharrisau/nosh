@@ -23,7 +23,7 @@ use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
 use rustls::pki_types::CertificateDer;
 use nosh_proto::{Message, TerminalControlPayload};
 use nosh_proto::datagram::{
-    encode_datagram, decode_epoch_ack, StateDiff, DiffRun, MIN_CAP, MAX_RUNS,
+    encode_datagram, decode_epoch_ack, StateDiff, DiffRun, CursorPos, MIN_CAP, MAX_RUNS,
 };
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use tokio::sync::mpsc;
@@ -169,6 +169,15 @@ const CLOSE_OK: u32 = 0;
 /// RTT: even at 500ms RTT and 60Hz ticks, only ~30 epochs are in-flight at once,
 /// but acks arrive at the same rate as sends so the store stays shallow.
 const EPOCH_SNAPSHOT_CAP: usize = 16;
+/// Maximum datagrams sent in a single burst tick (D-20-02).
+///
+/// A full 80×24 terminal repaint (~1920 cells at 8–15 bytes/run with a 1200-byte
+/// MTU) needs approximately 16–24 datagrams. 64 is ~2.5–4× that — generous enough
+/// that it never fires under any normal TUI app (vim startup, htop, large paste),
+/// but caps pathological cases (e.g. a 400-column terminal or a 200-line paste)
+/// at 64 × ~1200 ≈ 76 KB of datagram payload per tick, well within the default
+/// 1 MiB send buffer. Its sole purpose is DoS/resource bounding (T-20-02).
+const BURST_CAP: usize = 64;
 /// QUIC application close code for a protocol violation (bad first frame).
 const CLOSE_PROTOCOL: u32 = 1;
 /// QUIC application close code for peer identity extraction failure (should
@@ -292,6 +301,19 @@ struct DiffTickResult {
     /// must be prepended to the next tick's run list (Anti-Pattern: deferred
     /// runs go FIRST to maintain cursor-proximate priority).
     deferred: Vec<DiffRun>,
+    // ── Phase 20 burst geometry (D-20 / Pitfall 4) ───────────────────────────
+    // Burst iterations 2..N need the terminal geometry to construct StateDiff
+    // without re-locking the slot. These are captured from the slot snapshot
+    // taken inside build_state_diff and carried here so send_burst() can
+    // construct subsequent burst datagrams without any additional lock.
+    /// Terminal width (columns) at diff time.
+    cols: u16,
+    /// Terminal height (rows) at diff time.
+    rows: u16,
+    /// Cursor position at diff time (used for all burst datagrams in the tick).
+    cursor: CursorPos,
+    /// Alt-screen flag at diff time.
+    alt_screen: bool,
 }
 
 /// Build one coalesced `StateDiff` datagram for the current tick.
@@ -372,9 +394,105 @@ fn build_state_diff(
             sent_cells: cells,
             epoch: sent_epoch,
             deferred,
+            // Phase 20: carry terminal geometry for burst iterations 2..N (Pitfall 4).
+            cols,
+            rows,
+            cursor,
+            alt_screen,
         }),
         Err(_) => None, // encoding failed: skip this tick
     }
+}
+
+/// Drain all burst datagrams for one tick (D-20-01 through D-20-05).
+///
+/// Sends the first datagram from `result.payload`, then loops
+/// `encode_datagram`-only (never `build_state_diff` — D-20-03 / R-1 fix) until
+/// `result.deferred` is empty, the `BURST_CAP` is reached, or the connection's
+/// send buffer is full.
+///
+/// All datagrams share `result.epoch` (D-20-04 / R-2 fix: one epoch per tick;
+/// `confirmed_epoch` does not advance more than once per tick).
+///
+/// Returns the leftover deferred runs (to be carried to the next tick as
+/// `pending_deferred`) and a transport-loss flag. When the flag is `true` the
+/// caller must break the session loop with `SessionEnd::TransportLost`.
+///
+/// # Invariants
+/// - No `.await` call anywhere in this function (uses only synchronous
+///   `send_datagram` — D-20-01; the async `send_datagram_wait` is NOT used).
+/// - `build_state_diff` is never called here (would cause R-1 spin).
+/// - `epoch_snapshots.push_back` is not called here (belongs to the caller,
+///   once per tick — Pitfall 5).
+fn send_burst(
+    conn: &quinn::Connection,
+    result: DiffTickResult,
+    cap: usize,
+) -> (Vec<DiffRun>, bool /* transport_lost */) {
+    // Send the first datagram (already encoded by build_state_diff).
+    if let Err(e) = conn.send_datagram(result.payload) {
+        use quinn::SendDatagramError::*;
+        match e {
+            TooLarge => {} // unreachable: build_state_diff guarantees payload < cap
+            UnsupportedByPeer | Disabled | ConnectionLost(_) => {
+                // Transport lost: return remaining deferred + signal caller.
+                return (result.deferred, true);
+            }
+        }
+    }
+
+    let tick_epoch = result.epoch;
+    let tick_cols = result.cols;
+    let tick_rows = result.rows;
+    let tick_cursor = result.cursor;
+    let tick_alt_screen = result.alt_screen;
+    let mut deferred = result.deferred;
+    let mut burst_count: usize = 1; // first datagram already sent above
+
+    // ── D-20-01/D-20-02: burst encode_datagram-only drain ────────────────────
+    // Loop until deferred is empty, safety cap is hit, or send buffer is full.
+    // NEVER call build_state_diff here (R-1 fix: that would recompute fresh_runs
+    // against the non-advancing last_acked_snapshot, refilling deferred every
+    // iteration and causing an infinite spin).
+    let mut transport_lost = false;
+    'burst: while !deferred.is_empty()
+        && burst_count < BURST_CAP
+        && conn.datagram_send_buffer_space() >= cap
+    {
+        // Construct the burst StateDiff from carried deferred runs + the SAME
+        // epoch from build_state_diff (D-20-04: one epoch per tick; every burst
+        // datagram shares this epoch so confirmed_epoch advances only once).
+        let burst_diff = StateDiff {
+            epoch: tick_epoch,
+            cols: tick_cols,
+            rows: tick_rows,
+            cursor: tick_cursor,
+            alt_screen: tick_alt_screen,
+            runs: std::mem::take(&mut deferred),
+        };
+        let (payload, next_deferred) = match encode_datagram(&burst_diff, cap) {
+            Ok(pair) => pair,
+            Err(_) => {
+                // CapTooSmall is unreachable at runtime (cap from max_datagram_size).
+                // burst_diff consumed deferred; leave it empty and stop.
+                break 'burst;
+            }
+        };
+        deferred = next_deferred;
+        if let Err(e) = conn.send_datagram(payload) {
+            use quinn::SendDatagramError::*;
+            match e {
+                TooLarge => {} // unreachable: encode_datagram guarantees payload < cap
+                UnsupportedByPeer | Disabled | ConnectionLost(_) => {
+                    transport_lost = true;
+                    break 'burst;
+                }
+            }
+        }
+        burst_count += 1;
+    }
+
+    (deferred, transport_lost)
 }
 
 /// Handle one connection: after auth, drive a real PTY login-shell session over
@@ -688,9 +806,14 @@ async fn run_session(
                     last_seen_addr = cur;
                 }
             }
-            // SYNC-03: diff-interval tick — emit one coalesced StateDiff datagram.
-            // D-13-02: one diff per tick, not per PTY chunk.
+            // SYNC-03 / PACE-01: diff-interval tick — burst state-diff datagrams.
+            // D-13-02: one build_state_diff per tick, not per PTY chunk.
             // D-13-03: gate on resume_complete (always true for run_session).
+            // Phase 20 (D-20-01..D-20-05): send_burst() drains the deferred run
+            // list within one tick via encode_datagram-only (never build_state_diff
+            // again — R-1 fix). All burst datagrams share the tick's single epoch
+            // (R-2 fix). epoch_snapshots.push_back is called exactly once per tick
+            // (Pitfall 5 / D-20-04).
             _ = diff_interval.tick() => {
                 if !resume_complete {
                     continue;
@@ -710,22 +833,20 @@ async fn run_session(
                     cap,
                 ) {
                     // CR-01 fix: store the sent snapshot keyed by epoch BEFORE
-                    // calling send_datagram. On ack receipt we look up this
-                    // snapshot rather than snapshotting the current (potentially
-                    // advanced) grid.
+                    // calling send_burst. Push exactly ONCE per tick outside the
+                    // burst loop — burst datagrams all share this epoch (Pitfall 5).
                     epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
                     if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
                         epoch_snapshots.pop_front();
                     }
-                    last_sent_snapshot = result.sent_cells;
-                    pending_deferred = result.deferred;
-                    if let Err(e) = conn.send_datagram(result.payload) {
-                        use quinn::SendDatagramError::*;
-                        match e {
-                            TooLarge => {} // encode_datagram guarantees this is unreachable; treat as skip
-                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
-                            ConnectionLost(_) => break SessionEnd::TransportLost,
-                        }
+                    last_sent_snapshot = result.sent_cells.clone();
+                    // Phase 20: send_burst() sends result.payload first, then
+                    // drains result.deferred via encode_datagram-only until the
+                    // send buffer is full, BURST_CAP is hit, or deferred is empty.
+                    let (leftover, transport_lost) = send_burst(&conn, result, cap);
+                    pending_deferred = leftover;
+                    if transport_lost {
+                        break SessionEnd::TransportLost;
                     }
                 }
             }
@@ -1181,8 +1302,11 @@ async fn run_reattach_session(
                     }
                 }
             }
-            // SYNC-03: diff-interval tick — same arm as run_session.
+            // SYNC-03 / PACE-01: diff-interval tick — burst state-diff datagrams.
             // D-13-03: gated by resume_complete (false until replay loop above completes).
+            // Phase 20: identical burst semantics as run_session (send_burst called
+            // here too — reattached sessions burst identically to fresh sessions,
+            // Pitfall 6 prevention).
             _ = diff_interval.tick() => {
                 if !resume_complete {
                     continue;
@@ -1202,19 +1326,17 @@ async fn run_reattach_session(
                     cap,
                 ) {
                     // CR-01 fix: store sent snapshot keyed by epoch (same as run_session).
+                    // Push exactly ONCE per tick outside the burst loop (Pitfall 5).
                     epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
                     if epoch_snapshots.len() > EPOCH_SNAPSHOT_CAP {
                         epoch_snapshots.pop_front();
                     }
-                    last_sent_snapshot = result.sent_cells;
-                    pending_deferred = result.deferred;
-                    if let Err(e) = conn.send_datagram(result.payload) {
-                        use quinn::SendDatagramError::*;
-                        match e {
-                            TooLarge => {}
-                            UnsupportedByPeer | Disabled => break SessionEnd::TransportLost,
-                            ConnectionLost(_) => break SessionEnd::TransportLost,
-                        }
+                    last_sent_snapshot = result.sent_cells.clone();
+                    // Phase 20: burst drain via send_burst (same as run_session).
+                    let (leftover, transport_lost) = send_burst(&conn, result, cap);
+                    pending_deferred = leftover;
+                    if transport_lost {
+                        break SessionEnd::TransportLost;
                     }
                 }
             }
