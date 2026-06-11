@@ -1024,6 +1024,7 @@ dependencies = [
  "nosh-auth",
  "nosh-proto",
  "nosh-server",
+ "postcard",
  "quinn",
  "rustls",
  "serde_json",

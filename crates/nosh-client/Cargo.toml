@@ -23,6 +23,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
+postcard = { workspace = true }
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
 # crossterm 0.29: terminal raw-mode + size() (resize is detected by polling
 # terminal::size(), NOT EventStream — see platform.rs: a second console-input

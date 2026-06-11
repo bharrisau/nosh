@@ -14,6 +14,7 @@ use nosh_auth::{
 };
 #[cfg(unix)]
 use nosh_auth::AgentSigner;
+use nosh_proto::messages::ChannelType;
 use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig};
 
@@ -657,6 +658,107 @@ pub async fn collect_until_close(recv: &mut quinn::RecvStream) -> anyhow::Result
             Ok(Message::SessionClose { exit_code, .. }) => return Ok((output, exit_code)),
             Ok(_) => {} // ignore unexpected control frames in the headless driver
             Err(_) => return Ok((output, 0)), // stream closed without an explicit close
+        }
+    }
+}
+
+// ── Phase 21: channel-multiplexing helpers (MUX-01/MUX-04) ───────────────────
+
+/// Outcome of a `ChannelAccept`/`ChannelReject` reply from the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelAcceptOutcome {
+    /// Server accepted the channel; the caller may now open a bidi stream.
+    Accepted,
+    /// Server rejected the channel; the channel id is now free to reuse.
+    Rejected,
+}
+
+/// Send a `ChannelOpen` frame on the CONTROL stream.
+///
+/// This writes to the existing session control stream, NOT to a new stream.
+/// MUX-01: the OPEN/ACCEPT handshake is completed on the control stream before
+/// any data stream is bound.
+pub async fn send_channel_open(
+    control_send: &mut quinn::SendStream,
+    channel_id: u32,
+    channel_type: ChannelType,
+) -> anyhow::Result<()> {
+    nosh_proto::write_message(
+        control_send,
+        &Message::ChannelOpen {
+            channel_id,
+            channel_type,
+        },
+    )
+    .await
+    .context("send ChannelOpen")
+}
+
+/// Read the server's `ChannelAccept` or `ChannelReject` reply from the CONTROL
+/// stream for the given `expected_id`.
+///
+/// Returns `ChannelAcceptOutcome::Accepted` on `ChannelAccept { channel_id }`
+/// (when `channel_id == expected_id`) and `ChannelAcceptOutcome::Rejected` on
+/// `ChannelReject`. Any other frame is a protocol error.
+///
+/// W3 / D-07: frame payloads are never logged — only variant names.
+pub async fn await_channel_accept(
+    control_recv: &mut quinn::RecvStream,
+    expected_id: u32,
+) -> anyhow::Result<ChannelAcceptOutcome> {
+    match nosh_proto::read_message(control_recv).await {
+        Ok(Message::ChannelAccept { channel_id }) if channel_id == expected_id => {
+            Ok(ChannelAcceptOutcome::Accepted)
+        }
+        Ok(Message::ChannelAccept { channel_id }) => {
+            // Unexpected channel id — protocol error.
+            anyhow::bail!(
+                "ChannelAccept for unexpected id {channel_id} (expected {expected_id})"
+            )
+        }
+        Ok(Message::ChannelReject { .. }) => Ok(ChannelAcceptOutcome::Rejected),
+        // W3 / D-07: never Debug a frame — use the variant name.
+        Ok(other) => anyhow::bail!(
+            "unexpected reply to ChannelOpen: {}",
+            other.variant_name()
+        ),
+        Err(e) => anyhow::bail!("failed to read ChannelAccept/ChannelReject: {e}"),
+    }
+}
+
+/// Open a logical channel over the connection.
+///
+/// MUX-01 control-first ordering:
+/// 1. Sends `ChannelOpen` on the CONTROL stream.
+/// 2. Awaits `ChannelAccept`/`ChannelReject` on the CONTROL stream.
+/// 3. On `Rejected`: returns `Ok(None)` — no bidi stream is opened.
+/// 4. On `Accepted`: calls `conn.open_bi()`, writes the channel-id as a postcard
+///    varint prefix on the new `SendStream` BEFORE any payload (MUX-02), and
+///    returns `Ok(Some((send, recv)))`.
+///
+/// The varint prefix binds the stream to the logical channel id independently of
+/// the QUIC stream id, so the mapping survives QUIC connection migration.
+pub async fn open_channel(
+    conn: &quinn::Connection,
+    control_send: &mut quinn::SendStream,
+    control_recv: &mut quinn::RecvStream,
+    channel_id: u32,
+    channel_type: ChannelType,
+) -> anyhow::Result<Option<(quinn::SendStream, quinn::RecvStream)>> {
+    send_channel_open(control_send, channel_id, channel_type).await?;
+
+    match await_channel_accept(control_recv, channel_id).await? {
+        ChannelAcceptOutcome::Rejected => Ok(None),
+        ChannelAcceptOutcome::Accepted => {
+            let (mut send, recv) = conn.open_bi().await.context("open channel bidi stream")?;
+            // Write the channel-id varint prefix before any payload (MUX-02).
+            // postcard encodes u32 as a LEB128 varint (1–5 bytes).
+            let prefix = postcard::to_allocvec(&channel_id)
+                .context("encode channel-id varint prefix")?;
+            send.write_all(&prefix)
+                .await
+                .context("write channel-id varint prefix")?;
+            Ok(Some((send, recv)))
         }
     }
 }
