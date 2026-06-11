@@ -35,7 +35,7 @@ Requirements for this milestone. Each maps to a roadmap phase.
 - [x] **MUX-02**: Multiple logical channels run concurrently over the single QUIC connection, each on its own stream, with no head-of-line blocking between channels (PTY input stays responsive while another channel is saturated)
 - [x] **MUX-03**: Reliable channels have per-channel application-level flow control (credit-based windows) so a slow consumer on one channel cannot stall the connection or other channels
 - [x] **MUX-04**: Channel lifecycle is clean — half-close and full-close release resources on both ends; a rejected or closed channel leaks nothing; channel-id parity prevents simultaneous-open collisions
-- [ ] **MUX-05**: Channels behave correctly across mobility — they survive QUIC migration transparently, and on cold reattach they are re-established over the control channel after resume (channels are per-connection, not byte-replayed)
+- [x] **MUX-05**: Channels behave correctly across mobility — they survive QUIC migration transparently, and on cold reattach they are re-established over the control channel after resume (channels are per-connection, not byte-replayed)
 - [x] **MUX-06**: The wire format is stable — the `Message` enum discriminant order is append-only, enforced by a discriminant-stability test that is the first commit of the mux work
 
 ### Scrollback Sync (SCROLL)
@@ -103,7 +103,7 @@ Which phases cover which requirements. Populated during roadmap creation.
 | MUX-02 | Phase 21 | Complete |
 | MUX-03 | Phase 21 | Complete |
 | MUX-04 | Phase 21 | Complete |
-| MUX-05 | Phase 21 | Pending |
+| MUX-05 | Phase 21 | Complete |
 | MUX-06 | Phase 21 | Complete |
 | SCROLL-01 | Phase 22 | Pending |
 | SCROLL-02 | Phase 22 | Pending |
