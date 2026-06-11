@@ -699,30 +699,49 @@ pub async fn send_channel_open(
 ///
 /// Returns `ChannelAcceptOutcome::Accepted` on `ChannelAccept { channel_id }`
 /// (when `channel_id == expected_id`) and `ChannelAcceptOutcome::Rejected` on
-/// `ChannelReject`. Any other frame is a protocol error.
+/// `ChannelReject`.
+///
+/// WR-03 fix: loops past interleaved pass-through frames (`PtyData`,
+/// `SessionOpened`, `TerminalControl`, `Ack`) that the server may send
+/// concurrently while the PTY is active. Without this loop, `open_channel`
+/// would spuriously fail in any real session with active shell output — the
+/// first `PtyData` frame before the `ChannelAccept` would be treated as a
+/// protocol error and the channel open would bail. This mirrors the
+/// `recv_channel_reply` helper used in the integration tests (channel_mux.rs).
 ///
 /// W3 / D-07: frame payloads are never logged — only variant names.
 pub async fn await_channel_accept(
     control_recv: &mut quinn::RecvStream,
     expected_id: u32,
 ) -> anyhow::Result<ChannelAcceptOutcome> {
-    match nosh_proto::read_message(control_recv).await {
-        Ok(Message::ChannelAccept { channel_id }) if channel_id == expected_id => {
-            Ok(ChannelAcceptOutcome::Accepted)
+    loop {
+        match nosh_proto::read_message(control_recv).await {
+            Ok(Message::ChannelAccept { channel_id }) if channel_id == expected_id => {
+                return Ok(ChannelAcceptOutcome::Accepted);
+            }
+            Ok(Message::ChannelAccept { channel_id }) => {
+                // Unexpected channel id — protocol error.
+                anyhow::bail!(
+                    "ChannelAccept for unexpected id {channel_id} (expected {expected_id})"
+                )
+            }
+            Ok(Message::ChannelReject { .. }) => return Ok(ChannelAcceptOutcome::Rejected),
+            // Pass-through frames that may be interleaved while PTY is active — skip
+            // and wait for the actual ChannelAccept/Reject reply.
+            // W3 / D-07: never Debug a frame — use the variant name.
+            Ok(Message::PtyData { .. })
+            | Ok(Message::SessionOpened { .. })
+            | Ok(Message::TerminalControl(_))
+            | Ok(Message::Ack { .. }) => {
+                // Continue the loop — not a channel-control reply.
+                continue;
+            }
+            Ok(other) => anyhow::bail!(
+                "unexpected reply to ChannelOpen: {}",
+                other.variant_name()
+            ),
+            Err(e) => anyhow::bail!("failed to read ChannelAccept/ChannelReject: {e}"),
         }
-        Ok(Message::ChannelAccept { channel_id }) => {
-            // Unexpected channel id — protocol error.
-            anyhow::bail!(
-                "ChannelAccept for unexpected id {channel_id} (expected {expected_id})"
-            )
-        }
-        Ok(Message::ChannelReject { .. }) => Ok(ChannelAcceptOutcome::Rejected),
-        // W3 / D-07: never Debug a frame — use the variant name.
-        Ok(other) => anyhow::bail!(
-            "unexpected reply to ChannelOpen: {}",
-            other.variant_name()
-        ),
-        Err(e) => anyhow::bail!("failed to read ChannelAccept/ChannelReject: {e}"),
     }
 }
 
