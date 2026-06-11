@@ -259,4 +259,86 @@ mod tests {
             assert_eq!(sc, got, "SessionClose discriminant must not shift after appending new variants");
         }
     }
+
+    /// MUX-06 / Phase 21: every `Message` variant must encode with its EXACT
+    /// expected postcard discriminant byte. This test is the first commit of
+    /// Phase 21 — any reordering of the enum is caught here before merge.
+    ///
+    /// postcard encodes enum variants as a leading varint equal to the variant's
+    /// 0-based source-order index. For discriminants 0..127 this is a single byte.
+    ///
+    /// Count (0-based):
+    ///   SessionOpen=0, PtyData=1, Resize=2, SessionClose=3,
+    ///   SessionOpened=4, Reattach=5, ReattachOk=6, ReattachErr=7,
+    ///   Ack=8, TerminalControl=9.
+    ///   First Phase-21 mux variant = 10 (ChannelOpen).
+    #[test]
+    fn message_discriminant_order_is_stable() {
+        use crate::messages::{ChannelType, TerminalControlPayload};
+        use postcard::to_allocvec;
+
+        let cases: &[(u8, Message)] = &[
+            (0, Message::SessionOpen { term: "xterm".into(), cols: 80, rows: 24, env: vec![] }),
+            (1, Message::PtyData { data: vec![0x41] }),
+            (2, Message::Resize { cols: 80, rows: 24 }),
+            (3, Message::SessionClose { exit_code: 0, reason: String::new() }),
+            (4, Message::SessionOpened { token: [0u8; 16] }),
+            (5, Message::Reattach { token: [0u8; 16], last_acked_seq: 0 }),
+            (6, Message::ReattachOk { new_token: [0u8; 16], replaying_from_seq: 0, truncated: false }),
+            (7, Message::ReattachErr),
+            (8, Message::Ack { seq: 0 }),
+            (9, Message::TerminalControl(TerminalControlPayload::Title { title: String::new() })),
+            // Phase 21 mux variants — discriminants 10–14 (append-only after TerminalControl):
+            (10, Message::ChannelOpen { channel_id: 2, channel_type: ChannelType::Echo }),
+            (11, Message::ChannelAccept { channel_id: 2 }),
+            (12, Message::ChannelReject { channel_id: 2 }),
+            (13, Message::ChannelCredit { channel_id: 2, bytes: 256 * 1024 }),
+            (14, Message::ChannelClose { channel_id: 2 }),
+        ];
+        for (expected_disc, msg) in cases {
+            let encoded = to_allocvec(msg).expect("encode");
+            assert_eq!(
+                encoded[0], *expected_disc,
+                "Message::{} must encode with discriminant {}; encoded[0] = {}",
+                msg.variant_name(), expected_disc, encoded[0]
+            );
+        }
+    }
+
+    /// Phase 21 / MUX-06: the five new mux `Message` variants must round-trip
+    /// exactly through `write_message` → `read_message` (equality preserved).
+    #[tokio::test]
+    async fn mux_variants_round_trip() {
+        use crate::messages::ChannelType;
+
+        let msgs = [
+            Message::ChannelOpen { channel_id: 2, channel_type: ChannelType::Echo },
+            Message::ChannelOpen { channel_id: 4, channel_type: ChannelType::Scrollback },
+            Message::ChannelOpen { channel_id: 6, channel_type: ChannelType::PortForward },
+            Message::ChannelOpen { channel_id: 8, channel_type: ChannelType::AgentForward },
+            Message::ChannelAccept { channel_id: 2 },
+            Message::ChannelReject { channel_id: 4 },
+            Message::ChannelCredit { channel_id: 2, bytes: 256 * 1024 },
+            Message::ChannelCredit { channel_id: 2, bytes: 0 },
+            Message::ChannelClose { channel_id: 2 },
+        ];
+        for msg in msgs {
+            let mut buf: Vec<u8> = Vec::new();
+            write_message(&mut buf, &msg).await.expect("write");
+            let mut cursor = std::io::Cursor::new(buf);
+            let got = read_message(&mut cursor).await.expect("read");
+            assert_eq!(msg, got, "mux variant must round-trip exactly");
+        }
+
+        // ChannelReject carries ONLY channel_id — no reason field.
+        // Verify there is no extra data encoded beyond discriminant + channel_id varint.
+        let reject = Message::ChannelReject { channel_id: 0 };
+        let encoded = postcard::to_allocvec(&reject).expect("encode ChannelReject");
+        // discriminant byte (1) + channel_id varint for 0 (1 byte) = 2 bytes total.
+        assert_eq!(
+            encoded.len(), 2,
+            "ChannelReject must encode as exactly 2 bytes (discriminant + zero channel_id); \
+             a reason field would increase this"
+        );
+    }
 }

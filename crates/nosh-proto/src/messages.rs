@@ -172,6 +172,67 @@ pub enum Message {
     /// read/query form (`?`) is silently dropped in `osc_dispatch` before it can
     /// reach the forwarding path (D-16-01a / T-16-01).
     TerminalControl(TerminalControlPayload),
+
+    // ── Phase 21: Channel Multiplexing Foundation ────────────────────────────
+    //
+    // These variants are appended AFTER `TerminalControl` (discriminant 9) to
+    // preserve the postcard discriminant order of all existing variants.
+    // Inserting or reordering is NOT backward-compatible. The
+    // discriminant-stability test in codec.rs (message_discriminant_order_is_stable)
+    // enforces this invariant.
+    // APPEND-ONLY from here.
+
+    /// Client → server: request to open a new logical channel (MUX-01).
+    ///
+    /// Client-initiated channels MUST use even `channel_id` values; server-initiated
+    /// channels use odd values (parity prevents simultaneous-open collisions, MUX-04).
+    /// Channel id 0 is reserved for the session control stream.
+    ///
+    /// The server responds with [`Message::ChannelAccept`] or [`Message::ChannelReject`]
+    /// on the control stream before any data stream is opened.
+    ChannelOpen {
+        /// The application-level channel identifier. Client-initiated: MUST be even.
+        channel_id: u32,
+        /// The requested logical channel type.
+        channel_type: ChannelType,
+    },
+
+    /// Server → client: the requested channel has been accepted (MUX-01).
+    ///
+    /// After receiving this, the opener writes the `channel_id` as a varint prefix
+    /// at the start of a freshly opened QUIC bidi stream (MUX-02).
+    ChannelAccept {
+        /// The application-level channel identifier that was accepted.
+        channel_id: u32,
+    },
+
+    /// Server → client: the requested channel has been rejected (MUX-01).
+    ///
+    /// OPAQUE by design (MUX-01 / T-21-02): carries no reason code so a rejected
+    /// channel reveals nothing about server capabilities.
+    ChannelReject {
+        /// The application-level channel identifier that was rejected.
+        channel_id: u32,
+    },
+
+    /// Either direction: grants additional byte-credit to the send side of a
+    /// channel (MUX-03). Sent on the control stream, not the channel's data stream.
+    ///
+    /// Initial window is 256 KiB per channel. The consumer sends this after
+    /// draining its buffer to allow more data.
+    ChannelCredit {
+        /// The channel identifier whose credit is being replenished.
+        channel_id: u32,
+        /// Number of additional bytes the send side may transmit.
+        bytes: u64,
+    },
+
+    /// Either direction: signals that the sender is closing its side of the
+    /// channel (MUX-04). The receiver should finish draining and close its side.
+    ChannelClose {
+        /// The channel identifier being closed.
+        channel_id: u32,
+    },
 }
 
 /// Payload for a [`Message::TerminalControl`] frame.
@@ -210,6 +271,25 @@ pub enum TerminalControlPayload {
     },
 }
 
+/// The logical channel type carried in a [`Message::ChannelOpen`] frame.
+///
+/// APPEND-ONLY: adding a variant is backward-compatible; removing or reordering
+/// corrupts deployed connections (postcard encodes by source-order position).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelType {
+    /// Test-only echo channel. NOT a production channel type.
+    ///
+    /// Accepted by the server only in `#[cfg(test)]` builds; unconditionally
+    /// rejected in production. Exists solely to prove the mux layer end-to-end.
+    Echo,
+    /// Scrollback sync channel (Phase 22 consumer).
+    Scrollback,
+    /// Port-forward channel — declared but REJECTed by v1.3 peers (FWD-01 deferred).
+    PortForward,
+    /// Agent-forward channel — declared but REJECTed by v1.3 peers (FWD-02 deferred).
+    AgentForward,
+}
+
 impl Message {
     /// The variant's static name, with NO payload. Use this for logging instead
     /// of `Debug` (`{:?}`): several variants (`SessionOpened`, `Reattach`,
@@ -227,6 +307,12 @@ impl Message {
             Message::ReattachErr => "ReattachErr",
             Message::Ack { .. } => "Ack",
             Message::TerminalControl(_) => "TerminalControl",
+            // Phase 21 mux variants:
+            Message::ChannelOpen { .. } => "ChannelOpen",
+            Message::ChannelAccept { .. } => "ChannelAccept",
+            Message::ChannelReject { .. } => "ChannelReject",
+            Message::ChannelCredit { .. } => "ChannelCredit",
+            Message::ChannelClose { .. } => "ChannelClose",
         }
     }
 }
