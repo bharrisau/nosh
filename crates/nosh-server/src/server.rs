@@ -30,7 +30,7 @@ use nosh_proto::datagram::{
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use tokio::sync::mpsc;
 
-use crate::channel::{ChannelEvent, run_channel_task};
+use crate::channel::{ChannelEvent, run_channel_task, run_scrollback_sender_task};
 use crate::registry::SessionRegistry;
 use crate::session;
 use crate::terminal::Cell;
@@ -753,6 +753,16 @@ async fn run_session(
     let resume_complete = true;
     // Per-connection datagram state (Open Question 3: task-local, resets on reattach).
     let mut current_epoch: u64 = 0;
+    // Phase 22 (S-5): epoch mirror for the scrollback sender task.
+    //
+    // The scrollback sender task must read the live epoch atomically with the
+    // scrollback lines snapshot. This Arc<AtomicU64> mirrors current_epoch and is
+    // updated (store, Release) at each diff tick immediately after build_state_diff
+    // increments current_epoch. The sender reads it with Acquire ordering into a
+    // local before entering with_terminal_state — no .await between the load and
+    // the closure (S-5 atomic epoch capture). This in-process atomic is additive:
+    // it does NOT change epoch cadence, confirmed_epoch logic, or datagram sends.
+    let epoch_src = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut last_acked_epoch: u64 = 0;
     // D-13-01b: empty baseline → first diff is naturally the full screen.
     let mut last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
@@ -914,6 +924,10 @@ async fn run_session(
                     deferred,
                     cap,
                 ) {
+                    // Phase 22 (S-5): mirror the updated epoch into epoch_src so the
+                    // scrollback sender task can read it atomically with the scrollback
+                    // snapshot. Additive — does NOT change epoch cadence or datagram sends.
+                    epoch_src.store(current_epoch, std::sync::atomic::Ordering::Release);
                     // CR-01 fix: store the sent snapshot keyed by epoch BEFORE
                     // calling send_burst. Push exactly ONCE per tick outside the
                     // burst loop — burst datagrams all share this epoch (Pitfall 5).
@@ -1045,9 +1059,9 @@ async fn run_session(
                             .await;
                             continue;
                         }
-                        // Validate channel type: only Echo is accepted (test-only builds
-                        // only); PortForward and AgentForward are unconditionally rejected
-                        // (FWD-01 / FWD-02 / T-21-08); Scrollback deferred to Phase 22.
+                        // Validate channel type: Scrollback and Echo (test-only) are
+                        // accepted; PortForward and AgentForward are unconditionally
+                        // rejected (FWD-01 / FWD-02 / T-21-08 / T-22-10 access control).
                         let accept = match channel_type {
                             ChannelType::PortForward | ChannelType::AgentForward => {
                                 // Always rejected: SSH_AUTH_SOCK never reachable (T-21-08).
@@ -1058,12 +1072,8 @@ async fn run_session(
                                 false
                             }
                             ChannelType::Scrollback => {
-                                // Phase 22 consumer — not yet handled.
-                                tracing::debug!(
-                                    channel_id,
-                                    "ChannelOpen for Scrollback; rejecting (Phase 22)"
-                                );
-                                false
+                                // Phase 22: accepted — spawns run_scrollback_sender_task.
+                                true
                             }
                             ChannelType::Echo => {
                                 // Echo is the test-only proving fixture (21-CONTEXT.md).
@@ -1103,13 +1113,59 @@ async fn run_session(
                         {
                             break SessionEnd::TransportLost;
                         }
+                        // Bounded mpsc(64) for channel events (M-6 / S-4): any pump-side
+                        // push uses try_send + drop-on-Full so the pump select! arm is
+                        // never blocked by a slow channel consumer (M-6 comment).
                         let (task_tx, task_rx) = mpsc::channel::<ChannelEvent>(64);
                         channel_map.insert(channel_id, task_tx);
-                        tokio::spawn(run_channel_task(
-                            channel_id,
-                            task_rx,
-                            channel_ctrl_tx.clone(),
-                        ));
+                        // Dispatch to the correct per-channel task based on channel type.
+                        match channel_type {
+                            ChannelType::Scrollback => {
+                                // Phase 22: dedicated scrollback sender task.
+                                // Runs separately from the pump so it cannot stall PTY
+                                // output or the 16 ms diff tick (M-6 sender task isolation).
+                                let slot_clone = slot.clone();
+                                let epoch_src_clone = epoch_src.clone();
+                                let ctrl_tx_clone = channel_ctrl_tx.clone();
+                                tokio::spawn(async move {
+                                    let mut task_rx_inner = task_rx;
+                                    // Wait for the stream-bind event (same pattern as
+                                    // run_channel_task's stream-bind Phase-1 loop).
+                                    let (mut ch_send, mut ch_recv) = loop {
+                                        match task_rx_inner.recv().await {
+                                            Some(ChannelEvent::Stream(s, r)) => break (s, r),
+                                            Some(ChannelEvent::Close) | None => {
+                                                let _ = ctrl_tx_clone
+                                                    .send(Message::ChannelClose { channel_id })
+                                                    .await;
+                                                return;
+                                            }
+                                            Some(ChannelEvent::Credit(_)) => {
+                                                // Credit before stream bound; keep waiting.
+                                            }
+                                        }
+                                    };
+                                    run_scrollback_sender_task(
+                                        channel_id,
+                                        slot_clone,
+                                        &mut ch_send,
+                                        &mut ch_recv,
+                                        &mut task_rx_inner,
+                                        &ctrl_tx_clone,
+                                        epoch_src_clone,
+                                    ).await;
+                                });
+                            }
+                            _ => {
+                                // All other accepted types use the generic channel task
+                                // (Echo in test builds).
+                                tokio::spawn(run_channel_task(
+                                    channel_id,
+                                    task_rx,
+                                    channel_ctrl_tx.clone(),
+                                ));
+                            }
+                        }
                         tracing::debug!(channel_id, "channel accepted; task spawned");
                     }
 
@@ -1645,6 +1701,11 @@ async fn run_reattach_session(
     // Per-connection datagram state (Open Question 3: task-local, resets on reattach).
     // D-13-01b: empty baseline → first post-resume diff is naturally the full screen.
     let mut current_epoch: u64 = 0;
+    // Phase 22 (S-5): epoch mirror for the scrollback sender task (same as run_session).
+    // Updated (store, Release) at each diff tick after build_state_diff increments
+    // current_epoch. Does NOT change epoch cadence, confirmed_epoch logic, or
+    // datagram sends — additive mirror only.
+    let epoch_src = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut last_acked_epoch: u64 = 0;
     let mut last_acked_snapshot: Vec<Vec<Cell>> = Vec::new();
     let mut last_sent_snapshot: Vec<Vec<Cell>> = Vec::new();
@@ -1732,6 +1793,9 @@ async fn run_reattach_session(
                     deferred,
                     cap,
                 ) {
+                    // Phase 22 (S-5): mirror updated epoch into epoch_src (same as
+                    // run_session). Additive — does NOT change epoch cadence or sends.
+                    epoch_src.store(current_epoch, std::sync::atomic::Ordering::Release);
                     // CR-01 fix: store sent snapshot keyed by epoch (same as run_session).
                     // Push exactly ONCE per tick outside the burst loop (Pitfall 5).
                     epoch_snapshots.push_back((result.epoch, result.sent_cells.clone()));
@@ -1830,9 +1894,17 @@ async fn run_reattach_session(
                             .await;
                             continue;
                         }
+                        // Validate channel type: Scrollback and Echo (test-only) are
+                        // accepted; PortForward and AgentForward are unconditionally
+                        // rejected (FWD-01 / FWD-02 / T-21-08 / T-22-10 access control).
                         let accept = match channel_type {
                             ChannelType::PortForward | ChannelType::AgentForward => false,
-                            ChannelType::Scrollback => false,
+                            ChannelType::Scrollback => {
+                                // Phase 22: accepted on reattach (SCROLL-05 reattach
+                                // precondition). Channel state is not replayed; the client
+                                // re-opens after ResumeComplete (MUX-05).
+                                true
+                            }
                             ChannelType::Echo => {
                                 #[cfg(any(test, feature = "test-support"))] { true }
                                 #[cfg(not(any(test, feature = "test-support")))] { false }
@@ -1855,13 +1927,54 @@ async fn run_reattach_session(
                         {
                             break SessionEnd::TransportLost;
                         }
+                        // Bounded mpsc(64) for channel events (M-6 / S-4).
                         let (task_tx, task_rx) = mpsc::channel::<ChannelEvent>(64);
                         channel_map.insert(channel_id, task_tx);
-                        tokio::spawn(run_channel_task(
-                            channel_id,
-                            task_rx,
-                            channel_ctrl_tx.clone(),
-                        ));
+                        // Dispatch to the correct per-channel task based on channel type.
+                        match channel_type {
+                            ChannelType::Scrollback => {
+                                // Phase 22: dedicated scrollback sender task (SCROLL-05
+                                // reattach path). Isolated from pump — cannot stall PTY (M-6).
+                                let slot_clone = slot.clone();
+                                let epoch_src_clone = epoch_src.clone();
+                                let ctrl_tx_clone = channel_ctrl_tx.clone();
+                                tokio::spawn(async move {
+                                    let mut task_rx_inner = task_rx;
+                                    // Wait for the stream-bind event.
+                                    let (mut ch_send, mut ch_recv) = loop {
+                                        match task_rx_inner.recv().await {
+                                            Some(ChannelEvent::Stream(s, r)) => break (s, r),
+                                            Some(ChannelEvent::Close) | None => {
+                                                let _ = ctrl_tx_clone
+                                                    .send(Message::ChannelClose { channel_id })
+                                                    .await;
+                                                return;
+                                            }
+                                            Some(ChannelEvent::Credit(_)) => {
+                                                // Credit before stream bound; keep waiting.
+                                            }
+                                        }
+                                    };
+                                    run_scrollback_sender_task(
+                                        channel_id,
+                                        slot_clone,
+                                        &mut ch_send,
+                                        &mut ch_recv,
+                                        &mut task_rx_inner,
+                                        &ctrl_tx_clone,
+                                        epoch_src_clone,
+                                    ).await;
+                                });
+                            }
+                            _ => {
+                                // All other accepted types use the generic channel task.
+                                tokio::spawn(run_channel_task(
+                                    channel_id,
+                                    task_rx,
+                                    channel_ctrl_tx.clone(),
+                                ));
+                            }
+                        }
                     }
 
                     Ok(Message::ChannelCredit { channel_id, bytes }) => {
