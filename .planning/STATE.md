@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
-status: planning
-stopped_at: Phase 21 context gathered
-last_updated: "2026-06-11T13:39:32.562Z"
-last_activity: 2026-06-11 -- Phase 21 planning complete
+status: executing
+stopped_at: Phase 21 Plan 01 complete
+last_updated: "2026-06-11T14:02:00Z"
+last_activity: 2026-06-11 -- Phase 21 Plan 01 executed (d5f7e76)
 progress:
   total_phases: 4
   completed_phases: 2
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-07)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 21 — channel multiplexing foundation
+**Current focus:** Phase 21 — channel-multiplexing-foundation
 
 ## Current Position
 
-Phase: 21
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-06-11 -- Phase 21 planning complete
+Phase: 21 (channel-multiplexing-foundation) — EXECUTING
+Plan: 2 of 4
+Status: Executing Phase 21
+Last activity: 2026-06-11 -- Phase 21 Plan 01 executed (d5f7e76)
 
 ```
 Progress: [██████████] 100%
@@ -66,6 +66,7 @@ Progress: [██████████] 100%
 | Phase 19-full-screen-tui-rendering-correctness P05 | 25 | 3 tasks | 2 files |
 | Phase 20-repaint-pacing P01 | 25 | 2 tasks | 1 files |
 | Phase 20-repaint-pacing P02 | 28 | 2 tasks | 2 files |
+| Phase 21-channel-multiplexing-foundation P01 | 120 | 1 task | 2 files |
 
 ## Accumulated Context
 
@@ -90,13 +91,14 @@ Recent decisions affecting current work:
 - v1.3 roadmap: `SCROLLBACK_LINE_CAP = 10_000` is not raised; bounded mpsc for scrollback sender; add `tracing::warn!` as per-session scrollback approaches cap
 - [Phase ?]: plan 19-01 execution
 - [Phase 20]: send_burst() encode_datagram-only drain (R-1 fix, D-20-03); one epoch per tick shared across all burst datagrams (R-2 fix, D-20-04); BURST_CAP=64; both run_session and run_reattach_session burst identically
+- [Phase 21-01]: ChannelOpen/ChannelAccept/ChannelReject/ChannelCredit/ChannelClose variants appended to Message enum (discriminants 10-14) after TerminalControl (9); ChannelReject is opaque (channel_id only, MUX-01); ChannelType enum added (Echo/Scrollback/PortForward/AgentForward); message_discriminant_order_is_stable test pins all 15 discriminants (MUX-06 gating first commit)
 
 ### Pending Todos
 
 - At Phase 19 start: investigation-first — reproduce the garbled-TUI bug on a Linux client↔server before implementing any fix (PITFALLS A-1 mandate); confirm `grapheme_column_width` pub surface in transitive termwiz version
 - At Phase 19 start: decide wire-format strategy for `StateDiff` width field (adding `width: u8` to cell runs is a v1.2-breaking change; treat as milestone-level breaking change or add version field — document decision before coding)
 - At Phase 20 start: write `burst_drains_when_grid_differs_from_acked_baseline` as RED-before test before any burst code touches server.rs
-- At Phase 21 start: `message_discriminant_order_is_stable` is the first commit; confirm `TerminalControl` is currently discriminant 10 (not 9 — the v1.2 ROADMAP says discriminant 9 in some places and 10 in others; verify in `messages.rs` before writing the test)
+- At Phase 21 start: `message_discriminant_order_is_stable` is the first commit; confirm `TerminalControl` is currently discriminant 10 (not 9 — the v1.2 ROADMAP says discriminant 9 in some places and 10 in others; verify in `messages.rs` before writing the test) — RESOLVED: TerminalControl is discriminant 9 (0-based); first mux variant is 10. Test committed at d5f7e76.
 - At Phase 21 start: confirm `datagram_send_buffer_space()` is still public on quinn 0.11.9 at implementation time
 - At Phase 21 start: decide exact who-reopens-TTY-channel-on-reattach contract (suggested: client sends `ChannelOpen { type: Tty }` after `ReattachOk`; server does not proactively re-open)
 - At Phase 22 start: decide keystrokes-while-in-scrollback behaviour: (a) buffer and deliver on return to live, (b) immediately return to live — SUMMARY.md says TBD; decide before client state machine is coded
@@ -131,9 +133,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-11T13:11:40.618Z
-Stopped at: Phase 21 context gathered
-Resume file: .planning/phases/21-channel-multiplexing-foundation/21-CONTEXT.md
+Last session: 2026-06-11T14:02:00Z
+Stopped at: Phase 21 Plan 01 complete
+Resume file: .planning/phases/21-channel-multiplexing-foundation/21-01-SUMMARY.md
 
 ## Operator Next Steps
 
