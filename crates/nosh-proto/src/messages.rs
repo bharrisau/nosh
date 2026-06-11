@@ -9,6 +9,41 @@
 
 use serde::{Deserialize, Serialize};
 
+// ── Phase 22: Scrollback wire payload types ───────────────────────────────────
+
+/// A single cell in a scrollback line, carrying the full cell content including
+/// per-character SGR attributes (S-3: original per-line width metadata retained;
+/// no server-side reflow).
+///
+/// Field types match `nosh_proto::datagram::DiffRun` to enable zero-copy
+/// assembly from `terminal.rs` `Cell` values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrollbackCell {
+    /// Unicode scalar value. `' '` means blank/empty.
+    pub ch: char,
+    /// SGR attributes packed as bitflags. Same type as `DiffRun.style`.
+    pub style: crate::datagram::CellStyle,
+    /// ANSI 256-colour foreground. `None` = terminal default; `Some(n)` = palette index.
+    pub fg: Option<u8>,
+    /// ANSI 256-colour background. `None` = terminal default; `Some(n)` = palette index.
+    pub bg: Option<u8>,
+}
+
+/// One scrollback line: original column width metadata (S-3) plus the cell content.
+///
+/// The `width` field carries the column count at the time the line scrolled into
+/// history (i.e. the terminal width when the line was last visible). The client
+/// may use this to render variable-width lines without server-side reflow.
+///
+/// An empty `cells` vec is valid — it represents a blank line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrollbackLine {
+    /// Terminal column width when this line was live (S-3 original width metadata).
+    pub width: u16,
+    /// Per-cell content. Length ≤ `width` (trailing blank cells may be omitted).
+    pub cells: Vec<ScrollbackCell>,
+}
+
 /// A control/session-protocol message exchanged over a reliable QUIC stream.
 ///
 /// The session lifecycle on the single bidi stream is:
@@ -233,6 +268,72 @@ pub enum Message {
         /// The channel identifier being closed.
         channel_id: u32,
     },
+
+    // ── Phase 22: Scrollback Sync — append-only after ChannelClose (discriminant 14). ─
+    //
+    // These variants are appended AFTER `ChannelClose` (discriminant 14) to
+    // preserve the postcard discriminant order of all existing variants.
+    // Inserting or reordering is NOT backward-compatible. The
+    // discriminant-stability test in codec.rs (message_discriminant_order_is_stable)
+    // enforces this invariant.
+    // APPEND-ONLY from here.
+
+    /// Client → server: request a page of scrollback lines (SCROLL-01).
+    ///
+    /// Travels on the scrollback channel's own data stream (`RecvStream`), NOT the
+    /// control stream — avoids the M-2 control/data flow-control deadlock (Pitfall 7).
+    ///
+    /// `from_line` is indexed from the newest scrollback line backwards:
+    /// 0 = line just above the live viewport.
+    ScrollbackRequest {
+        /// The scrollback channel identifier.
+        channel_id: u32,
+        /// Index of the first line to fetch, from newest backwards.
+        /// 0 = the most recent line (just above the live viewport).
+        from_line: u64,
+        /// Number of lines requested (default page size: 256).
+        count: u32,
+    },
+
+    /// Server → client: a page of scrollback lines (SCROLL-01 / S-5).
+    ///
+    /// Travels on the scrollback channel's `SendStream` (reliable, NEVER via
+    /// `send_datagram` — S-1 type-level enforcement). May have an empty `lines`
+    /// vec if the requested range is past the top of history.
+    ScrollbackPage {
+        /// The scrollback channel identifier.
+        channel_id: u32,
+        /// The index of the first line in this page (same coordinate as
+        /// `ScrollbackRequest.from_line`).
+        from_line: u64,
+        /// Total number of scrollback lines available at snapshot time.
+        /// The client uses this to detect when it has reached the top of history.
+        total_available: u64,
+        /// The datagram epoch at the moment this page was snapshotted (LOCKED — S-5).
+        ///
+        /// The client applies scrollback history up to (not including) this epoch,
+        /// then waits for a live datagram with `epoch >= epoch_at_snapshot` before
+        /// transitioning back to live-grid rendering — ensuring no gap or duplicate
+        /// at the scrollback/live boundary.
+        ///
+        /// Captured atomically with the scrollback lines under the same
+        /// `terminal_state` mutex acquisition (no torn read).
+        epoch_at_snapshot: u64,
+        /// Per-line content in display order (oldest first within the page).
+        /// May be empty (past top of history).
+        lines: Vec<ScrollbackLine>,
+    },
+
+    /// Either direction: grants additional byte-credit on the scrollback channel
+    /// (SCROLL-02 / MUX-03). Byte-granular, consistent with `ChannelCredit`.
+    ///
+    /// Sent on the control stream (not the channel's data stream).
+    ScrollbackCredit {
+        /// The scrollback channel identifier.
+        channel_id: u32,
+        /// Number of additional bytes the send side may transmit.
+        bytes: u64,
+    },
 }
 
 /// Payload for a [`Message::TerminalControl`] frame.
@@ -313,6 +414,10 @@ impl Message {
             Message::ChannelReject { .. } => "ChannelReject",
             Message::ChannelCredit { .. } => "ChannelCredit",
             Message::ChannelClose { .. } => "ChannelClose",
+            // Phase 22 scrollback variants:
+            Message::ScrollbackRequest { .. } => "ScrollbackRequest",
+            Message::ScrollbackPage { .. } => "ScrollbackPage",
+            Message::ScrollbackCredit { .. } => "ScrollbackCredit",
         }
     }
 }

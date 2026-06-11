@@ -294,6 +294,12 @@ mod tests {
             (12, Message::ChannelReject { channel_id: 2 }),
             (13, Message::ChannelCredit { channel_id: 2, bytes: 256 * 1024 }),
             (14, Message::ChannelClose { channel_id: 2 }),
+            // Phase 22: Scrollback Sync — discriminants 15–17 (append-only after ChannelClose):
+            (15, Message::ScrollbackRequest { channel_id: 2, from_line: 0, count: 256 }),
+            (16, Message::ScrollbackPage {
+                channel_id: 2, from_line: 0, total_available: 0,
+                epoch_at_snapshot: 0, lines: vec![] }),
+            (17, Message::ScrollbackCredit { channel_id: 2, bytes: 0 }),
         ];
         for (expected_disc, msg) in cases {
             let encoded = to_allocvec(msg).expect("encode");
@@ -305,11 +311,11 @@ mod tests {
         }
     }
 
-    /// Phase 21 / MUX-06: the five new mux `Message` variants must round-trip
+    /// Phase 21 / MUX-06 + Phase 22: all mux `Message` variants must round-trip
     /// exactly through `write_message` → `read_message` (equality preserved).
     #[tokio::test]
     async fn mux_variants_round_trip() {
-        use crate::messages::ChannelType;
+        use crate::messages::{ChannelType, ScrollbackLine};
 
         let msgs = [
             Message::ChannelOpen { channel_id: 2, channel_type: ChannelType::Echo },
@@ -321,6 +327,18 @@ mod tests {
             Message::ChannelCredit { channel_id: 2, bytes: 256 * 1024 },
             Message::ChannelCredit { channel_id: 2, bytes: 0 },
             Message::ChannelClose { channel_id: 2 },
+            // Phase 22 scrollback variants — discriminants 15–17:
+            Message::ScrollbackRequest { channel_id: 2, from_line: 0, count: 256 },
+            Message::ScrollbackRequest { channel_id: 4, from_line: 100, count: 50 },
+            Message::ScrollbackPage {
+                channel_id: 2, from_line: 0, total_available: 0,
+                epoch_at_snapshot: 0, lines: vec![] },
+            Message::ScrollbackPage {
+                channel_id: 2, from_line: 5, total_available: 42,
+                epoch_at_snapshot: 99,
+                lines: vec![ScrollbackLine { width: 80, cells: vec![] }] },
+            Message::ScrollbackCredit { channel_id: 2, bytes: 0 },
+            Message::ScrollbackCredit { channel_id: 2, bytes: 256 * 1024 },
         ];
         for msg in msgs {
             let mut buf: Vec<u8> = Vec::new();

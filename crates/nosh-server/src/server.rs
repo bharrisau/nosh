@@ -1182,6 +1182,22 @@ async fn run_session(
                         break SessionEnd::ClientClosed;
                     }
 
+                    // Phase 22 scrollback variants:
+                    // ScrollbackRequest travels on the scrollback channel's own
+                    // RecvStream (not the control stream). Receiving it on the control
+                    // stream is a protocol error — the channel task reads it from ch_recv.
+                    // ScrollbackPage and ScrollbackCredit are handled in channel tasks.
+                    // Until Phase 22-02 wires the scrollback channel task, treat any
+                    // of these on the control stream as a logged no-op (not a session close).
+                    Ok(Message::ScrollbackRequest { channel_id, .. })
+                    | Ok(Message::ScrollbackPage { channel_id, .. })
+                    | Ok(Message::ScrollbackCredit { channel_id, .. }) => {
+                        tracing::debug!(
+                            channel_id,
+                            "Phase-22 scrollback frame on control stream; ignoring (Phase 22-02 wires handler)"
+                        );
+                    }
+
                     Err(_) => {
                         // Stream/connection closed without a SessionClose → transport loss.
                         // D-02: this is NOT a clean close; orphan the session (Pitfall #7).
