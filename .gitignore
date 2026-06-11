@@ -1,1 +1,6 @@
 /target
+
+# Local test key material (generated for dev/integration runs)
+/host_key
+/host_key.pub
+/authorized_keys
