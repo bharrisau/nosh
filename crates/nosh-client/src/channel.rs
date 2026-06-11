@@ -203,4 +203,64 @@ mod tests {
             "replenish chunk should be half the initial window"
         );
     }
+
+    // ── run_scrollback_drain_task structural tests ───────────────────────────
+    //
+    // These tests verify:
+    // (1) The function exists with the correct signature (compile-time check via
+    //     function-pointer coercion).
+    // (2) ScrollbackPage and ScrollbackCredit round-trip correctly through the
+    //     codec used by the drain task.
+    //
+    // Full end-to-end delivery is tested in the channel_mux integration tests
+    // where real QUIC connections are available.
+
+    /// Verify run_scrollback_drain_task exports exist (compile-time check).
+    ///
+    /// References the not-yet-existing function so the crate fails to compile
+    /// in RED state. Once the function exists the test is a trivial pass.
+    ///
+    /// We can't coerce an async fn to a plain fn pointer, so we use `std::mem::size_of_val`
+    /// on the fn item reference to force name resolution.
+    #[test]
+    fn scrollback_drain_task_is_accessible() {
+        // std::mem::size_of_val(&f) forces the compiler to resolve the name and
+        // size the fn item, which requires the function to exist.  Works for
+        // async fn and generic fn alike.
+        let _ = std::mem::size_of_val(&run_scrollback_drain_task);
+    }
+
+    /// Verify ScrollbackPage encode/decode round-trip (the message type decoded
+    /// by the drain task from ch_recv and forwarded on page_tx).
+    #[tokio::test]
+    async fn scrollback_page_round_trips_via_codec() {
+        use nosh_proto::{Message, messages::ScrollbackLine};
+
+        let original = Message::ScrollbackPage {
+            channel_id: 4,
+            from_line: 0,
+            total_available: 100,
+            epoch_at_snapshot: 42,
+            lines: vec![ScrollbackLine { width: 80, cells: vec![] }],
+        };
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        nosh_proto::write_message(&mut buf, &original).await.expect("write");
+        buf.set_position(0);
+        let decoded = nosh_proto::read_message(&mut buf).await.expect("read");
+        assert_eq!(original, decoded, "ScrollbackPage must round-trip via codec");
+    }
+
+    /// Verify ScrollbackCredit encode/decode (sent by the drain task via
+    /// control_tx when drained_since_replenish >= CREDIT_REPLENISH_CHUNK).
+    #[tokio::test]
+    async fn scrollback_credit_round_trips_via_codec() {
+        use nosh_proto::Message;
+
+        let credit = Message::ScrollbackCredit { channel_id: 2, bytes: CREDIT_REPLENISH_CHUNK };
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        nosh_proto::write_message(&mut buf, &credit).await.expect("write");
+        buf.set_position(0);
+        let decoded = nosh_proto::read_message(&mut buf).await.expect("read");
+        assert_eq!(credit, decoded, "ScrollbackCredit must round-trip via codec");
+    }
 }
