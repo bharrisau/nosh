@@ -353,6 +353,118 @@ mod escape_tests {
     }
 }
 
+// ── ScrollbackView state machine tests (TDD RED gate) ────────────────────────
+//
+// These tests establish the RED gate for Task 2a. They reference `ScrollbackView`
+// and `CsiAccumulator` which don't exist yet, causing compile errors in RED state.
+// Once implemented (GREEN), all tests pass.
+
+#[cfg(test)]
+mod scrollback_view_tests {
+    use super::{ScrollbackView, CsiAccumulator};
+
+    // CSI sequence byte values
+    const ESC: u8 = 0x1b;
+    const LBRACKET: u8 = 0x5b;
+    const SHIFT_PGUP: &[u8] = &[0x1b, 0x5b, 0x35, 0x3b, 0x32, 0x7e]; // ESC [ 5 ; 2 ~
+    const SHIFT_PGDN: &[u8] = &[0x1b, 0x5b, 0x36, 0x3b, 0x32, 0x7e]; // ESC [ 6 ; 2 ~
+    const _ = (ESC, LBRACKET); // suppress unused warnings
+
+    /// ScrollbackView starts in Live mode.
+    #[test]
+    fn scrollback_view_starts_live() {
+        let view = ScrollbackView::Live;
+        assert!(matches!(view, ScrollbackView::Live),
+            "ScrollbackView must start as Live");
+    }
+
+    /// ScrollbackView Active variant carries epoch_at_snapshot.
+    #[test]
+    fn scrollback_view_active_has_epoch_at_snapshot() {
+        let view = ScrollbackView::Active {
+            lines: vec![],
+            offset: 0,
+            pending_request: false,
+            epoch_at_snapshot: 42,
+            total_available: 0,
+        };
+        match view {
+            ScrollbackView::Active { epoch_at_snapshot, .. } => {
+                assert_eq!(epoch_at_snapshot, 42);
+            }
+            ScrollbackView::Live => panic!("expected Active"),
+        }
+    }
+
+    /// CsiAccumulator detects Shift-PageUp across a single read.
+    #[test]
+    fn csi_accumulator_detects_shift_pageup_single_read() {
+        let mut acc = CsiAccumulator::new();
+        let result = acc.process(SHIFT_PGUP);
+        assert!(result.shift_pageup, "Shift-PageUp sequence must be detected");
+        assert!(!result.shift_pagedown, "only Shift-PageUp must be signalled");
+    }
+
+    /// CsiAccumulator detects Shift-PageDown across a single read.
+    #[test]
+    fn csi_accumulator_detects_shift_pagedown_single_read() {
+        let mut acc = CsiAccumulator::new();
+        let result = acc.process(SHIFT_PGDN);
+        assert!(result.shift_pagedown, "Shift-PageDown sequence must be detected");
+        assert!(!result.shift_pageup, "only Shift-PageDown must be signalled");
+    }
+
+    /// CsiAccumulator handles split reads (Pitfall 6 / T-22-11).
+    /// The 6-byte Shift-PageUp sequence is split 3+3 across two reads.
+    #[test]
+    fn csi_accumulator_detects_shift_pageup_split_read() {
+        let mut acc = CsiAccumulator::new();
+        // First 3 bytes: ESC [ 5
+        let r1 = acc.process(&SHIFT_PGUP[..3]);
+        assert!(!r1.shift_pageup, "partial sequence must not trigger yet");
+        // Remaining 3 bytes: ; 2 ~
+        let r2 = acc.process(&SHIFT_PGUP[3..]);
+        assert!(r2.shift_pageup, "split Shift-PageUp must be detected across reads");
+    }
+
+    /// CsiAccumulator handles split reads for Shift-PageDown.
+    #[test]
+    fn csi_accumulator_detects_shift_pagedown_split_read() {
+        let mut acc = CsiAccumulator::new();
+        let r1 = acc.process(&SHIFT_PGDN[..4]); // ESC [ 6 ;
+        assert!(!r1.shift_pagedown, "partial sequence must not trigger yet");
+        let r2 = acc.process(&SHIFT_PGDN[4..]); // 2 ~
+        assert!(r2.shift_pagedown, "split Shift-PageDown must be detected");
+    }
+
+    /// Non-paging bytes while accumulating a partial CSI sequence are returned
+    /// as remainder bytes to forward to the shell.
+    #[test]
+    fn csi_accumulator_non_paging_byte_resets_and_returns() {
+        let mut acc = CsiAccumulator::new();
+        // Start a potential Shift-PageUp then send a different byte.
+        let r = acc.process(&[0x1b, 0x5b, 0x41]); // ESC [ A (cursor up)
+        assert!(!r.shift_pageup, "ESC [ A must not trigger Shift-PageUp");
+        assert!(!r.shift_pagedown, "ESC [ A must not trigger Shift-PageDown");
+        // The bytes ESC [ A that don't match a paging sequence should be returned
+        // as non_paging_remainder so run_pump can forward them.
+        assert!(
+            !r.non_paging_remainder.is_empty(),
+            "non-paging bytes must be returned for forwarding"
+        );
+    }
+
+    /// CsiAccumulator does not swallow regular keystrokes.
+    #[test]
+    fn csi_accumulator_passes_regular_keystrokes_through() {
+        let mut acc = CsiAccumulator::new();
+        let r = acc.process(b"hello");
+        assert!(!r.shift_pageup);
+        assert!(!r.shift_pagedown);
+        assert_eq!(r.non_paging_remainder, b"hello");
+    }
+}
+
 /// nosh client (Phase 3 — interactive PTY session over authenticated QUIC).
 #[derive(Parser, Debug)]
 #[command(
