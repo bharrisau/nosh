@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
-status: ready_to_plan
-stopped_at: Phase 20 complete (2/2) — ready to discuss Phase 21
-last_updated: 2026-06-11T12:12:58.010Z
-last_activity: 2026-06-11 -- Phase 20 execution started
+status: planning
+stopped_at: Phase 21 context gathered
+last_updated: "2026-06-11T13:11:40.633Z"
+last_activity: 2026-06-11
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 7
-  completed_plans: 18
+  completed_plans: 7
   percent: 50
 ---
 
@@ -131,9 +131,9 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-11T11:40:57.023Z
-Stopped at: Phase 20 context gathered
-Resume file: .planning/phases/20-repaint-pacing/20-CONTEXT.md
+Last session: 2026-06-11T13:11:40.618Z
+Stopped at: Phase 21 context gathered
+Resume file: .planning/phases/21-channel-multiplexing-foundation/21-CONTEXT.md
 
 ## Operator Next Steps
 
