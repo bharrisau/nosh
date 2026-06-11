@@ -29,13 +29,17 @@ Out of scope this phase (declared but REJECTed by the mux): port forwarding
 <decisions>
 ## Implementation Decisions
 
-### Channel-id allocation (MUX-04) — Client-odd / server-even
-Each side owns a disjoint id space, mirroring SSH and HTTP/2: client-initiated
-channels use odd ids, server-initiated channels use even ids. No open-time
-arbitration round-trip; simultaneous opens from both ends cannot collide.
-Channel id 0 is reserved for the control channel (the existing session control
-stream — OPEN/ACCEPT/REJECT are new appended `Message` variants on it, NOT a new
-stream).
+### Channel-id allocation (MUX-04) — disjoint parity spaces (client-even / server-odd)
+Each side owns a disjoint id space so simultaneous opens from both ends cannot
+collide; no open-time arbitration round-trip is needed. **Direction is fixed by
+ROADMAP success criterion #2: client-initiated channels use EVEN ids,
+server-initiated channels use ODD ids.** (The discussion question proposed the
+HTTP/2 direction — client-odd/server-even — but the ROADMAP is the authoritative
+contract and its success criteria are what verification checks; the direction is
+functionally arbitrary for collision-avoidance, so we align to the locked
+ROADMAP rather than introduce a conflicting input.) Channel id 0 is reserved for
+the control channel (the existing session control stream — OPEN/ACCEPT/REJECT are
+new appended `Message` variants on it, NOT a new stream).
 
 ### Stream binding (MUX-02) — Channel-id varint prefix on the new stream
 After the control-channel handshake (OPEN → ACCEPT), the opener writes the
