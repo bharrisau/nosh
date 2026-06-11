@@ -11,6 +11,7 @@
 //! (PTY stays open, no SIGHUP — Pitfall #7 / D-02) while an explicit
 //! `SessionClose` or normal shell exit tears down immediately (D-01).
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -22,15 +23,23 @@ use bytes::Bytes;
 use nosh_auth::{AuthorizedKeysVerifier, NoshServerCertResolver};
 use rustls::pki_types::CertificateDer;
 use nosh_proto::{Message, TerminalControlPayload};
+use nosh_proto::messages::ChannelType;
 use nosh_proto::datagram::{
     encode_datagram, decode_epoch_ack, StateDiff, DiffRun, CursorPos, MIN_CAP, MAX_RUNS,
 };
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use tokio::sync::mpsc;
 
+use crate::channel::{ChannelEvent, run_channel_task};
 use crate::registry::SessionRegistry;
 use crate::session;
 use crate::terminal::Cell;
+
+/// Maximum number of simultaneously open channels per session (T-21-04 / DoS bound).
+///
+/// At this limit a new `ChannelOpen` from the client is unconditionally rejected
+/// (opaque `ChannelReject`) — no session state is allocated for the rejected channel.
+const MAX_OPEN_CHANNELS: usize = 64;
 
 /// Pre-auth DoS limits for the accept loop (decision D-13 / FOOTGUN-3).
 #[derive(Clone, Copy, Debug)]
@@ -740,6 +749,20 @@ async fn run_session(
     // the new last_acked_snapshot (not the current grid, which may have advanced).
     let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
+    // Phase 21 (MUX-01..MUX-04): per-session channel infrastructure.
+    //
+    // channel_map: maps open channel ids → the mpsc sender that delivers events to
+    // the per-channel task (ChannelEvent::Stream / Credit / Close). Only channel
+    // tasks that have been accepted are present; tasks remove themselves via
+    // ChannelEvent::Close flowing back through control_tx → control_rx.
+    //
+    // control_tx / control_rx: the SINGLE writer path for outbound control-stream
+    // frames produced by channel tasks (ChannelClose, ChannelCredit). Channel tasks
+    // MUST NOT call write_message on the control SendStream directly (A4 / Pitfall M-6).
+    // The session pump drains control_rx and writes to `send` — the sole owner.
+    let mut channel_map: HashMap<u32, mpsc::Sender<ChannelEvent>> = HashMap::new();
+    let (channel_ctrl_tx, mut channel_ctrl_rx) = mpsc::channel::<Message>(64);
+
     let session_end: SessionEnd = loop {
         tokio::select! {
             // Shell exited: capture the code and tell the client.
@@ -933,11 +956,224 @@ async fn run_session(
                         // treat as protocol error.
                         break SessionEnd::ClientClosed;
                     }
+
+                    // Phase 21 (MUX-01..MUX-04): channel multiplexing dispatch.
+
+                    Ok(Message::ChannelOpen { channel_id, channel_type }) => {
+                        // Client-initiated channels must have even ids (parity rule,
+                        // MUX-04 / 21-CONTEXT.md). Odd ids are in the server's parity
+                        // space; receiving one from the client is a protocol violation —
+                        // log and ignore rather than closing the session (Pitfall M-4;
+                        // non-fatal so the client can continue the session).
+                        if channel_id % 2 != 0 {
+                            tracing::warn!(
+                                channel_id,
+                                "client sent ChannelOpen with odd channel_id (server parity); ignoring"
+                            );
+                            continue;
+                        }
+                        // Duplicate open: reject opaquely (T-21-09, MUX-01).
+                        if channel_map.contains_key(&channel_id) {
+                            tracing::warn!(channel_id, "duplicate ChannelOpen; rejecting");
+                            let _ = nosh_proto::write_message(
+                                &mut send,
+                                &Message::ChannelReject { channel_id },
+                            )
+                            .await;
+                            continue;
+                        }
+                        // DoS cap: limit simultaneous open channels (T-21-04).
+                        if channel_map.len() >= MAX_OPEN_CHANNELS {
+                            tracing::warn!(
+                                channel_id,
+                                max = MAX_OPEN_CHANNELS,
+                                "channel cap reached; rejecting ChannelOpen"
+                            );
+                            let _ = nosh_proto::write_message(
+                                &mut send,
+                                &Message::ChannelReject { channel_id },
+                            )
+                            .await;
+                            continue;
+                        }
+                        // Validate channel type: only Echo is accepted (test-only builds
+                        // only); PortForward and AgentForward are unconditionally rejected
+                        // (FWD-01 / FWD-02 / T-21-08); Scrollback deferred to Phase 22.
+                        let accept = match channel_type {
+                            ChannelType::PortForward | ChannelType::AgentForward => {
+                                // Always rejected: SSH_AUTH_SOCK never reachable (T-21-08).
+                                tracing::debug!(
+                                    channel_id,
+                                    "ChannelOpen for forwarding type; rejecting (FWD-01/FWD-02)"
+                                );
+                                false
+                            }
+                            ChannelType::Scrollback => {
+                                // Phase 22 consumer — not yet handled.
+                                tracing::debug!(
+                                    channel_id,
+                                    "ChannelOpen for Scrollback; rejecting (Phase 22)"
+                                );
+                                false
+                            }
+                            ChannelType::Echo => {
+                                // Echo is the test-only proving fixture (21-CONTEXT.md).
+                                // Accepted only in test builds; rejected in production.
+                                #[cfg(test)]
+                                { true }
+                                #[cfg(not(test))]
+                                {
+                                    tracing::debug!(
+                                        channel_id,
+                                        "ChannelOpen for Echo (test-only type); rejecting in production"
+                                    );
+                                    false
+                                }
+                            }
+                        };
+
+                        if !accept {
+                            let _ = nosh_proto::write_message(
+                                &mut send,
+                                &Message::ChannelReject { channel_id },
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        // Send accept then spawn the per-channel task (MUX-02).
+                        // NEVER do channel data I/O inline (Pitfall M-2 HOL blocking).
+                        if nosh_proto::write_message(
+                            &mut send,
+                            &Message::ChannelAccept { channel_id },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break SessionEnd::TransportLost;
+                        }
+                        let (task_tx, task_rx) = mpsc::channel::<ChannelEvent>(64);
+                        channel_map.insert(channel_id, task_tx);
+                        tokio::spawn(run_channel_task(
+                            channel_id,
+                            task_rx,
+                            channel_ctrl_tx.clone(),
+                        ));
+                        tracing::debug!(channel_id, "channel accepted; task spawned");
+                    }
+
+                    Ok(Message::ChannelCredit { channel_id, bytes }) => {
+                        // Replenish send credit for the channel task (MUX-03).
+                        // Unknown id is a logged no-op — never panic (Pitfall M-4 / T-21-07).
+                        if let Some(task_tx) = channel_map.get(&channel_id) {
+                            let _ = task_tx.try_send(ChannelEvent::Credit(bytes));
+                        } else {
+                            tracing::debug!(channel_id, "ChannelCredit for unknown channel; ignoring");
+                        }
+                    }
+
+                    Ok(Message::ChannelClose { channel_id }) => {
+                        // Client is closing its side of the channel (MUX-04).
+                        // Signal the task and remove from the map.
+                        // Unknown id is a logged no-op — never panic (Pitfall M-4 / T-21-07).
+                        if let Some(task_tx) = channel_map.remove(&channel_id) {
+                            let _ = task_tx.try_send(ChannelEvent::Close);
+                        } else {
+                            tracing::debug!(channel_id, "ChannelClose for unknown channel; ignoring");
+                        }
+                    }
+
+                    Ok(Message::ChannelAccept { channel_id })
+                    | Ok(Message::ChannelReject { channel_id }) => {
+                        // ChannelAccept and ChannelReject are server→client direction.
+                        // Receiving them from the client is a protocol error (production path).
+                        // Under #[cfg(test)], an odd-id reply is the valid client response to
+                        // a server-initiated ChannelOpen (Task 3 server-open path). Handle it
+                        // as a no-op here (the channel task is already spawned and running);
+                        // Task 3 extends this arm with Reject → map removal.
+                        #[cfg(test)]
+                        if channel_id % 2 != 0 {
+                            // Valid reply to a server-initiated open (odd id).
+                            // Accept: channel stays alive (task already running).
+                            // Reject: channel stays in map until the task closes itself.
+                            // Task 3 will add map removal on Reject specifically.
+                            tracing::debug!(
+                                channel_id,
+                                "received ChannelAccept/Reject for server-initiated (odd) channel; continuing"
+                            );
+                            continue;
+                        }
+                        // Production path (or even-id): protocol error.
+                        tracing::warn!(
+                            channel_id,
+                            "client sent ChannelAccept/ChannelReject (server→client only); closing"
+                        );
+                        break SessionEnd::ClientClosed;
+                    }
+
                     Err(_) => {
                         // Stream/connection closed without a SessionClose → transport loss.
                         // D-02: this is NOT a clean close; orphan the session (Pitfall #7).
                         break SessionEnd::TransportLost;
                     }
+                }
+            }
+
+            // Phase 21 (MUX-02): secondary accept_bi arm — binds incoming QUIC bidi
+            // streams to their channel task by reading the channel-id varint prefix.
+            //
+            // This arm exists ONLY inside run_session/run_reattach_session, i.e. AFTER
+            // the pre-auth permit has been dropped. It MUST NOT appear in run_accept_loop
+            // (Pitfall M-1 auth bypass / T-21-03).
+            incoming_stream = conn.accept_bi() => {
+                match incoming_stream {
+                    Ok((ch_send, mut ch_recv)) => {
+                        // Read only the varint channel-id prefix — no channel payload
+                        // is ever consumed here (Pitfall M-2 HOL blocking prevention).
+                        match crate::channel::read_varint_u32(&mut ch_recv).await {
+                            Ok(channel_id) => {
+                                if let Some(task_tx) = channel_map.get(&channel_id) {
+                                    let _ = task_tx
+                                        .try_send(ChannelEvent::Stream(ch_send, ch_recv));
+                                } else {
+                                    // Stream arrived before ACCEPT was processed, or channel
+                                    // was already closed. Drop the stream; log at debug level.
+                                    tracing::debug!(
+                                        channel_id,
+                                        "accept_bi: no channel task for id; dropping stream"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                // Malformed varint: drop the stream without panicking (T-21-06 / V5).
+                                tracing::warn!("accept_bi: malformed channel-id varint; dropping stream");
+                            }
+                        }
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(_))
+                    | Err(quinn::ConnectionError::LocallyClosed) => {
+                        break SessionEnd::TransportLost;
+                    }
+                    Err(_) => {
+                        // Transient error: continue the loop.
+                    }
+                }
+            }
+
+            // Phase 21 (A4): drain outbound control frames from channel tasks.
+            //
+            // Channel tasks send ChannelClose and ChannelCredit back here via
+            // channel_ctrl_tx. This is the SINGLE writer for the control stream —
+            // channel tasks MUST NOT call write_message directly (Pitfall M-6).
+            Some(ctrl_msg) = channel_ctrl_rx.recv() => {
+                // On ChannelClose from a task, remove it from the map.
+                if let Message::ChannelClose { channel_id } = &ctrl_msg {
+                    channel_map.remove(channel_id);
+                    tracing::debug!(channel_id, "channel task closed; removed from map");
+                }
+                // Write the control frame to the client.
+                if nosh_proto::write_message(&mut send, &ctrl_msg).await.is_err() {
+                    break SessionEnd::TransportLost;
                 }
             }
         }
@@ -1261,6 +1497,12 @@ async fn run_reattach_session(
     // CR-01 fix: bounded per-epoch sent-snapshot store (same as run_session).
     let mut epoch_snapshots: VecDeque<(u64, Vec<Vec<Cell>>)> = VecDeque::new();
 
+    // Phase 21 (MUX-01..MUX-04): per-session channel infrastructure (same as
+    // run_session). Channel state is empty on reattach — the client must re-open
+    // any channels it wants after receiving ReattachOk (MUX-05 / Pitfall M-4).
+    let mut channel_map: HashMap<u32, mpsc::Sender<ChannelEvent>> = HashMap::new();
+    let (channel_ctrl_tx, mut channel_ctrl_rx) = mpsc::channel::<Message>(64);
+
     let session_end: SessionEnd = loop {
         tokio::select! {
             chunk = out_rx.recv() => {
@@ -1403,10 +1645,136 @@ async fn run_reattach_session(
                         slot.touch();
                         slot.trim_acked(seq);
                     }
-                    Ok(_) => {} // ignore unexpected frames
+
+                    // Phase 21 (MUX-01..MUX-04): channel multiplexing dispatch.
+                    // Same rules as run_session: client-even ids, no odd ids from client,
+                    // MAX_OPEN_CHANNELS cap, PortForward/AgentForward rejected, Echo
+                    // test-only, Scrollback Phase 22.
+
+                    Ok(Message::ChannelOpen { channel_id, channel_type }) => {
+                        if channel_id % 2 != 0 {
+                            tracing::warn!(
+                                channel_id,
+                                "client sent ChannelOpen with odd channel_id on reattach; ignoring"
+                            );
+                            continue;
+                        }
+                        if channel_map.contains_key(&channel_id) {
+                            let _ = nosh_proto::write_message(
+                                &mut send,
+                                &Message::ChannelReject { channel_id },
+                            )
+                            .await;
+                            continue;
+                        }
+                        if channel_map.len() >= MAX_OPEN_CHANNELS {
+                            let _ = nosh_proto::write_message(
+                                &mut send,
+                                &Message::ChannelReject { channel_id },
+                            )
+                            .await;
+                            continue;
+                        }
+                        let accept = match channel_type {
+                            ChannelType::PortForward | ChannelType::AgentForward => false,
+                            ChannelType::Scrollback => false,
+                            ChannelType::Echo => {
+                                #[cfg(test)] { true }
+                                #[cfg(not(test))] { false }
+                            }
+                        };
+                        if !accept {
+                            let _ = nosh_proto::write_message(
+                                &mut send,
+                                &Message::ChannelReject { channel_id },
+                            )
+                            .await;
+                            continue;
+                        }
+                        if nosh_proto::write_message(
+                            &mut send,
+                            &Message::ChannelAccept { channel_id },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break SessionEnd::TransportLost;
+                        }
+                        let (task_tx, task_rx) = mpsc::channel::<ChannelEvent>(64);
+                        channel_map.insert(channel_id, task_tx);
+                        tokio::spawn(run_channel_task(
+                            channel_id,
+                            task_rx,
+                            channel_ctrl_tx.clone(),
+                        ));
+                    }
+
+                    Ok(Message::ChannelCredit { channel_id, bytes }) => {
+                        if let Some(task_tx) = channel_map.get(&channel_id) {
+                            let _ = task_tx.try_send(ChannelEvent::Credit(bytes));
+                        }
+                        // Unknown id: no-op (T-21-07 / Pitfall M-4).
+                    }
+
+                    Ok(Message::ChannelClose { channel_id }) => {
+                        if let Some(task_tx) = channel_map.remove(&channel_id) {
+                            let _ = task_tx.try_send(ChannelEvent::Close);
+                        }
+                        // Unknown id: no-op (T-21-07 / Pitfall M-4).
+                    }
+
+                    Ok(Message::ChannelAccept { .. }) | Ok(Message::ChannelReject { .. }) => {
+                        // Server→client direction; receiving from the client is a protocol error.
+                        tracing::warn!("client sent ChannelAccept/ChannelReject on reattach session; closing");
+                        break SessionEnd::ClientClosed;
+                    }
+
+                    Ok(_) => {} // ignore any other unexpected frames
                     Err(_) => {
                         break SessionEnd::TransportLost;
                     }
+                }
+            }
+
+            // Phase 21 (MUX-02): secondary accept_bi arm — same as run_session.
+            // Exists ONLY inside run_reattach_session (post-auth — T-21-03 / Pitfall M-1).
+            incoming_stream = conn.accept_bi() => {
+                match incoming_stream {
+                    Ok((ch_send, mut ch_recv)) => {
+                        match crate::channel::read_varint_u32(&mut ch_recv).await {
+                            Ok(channel_id) => {
+                                if let Some(task_tx) = channel_map.get(&channel_id) {
+                                    let _ = task_tx
+                                        .try_send(ChannelEvent::Stream(ch_send, ch_recv));
+                                } else {
+                                    tracing::debug!(
+                                        channel_id,
+                                        "accept_bi (reattach): no channel task for id; dropping stream"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "accept_bi (reattach): malformed channel-id varint; dropping stream"
+                                );
+                            }
+                        }
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(_))
+                    | Err(quinn::ConnectionError::LocallyClosed) => {
+                        break SessionEnd::TransportLost;
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            // Phase 21 (A4): drain outbound control frames from channel tasks (same as run_session).
+            Some(ctrl_msg) = channel_ctrl_rx.recv() => {
+                if let Message::ChannelClose { channel_id } = &ctrl_msg {
+                    channel_map.remove(channel_id);
+                }
+                if nosh_proto::write_message(&mut send, &ctrl_msg).await.is_err() {
+                    break SessionEnd::TransportLost;
                 }
             }
         }
