@@ -221,7 +221,14 @@ impl ClientScreen {
     pub fn apply(&mut self, diff: &StateDiff) {
         // D-14-05 / D-20-07: discard strictly older diffs only.
         // Same-epoch burst datagrams (all datagrams in one tick share one epoch) MUST apply.
-        if diff.epoch < self.last_applied_epoch {
+        //
+        // Defence-in-depth: epoch=0 is never sent by a legitimate server
+        // (build_state_diff starts epochs at 1 via `*current_epoch += 1`).
+        // Reject it unconditionally so a spoofed or malformed epoch=0 datagram
+        // cannot overwrite the confirmed grid before any legitimate datagram
+        // has arrived (when last_applied_epoch is still 0, `0 < 0` is false
+        // and would otherwise let it through).
+        if diff.epoch == 0 || diff.epoch < self.last_applied_epoch {
             return;
         }
 
