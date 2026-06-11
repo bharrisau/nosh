@@ -30,12 +30,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
+use nosh_client::channel::{EvenIdAllocator, run_scrollback_drain_task};
 use nosh_client::client::{self, ClientIdentity, ReattachOutcome};
 use nosh_client::platform;
 use nosh_client::predictor::{PredictDisplayMode, PredictionOverlay};
 use nosh_client::screen::ConnectionLossOverlay;
 use nosh_proto::{Message, TerminalControlPayload};
+use nosh_proto::messages::ChannelType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 /// SIGWINCH / console-resize debounce window (~40 ms) — coalesces a window-drag
 /// burst into one `Resize` (SESS-05, avoids resize storms). Preserved on both
@@ -130,6 +133,166 @@ async fn quit_during_backoff(stdin: &mut tokio::io::Stdin) {
             }
         }
     }
+}
+
+// ── Scrollback view state machine ─────────────────────────────────────────────
+//
+// The client-side scrollback view has two modes:
+//
+//   Live    — normal operation; datagram diffs apply and display normally.
+//   Active  — scrollback mode; live datagram diffs are display-suspended (but
+//              their epochs are still acked so the server pump never stalls).
+//              Historical lines from the server are rendered using a local
+//              line buffer + offset.
+//
+// Transitions:
+//   Live → Active:    Shift-PageUp CSI sequence detected in stdin bytes.
+//   Active → Live:    (a) Any non-paging keystroke: snap back AND forward
+//                         the triggering byte to the shell (T-22-15 LOCKED).
+//                     (b) Paging down past line 0 (live boundary) auto-exits.
+//                     (c) Live datagram with epoch >= epoch_at_snapshot arrives
+//                         (SCROLL-05 epoch gate implemented in Task 2b).
+
+/// Client-side scrollback view state (SCROLL-04 / SCROLL-05).
+///
+/// `Live` is the default and is freshly initialised at the start of every
+/// `run_pump` call (including the reattach path), so no residual `Active`
+/// state from a prior connection can leak across reattach (T-22-13).
+#[derive(Debug)]
+pub enum ScrollbackView {
+    /// Normal live mode: datagram diffs apply and display normally.
+    Live,
+    /// Scrollback mode: historical lines are being displayed.
+    Active {
+        /// Fetched historical lines in display order (oldest first).
+        /// Lazily prefetched: grows as the user pages up.
+        lines: Vec<nosh_proto::messages::ScrollbackLine>,
+        /// How many lines from the bottom of `lines` are scrolled off the
+        /// bottom of the visible viewport. 0 = showing the most-recent lines.
+        offset: usize,
+        /// True while a `ScrollbackRequest` is in-flight to the server.
+        /// Prevents duplicate requests (lazy-prefetch gate).
+        pending_request: bool,
+        /// Datagram epoch at the time the scrollback snapshot was taken.
+        /// The client exits `Active` when a live datagram with
+        /// `epoch >= epoch_at_snapshot` arrives (SCROLL-05).
+        epoch_at_snapshot: u64,
+        /// Total scrollback lines available on the server at snapshot time.
+        /// Used to detect when the client has reached the top of history
+        /// (all lines fetched; further page-up is a no-op).
+        total_available: u64,
+    },
+}
+
+// ── CSI sequence accumulator ──────────────────────────────────────────────────
+//
+// The Shift-PageUp/Down sequences are 6 bytes:
+//   Shift-PageUp:   ESC [ 5 ; 2 ~  = [0x1b, 0x5b, 0x35, 0x3b, 0x32, 0x7e]
+//   Shift-PageDown: ESC [ 6 ; 2 ~  = [0x1b, 0x5b, 0x36, 0x3b, 0x32, 0x7e]
+//
+// Because the OS pipe buffer may deliver these as split reads (Pitfall 6 /
+// T-22-11), we maintain a rolling 8-byte accumulator. On each stdin read we
+// append to the accumulator and scan for the 6-byte sequences. Once matched,
+// the matched bytes are consumed from the accumulator. Bytes that are neither
+// part of a paging sequence prefix nor already matched are returned as
+// `non_paging_remainder` so run_pump can forward them via EscapeState.
+//
+// This is a stateful prefix-match: partial sequences are held in the
+// accumulator across reads until either the sequence completes or a byte
+// that cannot possibly be part of either paging sequence is received.
+
+/// Bytes of the Shift-PageUp CSI sequence.
+const CSI_SHIFT_PAGEUP: [u8; 6] = [0x1b, 0x5b, 0x35, 0x3b, 0x32, 0x7e];
+/// Bytes of the Shift-PageDown CSI sequence.
+const CSI_SHIFT_PAGEDOWN: [u8; 6] = [0x1b, 0x5b, 0x36, 0x3b, 0x32, 0x7e];
+
+/// Result from one `CsiAccumulator::process` call.
+#[derive(Debug, Default)]
+pub struct CsiResult {
+    /// True if a Shift-PageUp sequence was completed this call.
+    pub shift_pageup: bool,
+    /// True if a Shift-PageDown sequence was completed this call.
+    pub shift_pagedown: bool,
+    /// Bytes from `input` that were NOT consumed by paging sequences.
+    /// `run_pump` forwards these through `EscapeState` and then to the shell.
+    pub non_paging_remainder: Vec<u8>,
+}
+
+/// Rolling 8-byte accumulator for Shift-PageUp/Down CSI sequence detection.
+///
+/// Handles split reads (Pitfall 6 / T-22-11): the 6-byte sequence may arrive
+/// as multiple smaller stdin reads. The accumulator holds up to 8 pending
+/// bytes so a maximum-split sequence (6 × 1-byte reads) never loses bytes.
+pub struct CsiAccumulator {
+    /// Pending bytes that form the current partial CSI prefix.
+    pending: Vec<u8>,
+}
+
+impl CsiAccumulator {
+    /// Create a new accumulator with no pending bytes.
+    pub fn new() -> Self {
+        CsiAccumulator { pending: Vec::with_capacity(8) }
+    }
+
+    /// Process `input` bytes against the CSI paging sequences.
+    ///
+    /// Returns a [`CsiResult`] describing any paging sequences detected and
+    /// any non-paging bytes to forward. May be called with an empty slice.
+    ///
+    /// # Split-read safety (Pitfall 6 / T-22-11)
+    ///
+    /// Bytes that form a partial prefix of either sequence are held in
+    /// `self.pending` and combined with bytes from the next `process` call.
+    /// At most 8 bytes are ever held (the sequences are 6 bytes each).
+    pub fn process(&mut self, input: &[u8]) -> CsiResult {
+        let mut result = CsiResult::default();
+
+        // Append the new bytes to any partial match pending from previous reads.
+        self.pending.extend_from_slice(input);
+
+        let mut i = 0;
+        while i < self.pending.len() {
+            let remaining = &self.pending[i..];
+
+            if remaining.len() >= 6 && remaining[..6] == CSI_SHIFT_PAGEUP {
+                // Full Shift-PageUp match — consume 6 bytes.
+                result.shift_pageup = true;
+                i += 6;
+            } else if remaining.len() >= 6 && remaining[..6] == CSI_SHIFT_PAGEDOWN {
+                // Full Shift-PageDown match — consume 6 bytes.
+                result.shift_pagedown = true;
+                i += 6;
+            } else if is_paging_prefix(remaining) {
+                // `remaining` is a proper prefix of a paging sequence (< 6 bytes
+                // that match the start of CSI_SHIFT_PAGEUP or CSI_SHIFT_PAGEDOWN).
+                // Hold these bytes for the next call (split-read path).
+                break;
+            } else {
+                // First byte cannot start or continue a paging sequence.
+                // Return it as a non-paging byte to forward.
+                result.non_paging_remainder.push(self.pending[i]);
+                i += 1;
+            }
+        }
+
+        // Retain only unprocessed bytes (partial prefix held for next call).
+        self.pending.drain(..i);
+
+        result
+    }
+}
+
+/// Returns true if `bytes` is a non-empty PROPER prefix of either paging CSI
+/// sequence (length 1–5, matching the beginning of the respective 6-byte sequence).
+///
+/// "Proper prefix" means: `bytes.len() < 6` AND `bytes == target[..bytes.len()]`.
+/// A full 6-byte match is NOT a prefix (handled by the full-match arms above).
+fn is_paging_prefix(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() >= 6 {
+        return false;
+    }
+    let len = bytes.len();
+    bytes == &CSI_SHIFT_PAGEUP[..len] || bytes == &CSI_SHIFT_PAGEDOWN[..len]
 }
 
 // ── SSH-style escape state machine ────────────────────────────────────────────
@@ -368,7 +531,7 @@ mod scrollback_view_tests {
     const LBRACKET: u8 = 0x5b;
     const SHIFT_PGUP: &[u8] = &[0x1b, 0x5b, 0x35, 0x3b, 0x32, 0x7e]; // ESC [ 5 ; 2 ~
     const SHIFT_PGDN: &[u8] = &[0x1b, 0x5b, 0x36, 0x3b, 0x32, 0x7e]; // ESC [ 6 ; 2 ~
-    const _ = (ESC, LBRACKET); // suppress unused warnings
+    #[allow(unused)] const _SUPPRESS: (u8, u8) = (ESC, LBRACKET);
 
     /// ScrollbackView starts in Live mode.
     #[test]
@@ -1007,6 +1170,69 @@ async fn run_pump(
     #[cfg(not(windows))]
     let size_recheck_deadline: Option<tokio::time::Instant> = None;
 
+    // ── Scrollback view state machine (SCROLL-04 / SCROLL-05) ──────────────────
+    //
+    // Initialised as Live at the start of every run_pump invocation (including
+    // reattach path), so no residual Active state from a prior connection leaks
+    // across reattach (T-22-13 / SCROLL-05 re-open invariant).
+    let mut scrollback_view = ScrollbackView::Live;
+
+    // CSI accumulator for split-read-safe Shift-PageUp/Down detection (Pitfall 6 / T-22-11).
+    let mut csi_acc = CsiAccumulator::new();
+
+    // Open the Scrollback channel on pump entry (SCROLL-01).
+    // Both fresh_session and reattach_session converge here so the re-open logic is shared.
+    // channel_id=2: first even client-initiated channel; EvenIdAllocator is local to
+    // run_pump since it is the sole channel opener at this scope.
+    let mut id_alloc = EvenIdAllocator::new();
+    let scrollback_channel_id = id_alloc.next_id(); // = 2
+
+    // mpsc channel pair: scrollback drain task → run_pump page delivery.
+    // Capacity 32 prevents unbounded buffer growth if run_pump is in Live mode
+    // but pages are still arriving (T-22-14 drop-on-full semantics in drain task).
+    let (page_tx, mut page_rx) = mpsc::channel::<Message>(32);
+
+    // mpsc for control messages from the drain task to the pump (credits, close).
+    // The pump is the sole writer of the control stream (A4); the drain task
+    // sends ChannelCredit / ChannelClose via this mpsc, which run_pump flushes
+    // to the wire in a dedicated select arm.
+    let (scrollback_ctrl_tx, mut scrollback_ctrl_rx) = mpsc::channel::<Message>(16);
+
+    // Open the Scrollback channel. A Rejected response is non-fatal — the view
+    // simply stays in Live mode with no history fetching (server may not support
+    // it yet during a phase transition).
+    let scrollback_streams = match client::open_channel(
+        conn,
+        send,
+        recv,
+        scrollback_channel_id,
+        ChannelType::Scrollback,
+    )
+    .await
+    {
+        Ok(Some(streams)) => Some(streams),
+        Ok(None) => {
+            tracing::debug!("Scrollback channel rejected by server — no history available");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Scrollback channel open failed: {e} — continuing without scrollback");
+            None
+        }
+    };
+
+    // Spawn the drain task if the channel was accepted.
+    // The task holds ch_send/ch_recv exclusively (M-6 isolation: M-2 pitfall avoidance).
+    if let Some((ch_send, ch_recv)) = scrollback_streams {
+        tokio::spawn(run_scrollback_drain_task(
+            scrollback_channel_id,
+            ch_recv,
+            ch_send,
+            scrollback_ctrl_tx.clone(),
+            page_tx,
+        ));
+    }
+
     let exit_code;
 
     loop {
@@ -1043,7 +1269,12 @@ async fn run_pump(
                         // Ack{seq} mechanism on the reliable stream is unaffected.
                         // The reliable-stream Ack{seq} is DISTINCT from the datagram
                         // epoch-ack (D-14-03a / Pitfall 3).
-                        let _ = data; // content discarded for display (no scrollback this milestone)
+                        //
+                        // Phase 22 (SCROLL-01): PtyData on the control stream is the
+                        // reattach-replay byte sequence — it still increments
+                        // highest_applied for ack tracking. Scrollback content arrives
+                        // via the separate Scrollback channel (page_rx arm below).
+                        let _ = data;
                         *highest_applied = highest_applied.saturating_add(1);
                     }
                     Ok(Message::SessionClose { exit_code: code, .. }) => {
@@ -1305,75 +1536,158 @@ async fn run_pump(
                     }
                 }
             }
-            // Keystrokes: run through the escape machine before forwarding.
-            // ~. at line-start → quit; ~~ → literal ~; other ~ → pass through.
-            // The escape machine is fed ONLY these local stdin bytes (T-09-01).
+            // Scrollback page delivery from drain task to view buffer (Task 2b).
+            // Minimal stub here: page forwarding and epoch-gated exit are implemented
+            // in Task 2b. Here we just drain the channel to avoid back-pressure.
+            msg = page_rx.recv() => {
+                if let Some(Message::ScrollbackPage { .. }) = msg {
+                    // Task 2b will implement the full page_rx arm behavior.
+                    // For now: if Active, append lines; if Live, drop.
+                    // Stub: drop unconditionally (no scrollback display yet).
+                    let _ = &scrollback_view; // suppress unused-variable warning
+                }
+            }
+            // Scrollback control frames (ChannelCredit, ChannelClose) from drain task.
+            // The pump writes them to the wire (A4 single-writer invariant).
+            ctrl_msg = scrollback_ctrl_rx.recv() => {
+                if let Some(msg) = ctrl_msg {
+                    match &msg {
+                        Message::ScrollbackCredit { .. } | Message::ChannelClose { .. } => {
+                            // Forward the credit/close to the server via the control stream.
+                            if nosh_proto::write_message(send, &msg).await.is_err() {
+                                return Ok(PumpOutcome::TransportDrop);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Keystrokes: CSI-intercepted BEFORE the escape machine (Pitfall 6 / T-22-11).
+            //
+            // Processing order (SCROLL-04):
+            // 1. CsiAccumulator intercepts Shift-PageUp/Down 6-byte sequences (split-read safe).
+            // 2. Non-paging bytes are forwarded to EscapeState + shell.
+            // 3. In Active mode, any non-paging byte: snap to Live + forward (T-22-15 LOCKED).
+            // 4. The escape machine is fed ONLY local stdin bytes (T-09-01).
             n = stdin.read(&mut stdin_buf) => {
                 match n {
                     Ok(0) => return Ok(PumpOutcome::UserQuit),
                     Ok(n) => {
-                        let result = escape.process(&stdin_buf[..n]);
-                        if result.quit {
-                            // ~. escape: quit locally without forwarding.
-                            return Ok(PumpOutcome::UserQuit);
-                        }
-                        if !result.bytes_to_forward.is_empty() {
-                            // Phase 15: hook predictor AFTER escape machine, BEFORE send_input
-                            // (T-15-06: predictor receives a borrow and cannot alter the forwarded
-                            // slice — byte-identical keystrokes still flow to server via send_input).
-                            predictor.on_input(&result.bytes_to_forward, &screen);
+                        // Phase 22 (SCROLL-04): scan for paging CSI sequences BEFORE the
+                        // escape machine. CsiAccumulator handles split reads (Pitfall 6).
+                        let csi = csi_acc.process(&stdin_buf[..n]);
 
-                            // WR-02 fix: prune stale predict_enqueue_times entries on
-                            // EpochReset / BulkSuppressed (signalled by pending becoming empty).
-                            // When the predictor resets, all in-flight keystroke batches will
-                            // never be confirmed — their enqueue_times are stale. Pruning here
-                            // prevents unbounded growth during noecho sessions (stty -echo /
-                            // read -s / sudo) where confirmed_epoch never advances and the
-                            // datagram-arm prune block never runs.
-                            // Pruning up to the CURRENT keystroke_id (pre-increment) retains
-                            // entries from the batch just handed to on_input (which may be a
-                            // printable char that survives; keystroke_id+1 will be inserted below).
-                            if predictor.pending_len() == 0 {
-                                let watermark = keystroke_id;
-                                predict_enqueue_times.retain(|&k, _| k > watermark);
-                            }
-
-                            // D-04 latency instrumentation: record enqueue time per forwarded
-                            // keystroke batch (keystroke_id), not per prediction epoch.
-                            // This gives per-keystroke RTT (predicted→confirmed) rather than
-                            // epoch-confirmation time which included user think-time. Only timing
-                            // data logged — no character content (T-15-08).
-                            keystroke_id += 1;
-                            predict_enqueue_times.insert(keystroke_id, Instant::now());
-                            let epoch_required = predictor.prediction_epoch();
-                            tracing::debug!(
-                                target: "nosh::predict",
-                                event = "predict",
-                                keystroke_id,
-                                epoch_required,
-                                "keystroke predicted"
-                            );
-
-                            // Re-render speculatively so the prediction echo appears immediately.
-                            // All display goes through ClientScreen::render_with_predictor
-                            // (T-15-07: single display path, no second stdout writer).
-                            let mut buf: Vec<u8> = Vec::new();
-                            screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
-                                tracing::warn!("render_with_predictor error: {e}");
-                            });
-                            if !buf.is_empty() {
-                                if let Err(e) = stdout.write_all(&buf).await {
-                                    tracing::warn!("stdout write_all failed: {e} — forcing full repaint");
-                                    screen.reset_physical();
-                                } else if let Err(e) = stdout.flush().await {
-                                    tracing::warn!("stdout flush failed: {e} — forcing full repaint");
-                                    screen.reset_physical();
+                        // Handle Shift-PageUp.
+                        if csi.shift_pageup {
+                            match &scrollback_view {
+                                ScrollbackView::Live => {
+                                    // Enter scrollback mode and issue the first request.
+                                    scrollback_view = ScrollbackView::Active {
+                                        lines: vec![],
+                                        offset: 0,
+                                        pending_request: true,
+                                        epoch_at_snapshot: 0, // updated on first page
+                                        total_available: 0,
+                                    };
+                                    // Send the first ScrollbackRequest on the scrollback channel.
+                                    // Note: ch_send was consumed by the drain task — the request
+                                    // is sent by the drain task reading from ch_recv (server side).
+                                    // The client signals via the control stream (ScrollbackRequest
+                                    // travels on the channel's own data stream per Open Question 1).
+                                    // For now, note that the scrollback ch_send is in the drain task.
+                                    // TODO in Task 2b: wire the request send path.
+                                    tracing::debug!("Shift-PageUp: entering scrollback Active mode");
+                                }
+                                ScrollbackView::Active { offset, .. } => {
+                                    // Already active: page up.
+                                    let o = *offset;
+                                    if let ScrollbackView::Active { offset, .. } = &mut scrollback_view {
+                                        *offset = o.saturating_add(screen.size().1 as usize);
+                                    }
+                                    tracing::debug!("Shift-PageUp: paging up in scrollback");
                                 }
                             }
+                        }
 
-                            // Forward keystroke bytes UNCHANGED to the server (T-15-06).
-                            if client::send_input(send, &result.bytes_to_forward).await.is_err() {
-                                return Ok(PumpOutcome::TransportDrop);
+                        // Handle Shift-PageDown.
+                        if csi.shift_pagedown {
+                            match &scrollback_view {
+                                ScrollbackView::Active { offset, lines, .. } => {
+                                    let rows = screen.size().1 as usize;
+                                    let current_offset = *offset;
+                                    let lines_len = lines.len();
+                                    if current_offset <= rows {
+                                        // Paging down past the live boundary: auto-exit (LOCKED).
+                                        scrollback_view = ScrollbackView::Live;
+                                        tracing::debug!("Shift-PageDown: reached live boundary, exiting scrollback");
+                                    } else {
+                                        // Page down.
+                                        if let ScrollbackView::Active { offset, .. } = &mut scrollback_view {
+                                            *offset = current_offset.saturating_sub(rows);
+                                        }
+                                        let _ = lines_len;
+                                        tracing::debug!("Shift-PageDown: paging down in scrollback");
+                                    }
+                                }
+                                ScrollbackView::Live => {
+                                    // Shift-PageDown while Live: no-op.
+                                }
+                            }
+                        }
+
+                        // Non-paging bytes from the CSI accumulator.
+                        // In Active mode: any non-paging byte MUST snap back to Live
+                        // AND be forwarded to the shell (T-22-15 LOCKED / T-22-11).
+                        if !csi.non_paging_remainder.is_empty() {
+                            let bytes_to_process = csi.non_paging_remainder.as_slice();
+
+                            // Snap back to Live mode if we were in Active (SCROLL-04 LOCKED).
+                            if matches!(scrollback_view, ScrollbackView::Active { .. }) {
+                                scrollback_view = ScrollbackView::Live;
+                                tracing::debug!("non-paging keystroke while in scrollback: snapping to Live");
+                            }
+
+                            // Now process through the existing escape machine + forward path.
+                            let result = escape.process(bytes_to_process);
+                            if result.quit {
+                                return Ok(PumpOutcome::UserQuit);
+                            }
+                            if !result.bytes_to_forward.is_empty() {
+                                predictor.on_input(&result.bytes_to_forward, &screen);
+
+                                if predictor.pending_len() == 0 {
+                                    let watermark = keystroke_id;
+                                    predict_enqueue_times.retain(|&k, _| k > watermark);
+                                }
+
+                                keystroke_id += 1;
+                                predict_enqueue_times.insert(keystroke_id, Instant::now());
+                                let epoch_required = predictor.prediction_epoch();
+                                tracing::debug!(
+                                    target: "nosh::predict",
+                                    event = "predict",
+                                    keystroke_id,
+                                    epoch_required,
+                                    "keystroke predicted"
+                                );
+
+                                let mut buf: Vec<u8> = Vec::new();
+                                screen.render_with_predictor(&mut buf, &predictor, &loss_overlay).unwrap_or_else(|e| {
+                                    tracing::warn!("render_with_predictor error: {e}");
+                                });
+                                if !buf.is_empty() {
+                                    if let Err(e) = stdout.write_all(&buf).await {
+                                        tracing::warn!("stdout write_all failed: {e} — forcing full repaint");
+                                        screen.reset_physical();
+                                    } else if let Err(e) = stdout.flush().await {
+                                        tracing::warn!("stdout flush failed: {e} — forcing full repaint");
+                                        screen.reset_physical();
+                                    }
+                                }
+
+                                if client::send_input(send, &result.bytes_to_forward).await.is_err() {
+                                    return Ok(PumpOutcome::TransportDrop);
+                                }
                             }
                         }
                     }
