@@ -219,8 +219,9 @@ impl ClientScreen {
     ///
     /// No panic, no out-of-bounds write.
     pub fn apply(&mut self, diff: &StateDiff) {
-        // D-14-05: monotonic staleness check — discard stale or duplicate diffs.
-        if diff.epoch <= self.last_applied_epoch {
+        // D-14-05 / D-20-07: discard strictly older diffs only.
+        // Same-epoch burst datagrams (all datagrams in one tick share one epoch) MUST apply.
+        if diff.epoch < self.last_applied_epoch {
             return;
         }
 
