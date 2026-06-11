@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
-status: planning
+status: executing
 stopped_at: Phase 20 context gathered
-last_updated: "2026-06-07T08:47:38.462Z"
-last_activity: 2026-06-07 -- Phase 20 planning complete
+last_updated: "2026-06-11T11:09:56.996Z"
+last_activity: 2026-06-11 -- Phase 20 execution started
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 7
-  completed_plans: 5
+  completed_plans: 6
   percent: 25
 ---
 
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-07)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 20 — repaint pacing
+**Current focus:** Phase 20 — repaint-pacing
 
 ## Current Position
 
-Phase: 20
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-06-07 -- Phase 20 planning complete
+Phase: 20 (repaint-pacing) — EXECUTING
+Plan: 2 of 2
+Status: Executing Phase 20
+Last activity: 2026-06-11 -- Phase 20 execution started
 
 ```
-Progress: [██████████] 100%
+Progress: [█████████░] 86%
 ```
 
 ## Performance Metrics
@@ -63,6 +63,7 @@ Progress: [██████████] 100%
 | Phase 19 P03 | 25 | 2 tasks | 2 files |
 | Phase 19 P04 | 504 | 2 tasks | 5 files |
 | Phase 19-full-screen-tui-rendering-correctness P05 | 25 | 3 tasks | 2 files |
+| Phase 20-repaint-pacing P01 | 25 | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,7 @@ Recent decisions affecting current work:
 - v1.3 roadmap: `epoch_at_snapshot` field in `ScrollbackPage` wire type is mandatory — client uses it to transition from scrollback-replay to live-grid rendering without duplicated or missing lines
 - v1.3 roadmap: `SCROLLBACK_LINE_CAP = 10_000` is not raised; bounded mpsc for scrollback sender; add `tracing::warn!` as per-session scrollback approaches cap
 - [Phase ?]: plan 19-01 execution
+- [Phase 20]: send_burst() encode_datagram-only drain (R-1 fix, D-20-03); one epoch per tick shared across all burst datagrams (R-2 fix, D-20-04); BURST_CAP=64; both run_session and run_reattach_session burst identically
 
 ### Pending Todos
 
@@ -127,7 +129,7 @@ Items acknowledged and carried forward:
 
 ## Session Continuity
 
-Last session: 2026-06-07T08:27:59.517Z
+Last session: 2026-06-11T11:09:56.983Z
 Stopped at: Phase 20 context gathered
 Resume file: .planning/phases/20-repaint-pacing/20-CONTEXT.md
 

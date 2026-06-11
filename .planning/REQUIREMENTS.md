@@ -23,9 +23,9 @@ Requirements for this milestone. Each maps to a roadmap phase.
 
 <!-- was backlog 999.6. Reverted once in 999.4 for two documented bugs. -->
 
-- [ ] **PACE-01**: A full-screen repaint (vim startup, multi-line paste) lands in roughly one round-trip instead of dribbling one MTU per 16 ms tick — multiple state-diff datagrams burst per tick, bounded by the congestion-aware send budget (`datagram_send_buffer_space()`)
-- [ ] **PACE-02**: Burst pacing preserves the noecho security invariant — all burst datagrams in a tick share one epoch, and the `read -s` noecho-suppression test (`noecho_read_dash_s_zero_predicted_chars`) passes as a required, non-ignored CI gate
-- [ ] **PACE-03**: The two 999.4 traps cannot recur — the burst drain never recomputes the diff against a non-advancing acked baseline (no infinite-spin), guarded by a RED-before/GREEN-after burst-drain regression test
+- [x] **PACE-01**: A full-screen repaint (vim startup, multi-line paste) lands in roughly one round-trip instead of dribbling one MTU per 16 ms tick — multiple state-diff datagrams burst per tick, bounded by the congestion-aware send budget (`datagram_send_buffer_space()`)
+- [x] **PACE-02**: Burst pacing preserves the noecho security invariant — all burst datagrams in a tick share one epoch, and the `read -s` noecho-suppression test (`noecho_read_dash_s_zero_predicted_chars`) passes as a required, non-ignored CI gate
+- [x] **PACE-03**: The two 999.4 traps cannot recur — the burst drain never recomputes the diff against a non-advancing acked baseline (no infinite-spin), guarded by a RED-before/GREEN-after burst-drain regression test
 
 ### Channel Multiplexing & Flow Control (MUX)
 
@@ -96,9 +96,9 @@ Which phases cover which requirements. Populated during roadmap creation.
 | TUI-03 | Phase 19 | Complete |
 | TUI-04 | Phase 19 | Complete |
 | TUI-05 | Phase 19 | Complete |
-| PACE-01 | Phase 20 | Pending |
-| PACE-02 | Phase 20 | Pending |
-| PACE-03 | Phase 20 | Pending |
+| PACE-01 | Phase 20 | Complete |
+| PACE-02 | Phase 20 | Complete |
+| PACE-03 | Phase 20 | Complete |
 | MUX-01 | Phase 21 | Pending |
 | MUX-02 | Phase 21 | Pending |
 | MUX-03 | Phase 21 | Pending |
