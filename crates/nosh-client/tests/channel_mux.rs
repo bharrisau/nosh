@@ -236,7 +236,9 @@ async fn channel_open_accept_reject() {
         "AgentForward must yield ChannelReject; got {}", af_reply.variant_name()
     );
 
-    // ── Scrollback: opaque ChannelReject (Phase 22 deferred) ─────────────────
+    // ── Scrollback: ChannelAccept (Phase 22 — scrollback sync implemented) ────
+    // The ACCEPT arrives on the control stream before any bidi data stream is
+    // bound (MUX-01); the server then spawns run_scrollback_sender_task.
     let sb_id: u32 = 8;
     client::send_channel_open(&mut ctrl_send, sb_id, ChannelType::Scrollback)
         .await
@@ -245,8 +247,8 @@ async fn channel_open_accept_reject() {
         .await
         .expect("recv Scrollback reply");
     assert!(
-        matches!(sb_reply, nosh_proto::Message::ChannelReject { channel_id } if channel_id == sb_id),
-        "Scrollback must yield ChannelReject (Phase 22); got {}", sb_reply.variant_name()
+        matches!(sb_reply, nosh_proto::Message::ChannelAccept { channel_id } if channel_id == sb_id),
+        "Scrollback must yield ChannelAccept (Phase 22); got {}", sb_reply.variant_name()
     );
 
     conn.close(0u32.into(), b"done");
