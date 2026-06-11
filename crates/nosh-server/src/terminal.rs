@@ -85,7 +85,7 @@ pub const OSC_ACCUMULATION_MAX: usize = 1_048_576; // 1 MiB
 /// - `style: CellStyle` — same as `DiffRun.style`
 /// - `fg: Option<u8>` — same as `DiffRun.fg` (`None` = default, `Some(n)` = index)
 /// - `bg: Option<u8>` — same as `DiffRun.bg`
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
     /// Unicode scalar value in this cell. `' '` means blank/empty.
     pub ch: char,
@@ -806,6 +806,37 @@ impl TerminalState {
             .iter()
             .enumerate()
             .map(|(i, row)| (i as u16, row.as_slice()))
+    }
+
+    /// Return a page of scrollback lines for the scrollback sync protocol (SCROLL-01).
+    ///
+    /// `from_line` is the line index from newest backwards (0 = most recent line, just
+    /// above the live viewport). `count` is the number of lines requested.
+    ///
+    /// Returns `(lines, total_available)`:
+    /// - `lines`: the requested page in display order (oldest→newest within the page),
+    ///   may be shorter than `count` at the top of history.
+    /// - `total_available`: the total number of lines currently in scrollback.
+    ///
+    /// Bounds-safe: `from_line >= total_available` or `count == 0` or
+    /// `from_line == u64::MAX` all return `(vec![], total)` without panic (V5/T-22-02).
+    ///
+    /// The epoch MUST be captured by the CALLER under the same lock acquisition that
+    /// calls this method — never two separate lock calls (S-5 torn-read prevention).
+    /// The `VecDeque` is NOT exposed; this accessor is the only read path.
+    pub fn scrollback_lines(&self, from_line: u64, count: usize) -> (Vec<Vec<Cell>>, u64) {
+        let total = self.scrollback.len() as u64;
+        if from_line >= total || count == 0 {
+            return (vec![], total);
+        }
+        // scrollback[0] = oldest, scrollback[len-1] = newest (just above live viewport).
+        // from_line=0 maps to index total-1 (newest). from_line=N maps to total-1-N.
+        let newest_idx = (total - 1 - from_line) as usize;
+        let oldest_idx = newest_idx.saturating_sub(count - 1);
+        let lines: Vec<Vec<Cell>> = (oldest_idx..=newest_idx)
+            .map(|i| self.scrollback[i].clone())
+            .collect();
+        (lines, total)
     }
 }
 
@@ -2738,5 +2769,170 @@ mod tests {
         // Row 2 mixed content (from EL above) must be undisturbed by ED 0.
         assert_eq!(state.cell(2, 0).ch, 'X', "row 2 col 0 must still be 'X' after ED 0");
         assert_eq!(state.cell(2, 9).ch, ' ', "row 2 col 9 must still be ' ' after ED 0");
+    }
+
+    // ── Phase 22: scrollback_lines accessor + alt-screen exclusion tests ─────
+
+    /// Phase 22 / SCROLL-01: basic scrollback_lines accessor correctness.
+    ///
+    /// Tests: normal page fetch, from_line=0 returns newest page, out-of-bounds
+    /// returns empty page, u64::MAX from_line returns empty page without panic
+    /// (V5 / T-22-02 bounds-safety).
+    #[test]
+    fn scrollback_lines() {
+        // 3-row terminal so we scroll quickly.
+        let mut state = ts(80, 3);
+
+        // Nothing in scrollback yet.
+        let (lines, total) = state.scrollback_lines(0, 10);
+        assert_eq!(total, 0, "empty scrollback: total_available must be 0");
+        assert!(lines.is_empty(), "empty scrollback: page must be empty");
+
+        // Force 5 lines into scrollback by writing 8 newlines (fills 3 rows then scrolls 5).
+        state.advance(b"line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n");
+        let total_after = state.scrollback.len() as u64;
+        assert!(total_after >= 5, "must have at least 5 scrollback lines after 8 newlines");
+
+        // from_line=0, count=2: should return the 2 newest lines.
+        let (lines2, total2) = state.scrollback_lines(0, 2);
+        assert_eq!(total2, total_after, "total_available must match scrollback.len()");
+        assert_eq!(lines2.len(), 2, "expected 2 lines for from_line=0, count=2");
+
+        // from_line >= total_available: empty page.
+        let (lines_oob, total_oob) = state.scrollback_lines(total_after, 256);
+        assert!(lines_oob.is_empty(), "from_line >= total must return empty page");
+        assert_eq!(total_oob, total_after);
+
+        // count=0: empty page regardless of from_line.
+        let (lines_zero, total_zero) = state.scrollback_lines(0, 0);
+        assert!(lines_zero.is_empty(), "count=0 must return empty page");
+        assert_eq!(total_zero, total_after);
+
+        // from_line=u64::MAX: no overflow, no panic, empty page (T-22-02 / V5).
+        let (lines_max, total_max) = state.scrollback_lines(u64::MAX, 256);
+        assert!(lines_max.is_empty(), "from_line=u64::MAX must return empty page (no panic)");
+        assert_eq!(total_max, total_after);
+
+        // Full-history request: request more than available.
+        let (lines_all, total_all) = state.scrollback_lines(0, 1_000_000);
+        assert_eq!(lines_all.len(), total_all as usize,
+            "requesting more than total_available must return exactly total_available lines");
+    }
+
+    /// Phase 22 / SCROLL-03: alt-screen content NEVER enters primary scrollback
+    /// (scroll_up() path). Proves the existing `!alt_screen` gate at terminal.rs:631.
+    ///
+    /// ROADMAP success criterion 3 verbatim: write to primary buffer, activate alt
+    /// screen, force scroll lines, deactivate alt screen, assert only primary lines
+    /// appear in TerminalState.scrollback (none from alt screen).
+    #[test]
+    fn scrollback_excludes_alt_screen() {
+        // 3-row terminal to scroll quickly.
+        let mut state = ts(80, 3);
+
+        // Write to primary buffer and scroll several lines into scrollback.
+        // 6 newlines on a 3-row terminal forces 3 lines into scrollback.
+        state.advance(b"primary1\nprimary2\nprimary3\nprimary4\nprimary5\nprimary6\n");
+        let primary_scrollback_len = state.scrollback.len();
+        assert!(primary_scrollback_len >= 3,
+            "expected at least 3 primary lines in scrollback after 6 newlines");
+
+        // Clone the primary scrollback content for later comparison.
+        let primary_content: Vec<Vec<Cell>> = state.scrollback.iter().cloned().collect();
+
+        // Activate alternate screen (?1049h).
+        state.advance(b"\x1b[?1049h");
+        assert!(state.echo_state().alt_screen, "alt screen must be active after ?1049h");
+
+        // Force several scroll_up() calls while alt_screen is active.
+        // These must NOT enter scrollback (T-22-03 alt-screen gate).
+        state.advance(b"alt1\nalt2\nalt3\nalt4\nalt5\nalt6\n");
+
+        // alt_screen still active — scrollback must not have grown.
+        assert_eq!(
+            state.scrollback.len(), primary_scrollback_len,
+            "scrollback must not grow while alt screen is active (scroll_up gate)"
+        );
+
+        // Deactivate alternate screen (?1049l) — restores primary.
+        state.advance(b"\x1b[?1049l");
+        assert!(!state.echo_state().alt_screen, "alt screen must be inactive after ?1049l");
+
+        // Scrollback length must still be the primary count.
+        assert_eq!(
+            state.scrollback.len(), primary_scrollback_len,
+            "scrollback length must equal primary count after deactivating alt screen"
+        );
+
+        // Scrollback content must be identical to what was there before alt screen.
+        let restored_content: Vec<Vec<Cell>> = state.scrollback.iter().cloned().collect();
+        assert_eq!(
+            restored_content, primary_content,
+            "scrollback content must be unchanged by alt-screen scroll_up calls"
+        );
+
+        // scrollback_lines with u64::MAX must not panic even after alt-screen use.
+        let (empty_page, _) = state.scrollback_lines(u64::MAX, 256);
+        assert!(empty_page.is_empty(), "scrollback_lines(u64::MAX) must return empty page");
+    }
+
+    /// Phase 22 / SCROLL-03 (resize path): a resize() call while alt-screen is
+    /// active must NOT push rows into primary scrollback (D-19-09 gate).
+    ///
+    /// Distinct from `scrollback_excludes_alt_screen` which covers the scroll_up()
+    /// path; this covers the shrink-resize path in resize() at terminal.rs:489.
+    #[test]
+    fn resize_alt_screen_no_scrollback_contamination() {
+        // 80×10 terminal to keep the setup manageable.
+        let mut state = ts(80, 10);
+
+        // Write enough primary content to populate scrollback (force a few scroll_up calls).
+        // 15 newlines on a 10-row terminal pushes 5 lines into scrollback.
+        state.advance(b"prim1\nprim2\nprim3\nprim4\nprim5\nprim6\nprim7\nprim8\nprim9\nprim10\nprim11\nprim12\nprim13\nprim14\nprim15\n");
+        let before = state.scrollback.len();
+        assert!(before >= 5, "expected at least 5 primary lines in scrollback");
+
+        // Clone the scrollback content as the "before" snapshot.
+        let before_content: Vec<Vec<Cell>> = state.scrollback.iter().cloned().collect();
+
+        // Activate alternate screen (?1049h).
+        state.advance(b"\x1b[?1049h");
+        assert!(state.echo_state().alt_screen, "alt screen must be active");
+
+        // Fill the alt grid so a shrink-resize has rows to push.
+        // Alt screen has 10 rows; fill them with content.
+        for i in 0u8..10 {
+            state.advance(format!("alt_row_{}\n", i).as_bytes());
+        }
+
+        // Force a shrink resize while alt_screen is active.
+        // Shrinking from 10 rows to 5 rows means 5 rows are "pushed off the top".
+        // The D-19-09 gate in resize() must prevent them from entering scrollback.
+        state.resize(80, 5);
+
+        // Verify the terminal is now 80×5 and alt_screen is still active.
+        assert_eq!(state.size(), (80, 5), "terminal must be 80×5 after resize");
+        assert!(state.echo_state().alt_screen, "alt screen must still be active after resize");
+
+        // Scrollback length must be UNCHANGED from before alt-screen activation.
+        assert_eq!(
+            state.scrollback.len(), before,
+            "scrollback length must be unchanged after resize while alt screen is active"
+        );
+
+        // Deactivate alt screen.
+        state.advance(b"\x1b[?1049l");
+        assert!(!state.echo_state().alt_screen, "alt screen must be inactive after ?1049l");
+
+        // Scrollback length and content must be identical to the pre-alt snapshot.
+        assert_eq!(
+            state.scrollback.len(), before,
+            "scrollback length must equal pre-alt count after deactivating alt screen"
+        );
+        let after_content: Vec<Vec<Cell>> = state.scrollback.iter().cloned().collect();
+        assert_eq!(
+            after_content, before_content,
+            "scrollback content must be byte-identical to pre-alt snapshot after resize+deactivate"
+        );
     }
 }
