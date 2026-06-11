@@ -134,7 +134,11 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
   4. Pressing any key while in scrollback view immediately returns the display to the live viewport and delivers the keystroke to the shell; Shift-PageDown pages forward through history; reaching the live view automatically exits scrollback mode
   5. The scrollbackâlive-grid handoff contains no duplicate or missing lines â the `ScrollbackPage` wire type carries an `epoch_at_snapshot` field so the client knows at which epoch to stop replaying history and resume live datagrams; scrollback content is viewable immediately after a cold reattach (the server's `TerminalState.scrollback` survives in the `SessionSlot`)
 
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 22-01-PLAN.md — Wire-protocol foundation: discriminant-stability test first, ScrollbackRequest/Page/Credit variants, scrollback_lines accessor, alt-screen exclusion test (SCROLL-01, SCROLL-02, SCROLL-03, SCROLL-05)
+- [ ] 22-02-PLAN.md — Server scrollback sender task (reliable SendStream-only, byte-credit, bounded mpsc drop-oldest, atomic epoch capture) + accept-gate flip in both session paths (SCROLL-01, SCROLL-02, SCROLL-05)
+- [ ] 22-03-PLAN.md — Client scrollback view: drain task, ScrollbackView state machine, Shift-PageUp/Down CSI interception, snap-back, epoch handoff, cold-reattach re-open (SCROLL-01, SCROLL-04, SCROLL-05)
+- [ ] 22-04-PLAN.md — Integration suite: basic fetch, PTY-latency isolation, drop-oldest, in-order under loss, epoch handoff, post-reattach (SCROLL-01, SCROLL-02, SCROLL-05)
 
 **Security note**: Pitfalls S-1 through S-5 and M-6 from PITFALLS.md govern this phase. Scrollback must never travel over datagrams (type-level enforcement: scrollback sender accepts only `SendStream`). The `SCROLLBACK_LINE_CAP = 10_000` constant must not be raised without a measured reason. The scrollback sender task must use a bounded channel and drop oldest lines rather than blocking the pump. On cold reattach, the client re-opens the scrollback channel after `ResumeComplete` â channel state is never replayed from the byte buffer.
 
