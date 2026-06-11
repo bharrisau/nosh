@@ -433,7 +433,17 @@ fn send_burst(
     if let Err(e) = conn.send_datagram(result.payload) {
         use quinn::SendDatagramError::*;
         match e {
-            TooLarge => {} // unreachable: build_state_diff guarantees payload < cap
+            TooLarge => {
+                // Path MTU shrank between max_datagram_size() and send_datagram().
+                // build_state_diff normally guarantees payload < cap, but a PMTUD
+                // failure or route change between the query and the send can shrink
+                // the available size. The first payload was NOT sent; do NOT proceed
+                // to send the deferred runs — they are meaningless without the first
+                // payload and would corrupt the client's confirmed grid. Carry the
+                // deferred back to the caller so the next tick's build_state_diff
+                // can recompute a fresh diff against the still-current snapshot.
+                return (result.deferred, false);
+            }
             UnsupportedByPeer | Disabled | ConnectionLost(_) => {
                 // Transport lost: return remaining deferred + signal caller.
                 return (result.deferred, true);
