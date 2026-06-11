@@ -48,7 +48,7 @@ ssh-agent-client-rs = "1.1"
 windows-sys = { workspace = true }
 
 [dev-dependencies]
-nosh-server = { path = "../nosh-server" }
+nosh-server = { path = "../nosh-server", features = ["test-support"] }
 nosh-auth = { path = "../nosh-auth", features = ["test-support"] }
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
 ed25519-dalek = "2.2"

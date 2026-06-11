@@ -145,8 +145,13 @@ async fn run_channel_task_inner(
     events: &mut mpsc::Receiver<ChannelEvent>,
     _control_tx: &mpsc::Sender<Message>,
 ) {
-    // Echo behaviour: test-only, gated so the symbol is absent in production builds.
-    #[cfg(test)]
+    // Echo behaviour: test-only, gated so the symbol is absent in production
+    // builds. Must match the accept gate in server.rs (any(test, test-support))
+    // — otherwise an integration test in a downstream crate (cfg(test)=false but
+    // feature="test-support"=true) would accept the Echo channel yet fall through
+    // to the production stub below, silently discarding bytes and hanging the
+    // peer's read.
+    #[cfg(any(test, feature = "test-support"))]
     {
         run_echo_loop(channel_id, ch_send, ch_recv, events).await;
         return;
@@ -154,7 +159,7 @@ async fn run_channel_task_inner(
 
     // Production: no channel type that needs a body loop is accepted in this
     // phase; the task drains Close events and waits for RecvStream EOF.
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = channel_id; // suppress unused-variable warning in production
         let _ = ch_send;    // the send half is closed in the caller's half-close
@@ -190,7 +195,7 @@ async fn run_channel_task_inner(
 /// `ChannelEvent::Credit(n)` arrives from the session pump.
 ///
 /// Exits on RecvStream EOF, a read/write error, or `ChannelEvent::Close`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn run_echo_loop(
     _channel_id: u32,
     ch_send: &mut quinn::SendStream,

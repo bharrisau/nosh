@@ -795,19 +795,21 @@ async fn run_session(
     let mut next_server_channel_id: u32 = 1;
     let (server_open_tx, server_open_rx_inner) =
         tokio::sync::mpsc::channel::<ChannelType>(8);
-    // In test builds: store the sender in the slot and wire the receiver.
-    // In production builds: drop both so the Option below is None and the arm never fires.
-    #[cfg(test)]
+    // In test builds (or when the test-support feature is enabled): store the sender
+    // in the slot and wire the receiver so integration tests can trigger a
+    // server-initiated ChannelOpen. In production builds: drop both so the select!
+    // arm stays inert via recv_or_pending returning pending() (T-21-10).
+    #[cfg(any(test, feature = "test-support"))]
     slot.store_server_open_tx(server_open_tx);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let mut server_open_rx_opt: Option<tokio::sync::mpsc::Receiver<ChannelType>> =
         Some(server_open_rx_inner);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         // Drop the channel immediately; the select! arm stays inert (recv_or_pending None).
         let _ = (next_server_channel_id, server_open_tx, server_open_rx_inner);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let mut server_open_rx_opt: Option<tokio::sync::mpsc::Receiver<ChannelType>> = None;
 
     let session_end: SessionEnd = loop {
@@ -1065,10 +1067,12 @@ async fn run_session(
                             }
                             ChannelType::Echo => {
                                 // Echo is the test-only proving fixture (21-CONTEXT.md).
-                                // Accepted only in test builds; rejected in production.
-                                #[cfg(test)]
+                                // Accepted only in test builds (or when the test-support
+                                // feature is enabled by a downstream integration-test binary);
+                                // rejected in production.
+                                #[cfg(any(test, feature = "test-support"))]
                                 { true }
-                                #[cfg(not(test))]
+                                #[cfg(not(any(test, feature = "test-support")))]
                                 {
                                     tracing::debug!(
                                         channel_id,
@@ -1132,11 +1136,12 @@ async fn run_session(
 
                     Ok(Message::ChannelAccept { channel_id }) => {
                         // ChannelAccept is server→client direction.
-                        // Under #[cfg(test)], an odd-id ChannelAccept is the client
-                        // acknowledging a server-initiated ChannelOpen (Task 3).
-                        // The channel task is already running; nothing further is needed.
-                        // Unknown/already-closed odd ids are logged no-ops (Pitfall M-4 / T-21-07).
-                        #[cfg(test)]
+                        // Under #[cfg(any(test, feature = "test-support"))], an odd-id
+                        // ChannelAccept is the client acknowledging a server-initiated
+                        // ChannelOpen (Task 3). The channel task is already running;
+                        // nothing further is needed. Unknown/already-closed odd ids are
+                        // logged no-ops (Pitfall M-4 / T-21-07).
+                        #[cfg(any(test, feature = "test-support"))]
                         if channel_id % 2 != 0 {
                             tracing::debug!(
                                 channel_id,
@@ -1154,10 +1159,11 @@ async fn run_session(
 
                     Ok(Message::ChannelReject { channel_id }) => {
                         // ChannelReject is server→client direction.
-                        // Under #[cfg(test)], an odd-id ChannelReject is the client
-                        // rejecting a server-initiated ChannelOpen. Drop the map entry
-                        // so the channel task drains and exits cleanly (T-21-07).
-                        #[cfg(test)]
+                        // Under #[cfg(any(test, feature = "test-support"))], an odd-id
+                        // ChannelReject is the client rejecting a server-initiated
+                        // ChannelOpen. Drop the map entry so the channel task drains and
+                        // exits cleanly (T-21-07).
+                        #[cfg(any(test, feature = "test-support"))]
                         if channel_id % 2 != 0 {
                             tracing::debug!(
                                 channel_id,
@@ -1792,8 +1798,8 @@ async fn run_reattach_session(
                             ChannelType::PortForward | ChannelType::AgentForward => false,
                             ChannelType::Scrollback => false,
                             ChannelType::Echo => {
-                                #[cfg(test)] { true }
-                                #[cfg(not(test))] { false }
+                                #[cfg(any(test, feature = "test-support"))] { true }
+                                #[cfg(not(any(test, feature = "test-support")))] { false }
                             }
                         };
                         if !accept {

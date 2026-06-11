@@ -4,6 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exposes test-only channel-multiplexing seams (first_active_slot,
+# take_server_open_tx, store_server_open_tx, server_open_tx field on SessionSlot)
+# to downstream integration tests. Off by default; enabled as a dev-dependency
+# feature in nosh-client and any other crate that runs the Phase 21 mux tests.
+# These symbols are compiled out of production builds.
+test-support = []
+
 [lib]
 name = "nosh_server"
 path = "src/lib.rs"

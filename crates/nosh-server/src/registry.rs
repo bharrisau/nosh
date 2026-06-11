@@ -258,8 +258,10 @@ pub struct SessionSlot {
     /// `take_server_open_tx()` to request that the running session send a
     /// server-originated `ChannelOpen` (odd id, Task 3 / SC#6).
     ///
-    /// Compiled out entirely in production builds (#[cfg(test)] gating).
-    #[cfg(test)]
+    /// Compiled out entirely in production builds (gated on `#[cfg(test)]` or
+    /// the `test-support` crate feature, which downstream test binaries enable
+    /// via their dev-dependency declaration).
+    #[cfg(any(test, feature = "test-support"))]
     pub server_open_tx: Mutex<Option<tokio::sync::mpsc::Sender<nosh_proto::messages::ChannelType>>>,
 }
 
@@ -284,7 +286,7 @@ impl SessionSlot {
             last_active: Mutex::new(Instant::now()),
             token: Mutex::new(Uuid::new_v4().into_bytes()),
             pty_writer: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             server_open_tx: Mutex::new(None),
         })
     }
@@ -295,7 +297,7 @@ impl SessionSlot {
     /// receiver is wired into the select! loop. Integration tests retrieve the
     /// sender via `take_server_open_tx()` and send a `ChannelType` to trigger
     /// the server to open a channel from its own (odd-id) parity space (SC#6).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn store_server_open_tx(
         &self,
         tx: tokio::sync::mpsc::Sender<nosh_proto::messages::ChannelType>,
@@ -308,7 +310,7 @@ impl SessionSlot {
     /// Returns `None` if the session pump has not yet stored it (e.g. the session
     /// is still initialising) or if it was already taken. Tests should poll briefly
     /// after connecting before calling this.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn take_server_open_tx(
         &self,
     ) -> Option<tokio::sync::mpsc::Sender<nosh_proto::messages::ChannelType>> {
@@ -936,7 +938,7 @@ impl SessionRegistry {
     /// live session started by `spawn_server*`. Returns `None` if no active slot
     /// exists. The caller should poll briefly (e.g. 25 ms intervals for up to 2 s)
     /// after connecting to let the session pump start and store the sender.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn first_active_slot(&self) -> Option<std::sync::Arc<SessionSlot>> {
         let guard = self.inner.lock().unwrap();
         for slots in guard.values() {
