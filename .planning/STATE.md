@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
-status: executing
-stopped_at: Phase 20 context gathered
-last_updated: "2026-06-11T11:40:57.038Z"
+status: ready_to_plan
+stopped_at: Phase 20 complete (2/2) — ready to discuss Phase 21
+last_updated: 2026-06-11T12:12:58.010Z
 last_activity: 2026-06-11 -- Phase 20 execution started
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 7
-  completed_plans: 7
+  completed_plans: 18
   percent: 50
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-07)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 20 — repaint-pacing
+**Current focus:** Phase 21 — channel multiplexing foundation
 
 ## Current Position
 
-Phase: 20 (repaint-pacing) — EXECUTING
-Plan: 2 of 2
-Status: Executing Phase 20
-Last activity: 2026-06-11 -- Phase 20 execution started
+Phase: 21
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-06-11
 
 ```
 Progress: [██████████] 100%
@@ -52,6 +52,7 @@ Progress: [██████████] 100%
 | 21. Channel Multiplexing Foundation | 0/? | - | - |
 | 22. Scrollback Sync | 0/? | - | - |
 | 19 | 5 | - | - |
+| 20 | 2 | - | - |
 
 **Recent Trend:**
 

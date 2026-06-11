@@ -159,6 +159,6 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 17. Windows-Host Predictive Echo Validation | 1/1 | Shipped | 2026-06-02 |
 | 18. Security Design Pass | 0/? | Deferred | - |
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
-| 20. Repaint Pacing | 2/2 | Complete   | 2026-06-11 |
+| 20. Repaint Pacing | 2/2 | Complete    | 2026-06-11 |
 | 21. Channel Multiplexing Foundation | 0/? | Not started | - |
 | 22. Scrollback Sync | 0/? | Not started | - |
