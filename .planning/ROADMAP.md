@@ -55,7 +55,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 
 - [x] **Phase 19: Full-Screen TUI Rendering Correctness** â Real alternate-screen buffer (two-grid model), wide-char/grapheme audit, predictor suppression, OSC OOM bound; makes vim/htop/Claude Code work correctly (completed 2026-06-07)
 - [x] **Phase 20: Repaint Pacing** â Burst multiple state-diff datagrams per tick so full-screen repaints land in ~1 RTT; one epoch per tick; both 999.4 traps designed out architecturally (completed 2026-06-11)
-- [ ] **Phase 21: Channel Multiplexing Foundation** â Control-first OPEN/ACCEPT/REJECT on control stream (id 0); discriminant-stability test first; per-channel flow control; clean lifecycle; scrollback channel type declared
+- [x] **Phase 21: Channel Multiplexing Foundation** â Control-first OPEN/ACCEPT/REJECT on control stream (id 0); discriminant-stability test first; per-channel flow control; clean lifecycle; scrollback channel type declared (completed 2026-06-11)
 - [ ] **Phase 22: Scrollback Sync** â Scrollback delivered over the reliable scrollback channel; credit-based paging; alt-screen gate; Shift-PageUp/PageDown UX; consistent live-grid handoff and reattach survival
 
 ## Phase Details
@@ -117,7 +117,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 - [x] 21-01-PLAN.md — Append ChannelOpen/Accept/Reject/Credit/Close + ChannelType to nosh-proto; message_discriminant_order_is_stable test (FIRST commit) (MUX-06) — d5f7e76
 - [x] 21-02-PLAN.md — Server mux: control dispatch + post-auth accept_bi arm + per-channel task + 256 KiB credit + lifecycle (MUX-01, MUX-02, MUX-03, MUX-04)
 - [x] 21-03-PLAN.md — Client mux: open_channel + even-id allocator + varint prefix + channel drain task + credit grant + reattach re-open helpers (MUX-01..MUX-05)
-- [ ] 21-04-PLAN.md — Echo-channel integration suite: lifecycle, opaque REJECT, <5 ms PTY latency, backpressure, simultaneous-open, cold-reattach re-open (MUX-01..MUX-05)
+- [x] 21-04-PLAN.md — Echo-channel integration suite: lifecycle, opaque REJECT, <5 ms PTY latency, backpressure, simultaneous-open, cold-reattach re-open (MUX-01..MUX-05)
 
 **Security note**: Pitfalls M-1 through M-6 from PITFALLS.md govern this phase. The discriminant test (M-1) is the first commit. The secondary stream accept loop must not open streams before authentication completes and must not bypass the `AuthLimits` semaphore (pre-auth cap). `SSH_AUTH_SOCK` must never be forwarded via any new channel type. Port/agent forwarding types (PFWD/AFWD) are declared in the registry but must be rejected by v1.3 peers.
 
@@ -164,5 +164,5 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 18. Security Design Pass | 0/? | Deferred | - |
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
 | 20. Repaint Pacing | 2/2 | Complete    | 2026-06-11 |
-| 21. Channel Multiplexing Foundation | 3/4 | In Progress|  |
+| 21. Channel Multiplexing Foundation | 4/4 | Complete   | 2026-06-11 |
 | 22. Scrollback Sync | 0/? | Not started | - |
