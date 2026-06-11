@@ -1065,6 +1065,16 @@ async fn drain_datagrams_with_cull(
     }
     // Cull once after all datagrams are applied (D-20-04: one cull per completed burst).
     // Only cull if the epoch actually advanced during this drain window.
+    //
+    // NOTE: This helper culls ONCE per drain call using the highest epoch seen
+    // (the final `epoch_after`), not once per distinct epoch within the window.
+    // If two separate tick epochs arrive within the same drain window (possible
+    // at 500ms window / 16ms tick interval), predictions confirmed by the earlier
+    // epoch are not culled until the final cull(epoch_after) runs. This is correct
+    // for the noecho security gate (no predictions are made during `read -s`, so
+    // there is nothing to incorrectly defer), but is NOT correct for tests where
+    // per-epoch culling accuracy matters. Use drain_datagrams_until_quiet for
+    // those — it tracks last_culled_epoch and culls once per distinct epoch.
     let epoch_after = screen.last_applied_epoch();
     if epoch_after > epoch_before {
         predictor.cull(screen, epoch_after, 5);
