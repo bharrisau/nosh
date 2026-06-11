@@ -136,7 +136,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 
 **Plans**: 4 plans
 - [x] 22-01-PLAN.md — Wire-protocol foundation: discriminant-stability test first, ScrollbackRequest/Page/Credit variants, scrollback_lines accessor, alt-screen exclusion test (SCROLL-01, SCROLL-02, SCROLL-03, SCROLL-05)
-- [ ] 22-02-PLAN.md — Server scrollback sender task (reliable SendStream-only, byte-credit, bounded mpsc drop-oldest, atomic epoch capture) + accept-gate flip in both session paths (SCROLL-01, SCROLL-02, SCROLL-05)
+- [x] 22-02-PLAN.md — Server scrollback sender task (reliable SendStream-only, byte-credit, bounded mpsc drop-oldest, atomic epoch capture) + accept-gate flip in both session paths (SCROLL-01, SCROLL-02, SCROLL-05)
 - [ ] 22-03-PLAN.md — Client scrollback view: drain task, ScrollbackView state machine, Shift-PageUp/Down CSI interception, snap-back, epoch handoff, cold-reattach re-open (SCROLL-01, SCROLL-04, SCROLL-05)
 - [ ] 22-04-PLAN.md — Integration suite: basic fetch, PTY-latency isolation, drop-oldest, in-order under loss, epoch handoff, post-reattach (SCROLL-01, SCROLL-02, SCROLL-05)
 
@@ -169,4 +169,4 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
 | 20. Repaint Pacing | 2/2 | Complete    | 2026-06-11 |
 | 21. Channel Multiplexing Foundation | 4/4 | Complete    | 2026-06-11 |
-| 22. Scrollback Sync | 1/4 | In Progress|  |
+| 22. Scrollback Sync | 2/4 | In Progress|  |
