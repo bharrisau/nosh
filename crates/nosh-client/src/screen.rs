@@ -685,14 +685,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_monotonic_same_epoch_is_noop() {
+    fn apply_same_epoch_burst_applies() {
+        // Burst: two same-epoch diffs must both apply to the confirmed grid (D-20-07).
         let mut screen = ClientScreen::new(80, 24);
         let diff1 = make_diff(1, "hello");
         screen.apply(&diff1);
 
-        // Apply a different diff with the SAME epoch — must be ignored.
-        let diff_same = StateDiff {
-            epoch: 1, // same epoch
+        // Apply a second diff with the SAME epoch and different content.
+        let diff_burst = StateDiff {
+            epoch: 1, // same epoch as diff1 — burst datagram
             cols: 80,
             rows: 24,
             cursor: CursorPos { row: 0, col: 5 },
@@ -706,11 +707,41 @@ mod tests {
                 chars: "XXXXX".to_string(),
             }],
         };
-        screen.apply(&diff_same);
+        screen.apply(&diff_burst);
 
-        // Confirmed grid must still have the first apply's content.
-        assert_eq!(screen.confirmed_cell(0, 0).ch, 'h');
+        // Confirmed grid must show the second (burst) diff's content.
+        assert_eq!(screen.confirmed_cell(0, 0).ch, 'X', "burst datagram must overwrite first");
         assert_eq!(screen.last_applied_epoch(), 1);
+    }
+
+    #[test]
+    fn apply_monotonic_older_epoch_is_noop() {
+        // A strictly-older (replay/reorder) datagram must be discarded (T-20-06).
+        let mut screen = ClientScreen::new(80, 24);
+        let diff2 = make_diff(2, "world");
+        screen.apply(&diff2);
+
+        // Apply a diff with a STRICTLY OLDER epoch — must be ignored.
+        let diff_older = StateDiff {
+            epoch: 1, // strictly older than last applied (2)
+            cols: 80,
+            rows: 24,
+            cursor: CursorPos { row: 0, col: 5 },
+            alt_screen: false,
+            runs: vec![DiffRun {
+                row: 0,
+                start_col: 0,
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+                chars: "XXXXX".to_string(),
+            }],
+        };
+        screen.apply(&diff_older);
+
+        // Confirmed grid must still have epoch=2's content; older diff discarded.
+        assert_eq!(screen.confirmed_cell(0, 0).ch, 'w', "strictly older epoch must be discarded");
+        assert_eq!(screen.last_applied_epoch(), 2);
     }
 
     #[test]
