@@ -54,7 +54,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 ### v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness (Phases 19-22)
 
 - [x] **Phase 19: Full-Screen TUI Rendering Correctness** â Real alternate-screen buffer (two-grid model), wide-char/grapheme audit, predictor suppression, OSC OOM bound; makes vim/htop/Claude Code work correctly (completed 2026-06-07)
-- [ ] **Phase 20: Repaint Pacing** â Burst multiple state-diff datagrams per tick so full-screen repaints land in ~1 RTT; one epoch per tick; both 999.4 traps designed out architecturally
+- [x] **Phase 20: Repaint Pacing** â Burst multiple state-diff datagrams per tick so full-screen repaints land in ~1 RTT; one epoch per tick; both 999.4 traps designed out architecturally (completed 2026-06-11)
 - [ ] **Phase 21: Channel Multiplexing Foundation** â Control-first OPEN/ACCEPT/REJECT on control stream (id 0); discriminant-stability test first; per-channel flow control; clean lifecycle; scrollback channel type declared
 - [ ] **Phase 22: Scrollback Sync** â Scrollback delivered over the reliable scrollback channel; credit-based paging; alt-screen gate; Shift-PageUp/PageDown UX; consistent live-grid handoff and reattach survival
 
@@ -95,7 +95,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 
 **Plans**: 2 plans
 - [x] 20-01-PLAN.md — Server burst loop: send_burst() helper in both tick arms, DiffTickResult geometry, RED/GREEN burst-drain + one-epoch-per-tick tests (PACE-01, PACE-03, PACE-02)
-- [ ] 20-02-PLAN.md — Client apply() guard <=→<; same-epoch-burst test, older-epoch no-op test, noecho CI gate non-ignored (PACE-02)
+- [x] 20-02-PLAN.md — Client apply() guard <=→<; same-epoch-burst test, older-epoch no-op test, noecho CI gate non-ignored (PACE-02)
 
 **Security note**: Pitfalls R-1 and R-2 from PITFALLS.md are mandatory architectural constraints, not implementation options. Both caused the 999.4 revert. `burst_drains_when_grid_differs_from_acked_baseline` must be written as a RED-before test. `noecho_read_dash_s_zero_predicted_chars` must pass in CI before merge.
 
@@ -159,6 +159,6 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 17. Windows-Host Predictive Echo Validation | 1/1 | Shipped | 2026-06-02 |
 | 18. Security Design Pass | 0/? | Deferred | - |
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
-| 20. Repaint Pacing | 1/2 | In Progress|  |
+| 20. Repaint Pacing | 2/2 | Complete   | 2026-06-11 |
 | 21. Channel Multiplexing Foundation | 0/? | Not started | - |
 | 22. Scrollback Sync | 0/? | Not started | - |
