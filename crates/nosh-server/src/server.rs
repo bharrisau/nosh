@@ -1204,15 +1204,26 @@ async fn run_session(
                         match crate::channel::read_varint_u32(&mut ch_recv).await {
                             Ok(channel_id) => {
                                 if let Some(task_tx) = channel_map.get(&channel_id) {
-                                    let _ = task_tx
-                                        .try_send(ChannelEvent::Stream(ch_send, ch_recv));
+                                    // WR-01 fix: use send (not try_send) for Stream events so
+                                    // a momentarily-full task buffer does not silently discard
+                                    // the stream-bind. A permanently-lost Stream event would
+                                    // leave the channel task blocked forever waiting for a
+                                    // stream that will never arrive.
+                                    if task_tx.send(ChannelEvent::Stream(ch_send, ch_recv)).await.is_err() {
+                                        // Task already exited before the stream arrived; log and continue.
+                                        tracing::debug!(channel_id, "accept_bi: channel task gone before stream arrived");
+                                    }
                                 } else {
-                                    // Stream arrived before ACCEPT was processed, or channel
-                                    // was already closed. Drop the stream; log at debug level.
+                                    // CR-02 fix: explicitly reset the send side and stop the recv
+                                    // side before dropping, so the peer gets a clean signal instead
+                                    // of hanging until the QUIC idle timeout fires.
                                     tracing::debug!(
                                         channel_id,
-                                        "accept_bi: no channel task for id; dropping stream"
+                                        "accept_bi: no channel task for id; resetting stream"
                                     );
+                                    let mut ch_send = ch_send;
+                                    let _ = ch_send.reset(0u32.into());
+                                    ch_recv.stop(0u32.into()).ok();
                                 }
                             }
                             Err(_) => {
@@ -1258,42 +1269,51 @@ async fn run_session(
             // The arm runs on the session pump task which owns `send` — the
             // single-writer invariant for the control stream is maintained (A4).
             server_open_req = recv_or_pending(&mut server_open_rx_opt) => {
-                if let Some(ch_type) = server_open_req {
-                    let server_ch_id = next_server_channel_id;
-                    next_server_channel_id += 2; // advance: 1, 3, 5, …
-                    debug_assert!(server_ch_id % 2 != 0, "server channel id must be odd");
+                match server_open_req {
+                    Some(ch_type) => {
+                        let server_ch_id = next_server_channel_id;
+                        next_server_channel_id += 2; // advance: 1, 3, 5, …
+                        debug_assert!(server_ch_id % 2 != 0, "server channel id must be odd");
 
-                    if channel_map.len() >= MAX_OPEN_CHANNELS {
-                        tracing::warn!(
+                        if channel_map.len() >= MAX_OPEN_CHANNELS {
+                            tracing::warn!(
+                                server_ch_id,
+                                "server-initiated ChannelOpen rejected: channel cap reached"
+                            );
+                            continue;
+                        }
+
+                        let (task_tx, task_rx) = mpsc::channel::<ChannelEvent>(64);
+                        channel_map.insert(server_ch_id, task_tx);
+                        tokio::spawn(run_channel_task(
                             server_ch_id,
-                            "server-initiated ChannelOpen rejected: channel cap reached"
-                        );
-                        continue;
+                            task_rx,
+                            channel_ctrl_tx.clone(),
+                        ));
+
+                        tracing::debug!(server_ch_id, "server-initiated ChannelOpen");
+                        if nosh_proto::write_message(
+                            &mut send,
+                            &Message::ChannelOpen {
+                                channel_id: server_ch_id,
+                                channel_type: ch_type,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break SessionEnd::TransportLost;
+                        }
                     }
-
-                    let (task_tx, task_rx) = mpsc::channel::<ChannelEvent>(64);
-                    channel_map.insert(server_ch_id, task_tx);
-                    tokio::spawn(run_channel_task(
-                        server_ch_id,
-                        task_rx,
-                        channel_ctrl_tx.clone(),
-                    ));
-
-                    tracing::debug!(server_ch_id, "server-initiated ChannelOpen");
-                    if nosh_proto::write_message(
-                        &mut send,
-                        &Message::ChannelOpen {
-                            channel_id: server_ch_id,
-                            channel_type: ch_type,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break SessionEnd::TransportLost;
+                    None => {
+                        // WR-02 fix: sender was dropped; disable this arm permanently to
+                        // avoid a busy-loop. A closed receiver always returns None immediately,
+                        // which would starve the other select! arms on every iteration.
+                        // The session loop does NOT stop here — it continues draining PTY
+                        // output, incoming streams, and control frames normally.
+                        server_open_rx_opt = None;
                     }
                 }
-                // None means the sender was dropped; treat as session-pump signal to stop.
             }
         }
     };
@@ -1843,7 +1863,17 @@ async fn run_reattach_session(
                     }
 
                     Ok(Message::ChannelAccept { .. }) | Ok(Message::ChannelReject { .. }) => {
-                        // Server→client direction; receiving from the client is a protocol error.
+                        // IN-02: The blanket close here is currently correct because
+                        // run_reattach_session has no server-open infrastructure (no
+                        // server_open_rx_opt, no server_ch_id allocation). Unlike
+                        // run_session (which gates odd-id ChannelAccept/Reject behind
+                        // #[cfg(test)]), reattach has no server-initiated open path at all,
+                        // so both even and odd ids are protocol errors today.
+                        //
+                        // IMPORTANT: if run_reattach_session ever gains a server_open_rx_opt
+                        // arm (to support server-initiated opens on reattach), this blanket
+                        // close MUST be updated to mirror run_session's cfg-gated logic —
+                        // otherwise odd-id replies from the client will kill the session.
                         tracing::warn!("client sent ChannelAccept/ChannelReject on reattach session; closing");
                         break SessionEnd::ClientClosed;
                     }
@@ -1863,13 +1893,21 @@ async fn run_reattach_session(
                         match crate::channel::read_varint_u32(&mut ch_recv).await {
                             Ok(channel_id) => {
                                 if let Some(task_tx) = channel_map.get(&channel_id) {
-                                    let _ = task_tx
-                                        .try_send(ChannelEvent::Stream(ch_send, ch_recv));
+                                    // WR-01 fix: use send (not try_send) for Stream events.
+                                    // See run_session arm for full rationale.
+                                    if task_tx.send(ChannelEvent::Stream(ch_send, ch_recv)).await.is_err() {
+                                        tracing::debug!(channel_id, "accept_bi (reattach): channel task gone before stream arrived");
+                                    }
                                 } else {
+                                    // CR-02 fix: explicitly reset before dropping so the peer
+                                    // gets a clean signal rather than hanging until idle timeout.
                                     tracing::debug!(
                                         channel_id,
-                                        "accept_bi (reattach): no channel task for id; dropping stream"
+                                        "accept_bi (reattach): no channel task for id; resetting stream"
                                     );
+                                    let mut ch_send = ch_send;
+                                    let _ = ch_send.reset(0u32.into());
+                                    ch_recv.stop(0u32.into()).ok();
                                 }
                             }
                             Err(_) => {
