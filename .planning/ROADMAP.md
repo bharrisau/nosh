@@ -115,7 +115,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 
 **Plans**: 4 plans
 - [x] 21-01-PLAN.md — Append ChannelOpen/Accept/Reject/Credit/Close + ChannelType to nosh-proto; message_discriminant_order_is_stable test (FIRST commit) (MUX-06) — d5f7e76
-- [ ] 21-02-PLAN.md — Server mux: control dispatch + post-auth accept_bi arm + per-channel task + 256 KiB credit + lifecycle (MUX-01, MUX-02, MUX-03, MUX-04)
+- [x] 21-02-PLAN.md — Server mux: control dispatch + post-auth accept_bi arm + per-channel task + 256 KiB credit + lifecycle (MUX-01, MUX-02, MUX-03, MUX-04)
 - [ ] 21-03-PLAN.md — Client mux: open_channel + even-id allocator + varint prefix + channel drain task + credit grant + reattach re-open helpers (MUX-01..MUX-05)
 - [ ] 21-04-PLAN.md — Echo-channel integration suite: lifecycle, opaque REJECT, <5 ms PTY latency, backpressure, simultaneous-open, cold-reattach re-open (MUX-01..MUX-05)
 
@@ -164,5 +164,5 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 18. Security Design Pass | 0/? | Deferred | - |
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
 | 20. Repaint Pacing | 2/2 | Complete    | 2026-06-11 |
-| 21. Channel Multiplexing Foundation | 1/4 | Executing | 2026-06-11 |
+| 21. Channel Multiplexing Foundation | 2/4 | In Progress|  |
 | 22. Scrollback Sync | 0/? | Not started | - |
