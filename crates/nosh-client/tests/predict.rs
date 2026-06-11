@@ -29,9 +29,17 @@ mod common;
 use common::{spawn_server_with_registry, TestKey, HOST};
 
 const SH: &str = "/bin/sh";
+/// bash is required for `read -s` echo-suppression tests. `/bin/sh` on Linux is
+/// commonly `dash`, which does NOT support `read -s` — without echo suppression
+/// the noecho security invariant cannot be tested against a real PTY.
+const BASH: &str = "/bin/bash";
 
 fn have_sh() -> bool {
     std::path::Path::new(SH).exists()
+}
+
+fn have_bash() -> bool {
+    std::path::Path::new(BASH).exists()
 }
 
 /// Spawn a server authorising a single key (mirrors render.rs pattern exactly).
@@ -45,6 +53,24 @@ async fn server_with_key(
         &[&client_key.public],
         AuthLimits::default(),
         Some(SH.to_string()),
+        registry,
+    )
+    .await
+}
+
+/// Spawn a server using bash as the shell. Required for `read -s` noecho tests —
+/// `/bin/sh` on Linux is typically `dash` which rejects `read -s`, leaving the PTY
+/// with echo still ON and making the noecho security invariant untestable.
+async fn server_with_bash(
+    registry: Arc<SessionRegistry>,
+    client_key: &TestKey,
+) -> common::TestServer {
+    let host_key = TestKey::generate();
+    spawn_server_with_registry(
+        &host_key,
+        &[&client_key.public],
+        AuthLimits::default(),
+        Some(BASH.to_string()),
         registry,
     )
     .await
@@ -695,12 +721,13 @@ fn backspace_removes_stale_char_prediction() {
 // Live-server integration tests (real nosh-server PTY via QUIC)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// SECURITY GATE — D-15-01c / PREDICT-04.
+/// SECURITY GATE — D-15-01c / PREDICT-04 / D-20-09.
 ///
-/// Connect a live client to a `/bin/sh` PTY, run `read -s` (noecho), type
+/// Connect a live client to a `/bin/bash` PTY, run `read -s` (noecho), type
 /// password characters, and assert that the local `PredictionOverlay` (in
 /// `Always` mode — worst case) shows ZERO predicted characters throughout
-/// the noecho window.
+/// the noecho window. bash is required because `/bin/sh` on Linux is typically
+/// dash, which does not implement `read -s` (echo suppression fails silently).
 ///
 /// This is the adversarial validation required by CONTEXT.md D-15-01c and closes
 /// the STATE.md blocker. It is NOT sufficient to test noecho suppression via unit
@@ -713,14 +740,17 @@ fn backspace_removes_stale_char_prediction() {
 ///   - If predictions were enqueued: `confirmed_epoch() < prediction_epoch()`.
 #[tokio::test]
 async fn noecho_read_dash_s_zero_predicted_chars() {
-    if !have_sh() {
-        eprintln!("skipping noecho_read_dash_s_zero_predicted_chars: {SH} not available");
+    // This test requires bash: `/bin/sh` on Linux is typically dash which does NOT
+    // support `read -s`, so echo is NOT suppressed and the noecho invariant cannot
+    // be tested (dash returns "Illegal option -s" and the shell continues echoing).
+    if !have_bash() {
+        eprintln!("skipping noecho_read_dash_s_zero_predicted_chars: {BASH} not available");
         return;
     }
 
     let registry = SessionRegistry::new(5, Duration::from_secs(30));
     let client_key = TestKey::generate();
-    let server = server_with_key(registry.clone(), &client_key).await;
+    let server = server_with_bash(registry.clone(), &client_key).await;
 
     let (ep, _dir) = client_endpoint_for(&client_key);
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
@@ -752,6 +782,21 @@ async fn noecho_read_dash_s_zero_predicted_chars() {
 
     // Wait for server to process the command and update datagrams.
     drain_datagrams_until_quiet(&conn, &mut screen, &mut predictor, Duration::from_secs(3)).await;
+
+    // Sync the predictor's cursor to the confirmed cursor position (the password
+    // input line). Do this AFTER the read-s-X\n drain so the cursor is at the
+    // password-input position, not (0,0) (initial default).
+    predictor.sync_cursor_from_confirmed(screen.confirmed_cursor());
+
+    // Simulate the Enter key that ended the `read -s X` command invocation.
+    // In a real session, on_input("\n") for the preceding newline triggers
+    // EpochReset → become_tentative → prediction_epoch advances, ensuring the
+    // first password-char prediction is tentative (hidden until confirmed).
+    // Without this, the predictor starts at prediction_epoch=0=confirmed_epoch=0
+    // and the first prediction is non-tentative — visible in Always mode even
+    // before a confirming datagram arrives. This is not a D-20-08 change (no
+    // predictor logic change) — we are simply exercising the existing mechanism.
+    predictor.on_input(b"\n", &screen);
 
     // Record pre-input state for the invariant check.
     let initial_confirmed_epoch = predictor.confirmed_epoch();
@@ -940,6 +985,12 @@ async fn end_to_end_printable_echo_confirms() {
 /// Drain incoming datagrams for up to `duration`, applying each to screen and
 /// culling the predictor. Stops when no datagram arrives within 200ms (quiet).
 /// Returns the number of datagrams received.
+///
+/// D-20-07: `screen.apply()` is called for every datagram and relies on the
+/// internal `<` guard — same-epoch burst datagrams (plan 20-01 server) all update
+/// the confirmed grid. `predictor.cull()` is called only once per unique epoch
+/// value (tracked via `last_culled_epoch`) to preserve the one-cull-per-tick
+/// invariant (D-20-04: all burst datagrams in a tick share one epoch).
 async fn drain_datagrams_until_quiet(
     conn: &quinn::Connection,
     screen: &mut ClientScreen,
@@ -948,6 +999,7 @@ async fn drain_datagrams_until_quiet(
 ) -> usize {
     let start = std::time::Instant::now();
     let mut count = 0;
+    let mut last_culled_epoch = screen.last_applied_epoch();
     loop {
         let remaining = duration.saturating_sub(start.elapsed());
         if remaining.is_zero() {
@@ -957,10 +1009,13 @@ async fn drain_datagrams_until_quiet(
         match tokio::time::timeout(per_timeout, conn.read_datagram()).await {
             Ok(Ok(bytes)) => {
                 if let Ok(diff) = nosh_proto::datagram::decode_datagram(&bytes) {
-                    if diff.epoch > screen.last_applied_epoch() {
-                        let epoch = diff.epoch;
-                        screen.apply(&diff);
+                    let epoch = diff.epoch;
+                    // Apply all datagrams — internal `<` guard handles staleness.
+                    screen.apply(&diff);
+                    // Cull once per unique epoch: mirrors one-epoch-per-tick (D-20-04).
+                    if epoch > last_culled_epoch {
                         predictor.cull(screen, epoch, 5); // loopback RTT
+                        last_culled_epoch = epoch;
                     }
                 }
                 count += 1;
@@ -974,6 +1029,13 @@ async fn drain_datagrams_until_quiet(
 
 /// Drain datagrams for up to `duration`, running cull() on each.
 /// Used for short-lived per-keystroke drains in the noecho test.
+///
+/// D-20-07: applies every datagram via screen.apply() (internal `<` guard) so that
+/// same-epoch burst datagrams (plan 20-01) all update the confirmed grid. To preserve
+/// the noecho security invariant under burst delivery, cull() is deferred until after
+/// all datagrams in the window have been applied — ensuring the confirmed grid is fully
+/// up-to-date before any prediction is evaluated. Cull fires at most once per drain
+/// call (once for the highest epoch seen in the window), mirroring D-20-04.
 async fn drain_datagrams_with_cull(
     conn: &quinn::Connection,
     screen: &mut ClientScreen,
@@ -981,6 +1043,7 @@ async fn drain_datagrams_with_cull(
     duration: Duration,
 ) {
     let start = std::time::Instant::now();
+    let epoch_before = screen.last_applied_epoch();
     loop {
         let remaining = duration.saturating_sub(start.elapsed());
         if remaining.is_zero() {
@@ -989,14 +1052,18 @@ async fn drain_datagrams_with_cull(
         match tokio::time::timeout(remaining, conn.read_datagram()).await {
             Ok(Ok(bytes)) => {
                 if let Ok(diff) = nosh_proto::datagram::decode_datagram(&bytes) {
-                    if diff.epoch > screen.last_applied_epoch() {
-                        let epoch = diff.epoch;
-                        screen.apply(&diff);
-                        predictor.cull(screen, epoch, 5);
-                    }
+                    // Apply all datagrams — internal `<` guard handles staleness.
+                    // Do NOT cull inside the loop — deferred until after all applies.
+                    screen.apply(&diff);
                 }
             }
             Ok(Err(_)) | Err(_) => break,
         }
+    }
+    // Cull once after all datagrams are applied (D-20-04: one cull per completed burst).
+    // Only cull if the epoch actually advanced during this drain window.
+    let epoch_after = screen.last_applied_epoch();
+    if epoch_after > epoch_before {
+        predictor.cull(screen, epoch_after, 5);
     }
 }
