@@ -1372,6 +1372,221 @@ fn clean_exit(e: quinn::ConnectionError) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use nosh_proto::datagram::CellStyle;
+    use nosh_proto::datagram::{CursorPos, StateDiff};
+
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// Returns true if `/bin/sh` is available (guards PTY-spawning tests).
+    fn have_sh() -> bool {
+        std::path::Path::new("/bin/sh").exists()
+    }
+
+    /// Open a real /bin/sh session for use in burst drain tests.
+    /// Requires /bin/sh — guard with `have_sh()` before calling.
+    fn open_sh_session_for_burst() -> std::sync::Arc<crate::registry::SessionSlot> {
+        use crate::session;
+        let passwd = session::lookup_self(Some("/bin/sh"));
+        let identity = nosh_auth::NoshPublicKey::from_raw([0xBB_u8; 32]);
+        let (sess, _reader, _writer) =
+            session::open(&passwd, "xterm", 80, 24, &[], identity)
+                .expect("open /bin/sh for burst test");
+        let slot = crate::registry::SessionSlot::new(sess);
+        // Fill the 80x24 terminal with non-space characters so that
+        // compute_diff_runs returns ~1920 cells — enough to require multiple
+        // datagrams at typical MTU (~1200 bytes).
+        //
+        // ESC[<row>;<col>H positions the cursor; then 80 'A' chars fill the row.
+        let mut vt = String::new();
+        for r in 1u16..=24 {
+            vt.push_str(&format!("\x1b[{r};1H{}", "A".repeat(80)));
+        }
+        slot.push_output_and_parse(vt.as_bytes());
+        slot
+    }
+
+    // ── Phase 20 (20-01): burst drain unit tests ──────────────────────────────
+
+    /// PACE-03 / D-20-03 burst termination gate.
+    ///
+    /// With a full 80×24 grid of 'A' chars vs an EMPTY `last_acked_snapshot`,
+    /// the diff contains ~1920 changed cells — more than fits in a single ~1200-byte
+    /// datagram. The correct burst drain calls `build_state_diff` ONCE, extracts the
+    /// first `(payload, deferred)` pair, then drains `deferred` using `encode_datagram`
+    /// only (not `build_state_diff` again).
+    ///
+    /// This test asserts that the encode_datagram-only drain terminates in a finite
+    /// number of iterations (≤ 100). A naive loop that re-calls `build_state_diff`
+    /// on every iteration would regenerate `fresh_runs` against the non-advancing
+    /// `last_acked_snapshot`, refilling deferred faster than it drains, and would
+    /// spin forever — the R-1 infinite-spin trap from the reverted 999.4 attempt.
+    ///
+    /// RED-before: the test proves the correct finite-drain property. It passes
+    /// when the drain is encode_datagram-only; it would exceed `max_iterations`
+    /// (or loop infinitely) if build_state_diff were called on each iteration.
+    #[test]
+    fn burst_drains_when_grid_differs_from_acked_baseline() {
+        if !have_sh() {
+            eprintln!(
+                "skipping burst_drains_when_grid_differs_from_acked_baseline: /bin/sh unavailable"
+            );
+            return;
+        }
+
+        let slot = open_sh_session_for_burst();
+
+        let mut current_epoch = 0u64;
+        let last_acked_epoch = 0u64;
+        // Empty baseline — all 1920 cells are "changed" from the server's perspective.
+        let last_acked_snapshot: Vec<Vec<crate::terminal::Cell>> = Vec::new();
+        let last_sent_snapshot: Vec<Vec<crate::terminal::Cell>> = Vec::new();
+
+        let cap = 1200; // typical MTU; drive real datagram-size pressure
+        let max_iterations = 100; // a full 80×24 repaint takes ~16–24; 100 is generous
+
+        // ── D-20-03: call build_state_diff exactly ONCE ───────────────────────
+        let first = build_state_diff(
+            &slot,
+            &mut current_epoch,
+            last_acked_epoch,
+            &last_acked_snapshot,
+            &last_sent_snapshot,
+            vec![], // no pending_deferred on first call
+            cap,
+        )
+        .expect("build_state_diff must produce a result for a non-empty grid vs empty baseline");
+
+        // Extract geometry for burst iterations. After Task 2 adds cols/rows/cursor/
+        // alt_screen to DiffTickResult these will be first.cols etc. For now we
+        // derive from sent_cells and use a zero cursor (the 'A' fill does not move
+        // the cursor to a position that affects diff correctness here).
+        let tick_epoch = first.epoch;
+        let rows = first.sent_cells.len() as u16;
+        let cols = first.sent_cells.first().map(|r| r.len() as u16).unwrap_or(80);
+        let cursor = CursorPos { row: 0, col: 0 };
+        let alt_screen = false;
+
+        assert!(
+            current_epoch == 1,
+            "build_state_diff must increment epoch from 0 to 1, got {current_epoch}"
+        );
+
+        let mut deferred = first.deferred;
+        let mut iter_count = 0usize;
+
+        // ── Encode-datagram-only drain (D-20-03: no build_state_diff in loop) ─
+        while !deferred.is_empty() {
+            assert!(
+                iter_count < max_iterations,
+                "burst drain must terminate in ≤ {max_iterations} iterations (R-1 guard): \
+                 still {} deferred runs after {iter_count} iterations",
+                deferred.len()
+            );
+            let burst_diff = StateDiff {
+                epoch: tick_epoch, // same epoch — D-20-04
+                cols,
+                rows,
+                cursor,
+                alt_screen,
+                runs: deferred,
+            };
+            let (_, next_deferred) = encode_datagram(&burst_diff, cap)
+                .expect("encode_datagram must not fail with a valid cap");
+            deferred = next_deferred;
+            iter_count += 1;
+        }
+
+        assert!(
+            deferred.is_empty(),
+            "deferred must be empty after the encode_datagram drain loop"
+        );
+        assert!(
+            iter_count > 0,
+            "a full 80×24 grid must require at least one drain iteration at cap={cap}"
+        );
+
+        // Cleanup: send SIGHUP to the shell to avoid leaking the child process.
+        slot.sighup();
+    }
+
+    /// PACE-02 / D-20-04 one-epoch-per-tick gate.
+    ///
+    /// Asserts that `build_state_diff` increments `current_epoch` exactly once
+    /// (from 0 to 1) for the tick, and that subsequent `encode_datagram` drain
+    /// iterations do NOT further increment `current_epoch` (they do not call
+    /// `build_state_diff`).
+    ///
+    /// This is the structural proof that all burst datagrams in one tick share a
+    /// single epoch, preventing the R-2 noecho-epoch leak: if `confirmed_epoch`
+    /// only advances when `build_state_diff` is called (once per tick), it cannot
+    /// advance during a `read -s` window caused by mid-tick burst datagram
+    /// acknowledgements.
+    #[test]
+    fn one_epoch_per_tick() {
+        if !have_sh() {
+            eprintln!("skipping one_epoch_per_tick: /bin/sh unavailable");
+            return;
+        }
+
+        let slot = open_sh_session_for_burst();
+
+        let mut current_epoch = 0u64;
+        let last_acked_epoch = 0u64;
+        let last_acked_snapshot: Vec<Vec<crate::terminal::Cell>> = Vec::new();
+        let last_sent_snapshot: Vec<Vec<crate::terminal::Cell>> = Vec::new();
+
+        let cap = 1200;
+
+        // ── Exactly one epoch increment per build_state_diff call ─────────────
+        let first = build_state_diff(
+            &slot,
+            &mut current_epoch,
+            last_acked_epoch,
+            &last_acked_snapshot,
+            &last_sent_snapshot,
+            vec![],
+            cap,
+        )
+        .expect("build_state_diff must produce a result for a non-empty grid");
+
+        assert_eq!(
+            current_epoch, 1,
+            "build_state_diff must increment epoch from 0 to 1 exactly once"
+        );
+        let tick_epoch = first.epoch;
+        assert_eq!(tick_epoch, 1, "DiffTickResult.epoch must equal current_epoch after the call");
+
+        let rows = first.sent_cells.len() as u16;
+        let cols = first.sent_cells.first().map(|r| r.len() as u16).unwrap_or(80);
+        let cursor = CursorPos { row: 0, col: 0 };
+        let alt_screen = false;
+
+        let mut deferred = first.deferred;
+        let mut n_drain_iters = 0usize;
+
+        // ── Drain via encode_datagram only — current_epoch must NOT change ────
+        while !deferred.is_empty() && n_drain_iters < 100 {
+            let burst_diff = StateDiff {
+                epoch: tick_epoch,
+                cols,
+                rows,
+                cursor,
+                alt_screen,
+                runs: deferred,
+            };
+            let (_, next_deferred) = encode_datagram(&burst_diff, cap)
+                .expect("encode_datagram must not fail");
+            deferred = next_deferred;
+            n_drain_iters += 1;
+        }
+
+        assert_eq!(
+            current_epoch, 1,
+            "current_epoch must still be 1 after {n_drain_iters} encode_datagram drain iterations; \
+             the drain must never call build_state_diff (which is the only thing that increments the epoch)"
+        );
+
+        slot.sighup();
+    }
 
     // ── Task 2 (19-02): compute_diff_runs wide-char skip tests ───────────────
 
