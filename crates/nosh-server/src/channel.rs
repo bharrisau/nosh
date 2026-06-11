@@ -208,7 +208,9 @@ async fn run_echo_loop(
     loop {
         if remaining_credit == 0 {
             // Credit exhausted: wait for a replenishment event before attempting
-            // any further sends (MUX-03 back-pressure; T-21-05).
+            // any further reads or sends (MUX-03 back-pressure; T-21-05).
+            // IMPORTANT: do NOT attempt read(&mut buf[..0]) here — that returns
+            // Ok(None) and is misread as EOF. Block until credit arrives.
             match events.recv().await {
                 Some(ChannelEvent::Credit(n)) => {
                     remaining_credit = remaining_credit.saturating_add(n);
@@ -219,19 +221,24 @@ async fn run_echo_loop(
             continue;
         }
 
+        // CR-01 fix: cap the read to however many bytes we can actually send so
+        // that n <= remaining_credit is always guaranteed. Without this cap, bytes
+        // that exceed the window are consumed from the QUIC RecvStream but silently
+        // discarded on the echo path, creating a permanent accounting divergence the
+        // peer cannot detect.
+        let read_cap = remaining_credit.min(buf.len() as u64) as usize;
+
         tokio::select! {
-            // Try to read from the channel stream.
-            read_res = ch_recv.read(&mut buf) => {
+            // Try to read from the channel stream (capped to remaining credit).
+            read_res = ch_recv.read(&mut buf[..read_cap]) => {
                 match read_res {
                     Ok(Some(n)) => {
-                        let data = &buf[..n];
-                        // Cap the echo to the remaining credit so we never
-                        // overrun the window.
-                        let to_send = (n as u64).min(remaining_credit) as usize;
-                        if ch_send.write_all(&data[..to_send]).await.is_err() {
+                        // n <= read_cap <= remaining_credit, so no credit overrun
+                        // is possible and the min guard is a tautology.
+                        if ch_send.write_all(&buf[..n]).await.is_err() {
                             break;
                         }
-                        remaining_credit -= to_send as u64;
+                        remaining_credit -= n as u64;
                     }
                     Ok(None) => break, // RecvStream EOF — peer half-closed
                     Err(_) => break,
@@ -255,9 +262,15 @@ async fn run_echo_loop(
 mod tests {
     use super::*;
 
-    /// Verify that `read_varint_u32` correctly decodes single-byte and multi-byte
-    /// LEB128-encoded u32 values. The encoded bytes match postcard's varint
-    /// representation (which the opener writes via `postcard::to_allocvec`).
+    /// Verify that the LEB128 wire encoding table is correct (IN-01 wire-spec test).
+    ///
+    /// This is a **wire-encoding specification test** — it confirms that the byte
+    /// sequences the opener writes via `postcard::to_allocvec(&channel_id_u32)` are
+    /// what the LEB128 algorithm produces. It complements (but does not replace) the
+    /// integration tests that exercise `read_varint_u32` end-to-end via a real QUIC
+    /// connection (`accept_bi` in channel_mux.rs). `RecvStream` is not constructable
+    /// without a live QUIC pair, so a standalone unit test of the actual code path is
+    /// not practical here.
     ///
     /// LEB128 encoding: each byte contributes 7 bits (little-endian); high bit set
     /// means more bytes follow. Values 0–127 encode as a single byte.
