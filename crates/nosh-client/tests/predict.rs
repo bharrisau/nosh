@@ -744,8 +744,11 @@ async fn noecho_read_dash_s_zero_predicted_chars() {
     // support `read -s`, so echo is NOT suppressed and the noecho invariant cannot
     // be tested (dash returns "Illegal option -s" and the shell continues echoing).
     if !have_bash() {
-        eprintln!("skipping noecho_read_dash_s_zero_predicted_chars: {BASH} not available");
-        return;
+        panic!(
+            "SECURITY GATE: noecho_read_dash_s_zero_predicted_chars requires /bin/bash \
+             (D-20-09 mandatory CI gate). bash was not found at {BASH}. \
+             Ensure bash is installed in this CI environment."
+        );
     }
 
     let registry = SessionRegistry::new(5, Duration::from_secs(30));
