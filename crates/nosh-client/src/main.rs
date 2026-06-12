@@ -674,6 +674,46 @@ mod scrollback_view_epoch_tests {
         assert!(!should_exit, "epoch < epoch_at_snapshot must NOT trigger exit");
     }
 
+    /// CR-C-01: epoch_at_snapshot must be seeded from the LIVE epoch at entry, not 0.
+    ///
+    /// If seeded to 0, `diff.epoch >= 0` is always true (any live datagram has
+    /// epoch >= 1), so the gate fires immediately and scrollback exits before the
+    /// first page arrives. Seeding from the current applied epoch (e.g. 7) means
+    /// datagrams with epoch < 7 are correctly suppressed and Active is preserved
+    /// until the server epoch catches up to the snapshot.
+    #[test]
+    fn epoch_at_snapshot_seeded_to_zero_causes_premature_exit() {
+        // Simulate the BROKEN behaviour (epoch_at_snapshot = 0):
+        // any live datagram (epoch >= 1) triggers the exit gate.
+        let broken_view = active_view(0, 100);
+        let live_epoch = 7u64; // first datagram after entering scrollback
+        let would_exit = matches!(&broken_view, ScrollbackView::Active { epoch_at_snapshot, .. }
+            if live_epoch >= *epoch_at_snapshot);
+        assert!(
+            would_exit,
+            "seeding epoch_at_snapshot=0 must show the bug: gate fires on live_epoch={live_epoch}"
+        );
+
+        // Simulate the CORRECT behaviour (epoch_at_snapshot = current applied epoch = 7):
+        // datagrams with epoch < 7 do NOT exit; only epoch >= 7 does.
+        let correct_view = active_view(7, 100);
+        let early_epoch = 6u64;
+        let should_stay = !matches!(&correct_view, ScrollbackView::Active { epoch_at_snapshot, .. }
+            if early_epoch >= *epoch_at_snapshot);
+        assert!(
+            should_stay,
+            "seeding epoch_at_snapshot=7 must keep Active for early_epoch={early_epoch}"
+        );
+
+        let catchup_epoch = 7u64;
+        let should_exit = matches!(&correct_view, ScrollbackView::Active { epoch_at_snapshot, .. }
+            if catchup_epoch >= *epoch_at_snapshot);
+        assert!(
+            should_exit,
+            "seeding epoch_at_snapshot=7 must exit Active when catchup_epoch={catchup_epoch}"
+        );
+    }
+
     /// Lazy prefetch triggers when near top of held buffer and total_available > lines.len().
     ///
     /// Near-top is defined as: offset + page_height >= lines.len() - some threshold.
@@ -1787,11 +1827,19 @@ async fn run_pump(
                                 ScrollbackView::Live => {
                                     // Enter scrollback mode and issue the first request.
                                     // pending_request=true until the first page arrives.
+                                    //
+                                    // CR-C-01 fix: seed epoch_at_snapshot from the screen's
+                                    // current applied epoch so the SCROLL-05 epoch gate
+                                    // (~1507) does NOT fire until the server's epoch actually
+                                    // catches up. Seeding to 0 would cause the gate to fire
+                                    // on the very next datagram (diff.epoch >= 0 is always
+                                    // true), exiting scrollback before the first page arrives.
+                                    let epoch_at_entry = screen.last_applied_epoch();
                                     scrollback_view = ScrollbackView::Active {
                                         lines: vec![],
                                         offset: 0,
                                         pending_request: true,
-                                        epoch_at_snapshot: 0, // updated on first page
+                                        epoch_at_snapshot: epoch_at_entry,
                                         total_available: 0,
                                     };
                                     // Send the initial ScrollbackRequest on the channel's own
