@@ -1335,6 +1335,12 @@ async fn run_pump(
     // to the wire in a dedicated select arm.
     let (scrollback_ctrl_tx, mut scrollback_ctrl_rx) = mpsc::channel::<Message>(16);
 
+    // mpsc for ScrollbackRequest routing (Open Question 1 / M-2 safety).
+    // run_pump sends ScrollbackRequest frames here; the drain task forwards them
+    // to ch_send (the channel's own data stream), avoiding the M-2 deadlock that
+    // would occur if requests traveled on the shared control stream.
+    let (scrollback_req_tx, scrollback_req_rx) = mpsc::channel::<Message>(16);
+
     // Open the Scrollback channel. A Rejected response is non-fatal — the view
     // simply stays in Live mode with no history fetching (server may not support
     // it yet during a phase transition).
@@ -1360,6 +1366,7 @@ async fn run_pump(
 
     // Spawn the drain task if the channel was accepted.
     // The task holds ch_send/ch_recv exclusively (M-6 isolation: M-2 pitfall avoidance).
+    // req_rx feeds ScrollbackRequest frames from run_pump to ch_send (Open Question 1).
     if let Some((ch_send, ch_recv)) = scrollback_streams {
         tokio::spawn(run_scrollback_drain_task(
             scrollback_channel_id,
@@ -1367,6 +1374,7 @@ async fn run_pump(
             ch_send,
             scrollback_ctrl_tx.clone(),
             page_tx,
+            scrollback_req_rx,
         ));
     }
 
@@ -1490,6 +1498,31 @@ async fn run_pump(
                         if let Ok(diff) = nosh_proto::datagram::decode_datagram(&bytes) {
                             // T-14-06: monotonic epoch gate — stale/replayed diffs discarded.
                             if diff.epoch > screen.last_applied_epoch() {
+                                // SCROLL-05 epoch-gated exit: while in Active scrollback mode,
+                                // datagrams are NOT applied to the display, but their epoch acks
+                                // still flow so the server pump never stalls (T-22-12).
+                                // When a datagram with epoch >= epoch_at_snapshot arrives, exit
+                                // Active and apply this datagram normally (handoff, SCROLL-05).
+                                if let ScrollbackView::Active { epoch_at_snapshot, .. } = scrollback_view {
+                                    if diff.epoch < epoch_at_snapshot {
+                                        // Still in scrollback window: suppress display but emit epoch ack.
+                                        // Ack-flow continuity: the server pump must never stall because
+                                        // the client is in scrollback mode (T-22-12).
+                                        let ack_payload = nosh_proto::datagram::encode_epoch_ack(diff.epoch);
+                                        let _ = conn.send_datagram(ack_payload);
+                                        // Do NOT apply to screen, do NOT render. Skip rest of datagram arm.
+                                        continue;
+                                    } else {
+                                        // epoch >= epoch_at_snapshot: exit scrollback, apply this diff normally.
+                                        scrollback_view = ScrollbackView::Live;
+                                        tracing::debug!(
+                                            epoch = diff.epoch,
+                                            epoch_at_snapshot,
+                                            "SCROLL-05: epoch gate reached — exiting scrollback to Live"
+                                        );
+                                    }
+                                }
+
                                 // QOL-01: reset silence timer on every fresh datagram.
                                 last_datagram_time = tokio::time::Instant::now();
                                 // Clear the loss overlay if it was active (connection resumed).
@@ -1673,15 +1706,49 @@ async fn run_pump(
                     }
                 }
             }
-            // Scrollback page delivery from drain task to view buffer (Task 2b).
-            // Minimal stub here: page forwarding and epoch-gated exit are implemented
-            // in Task 2b. Here we just drain the channel to avoid back-pressure.
+            // Scrollback page delivery from drain task to view buffer (Task 2b / SCROLL-01).
+            //
+            // While Active: append received lines to the front of the view buffer
+            // (oldest-first ordering preserved), update metadata, clear pending_request,
+            // and redraw. While Live: drop the page (RESEARCH Open Question 3 / T-22-14).
             msg = page_rx.recv() => {
-                if let Some(Message::ScrollbackPage { .. }) = msg {
-                    // Task 2b will implement the full page_rx arm behavior.
-                    // For now: if Active, append lines; if Live, drop.
-                    // Stub: drop unconditionally (no scrollback display yet).
-                    let _ = &scrollback_view; // suppress unused-variable warning
+                if let Some(Message::ScrollbackPage {
+                    from_line: _,
+                    total_available: new_total,
+                    epoch_at_snapshot: new_epoch,
+                    lines: new_lines,
+                    ..
+                }) = msg {
+                    match &mut scrollback_view {
+                        ScrollbackView::Active {
+                            lines,
+                            epoch_at_snapshot,
+                            total_available,
+                            pending_request,
+                            ..
+                        } => {
+                            // Prepend new (older) lines to the front of the held buffer.
+                            // oldest-first ordering: new_lines are older than lines.
+                            let mut combined = new_lines;
+                            combined.extend(lines.drain(..));
+                            *lines = combined;
+                            *epoch_at_snapshot = new_epoch;
+                            *total_available = new_total;
+                            *pending_request = false;
+                            tracing::debug!(
+                                lines_held = lines.len(),
+                                total_available = new_total,
+                                epoch_at_snapshot = new_epoch,
+                                "scrollback page received: view buffer updated"
+                            );
+                            // TODO: render scrollback view from lines+offset once
+                            // the rendering path is wired (SCROLL-01 display).
+                        }
+                        ScrollbackView::Live => {
+                            // In Live mode, in-flight pages are dropped (T-22-14 / Open Question 3).
+                            tracing::debug!("scrollback page received while Live — dropped");
+                        }
+                    }
                 }
             }
             // Scrollback control frames (ChannelCredit, ChannelClose) from drain task.
@@ -1719,6 +1786,7 @@ async fn run_pump(
                             match &scrollback_view {
                                 ScrollbackView::Live => {
                                     // Enter scrollback mode and issue the first request.
+                                    // pending_request=true until the first page arrives.
                                     scrollback_view = ScrollbackView::Active {
                                         lines: vec![],
                                         offset: 0,
@@ -1726,20 +1794,46 @@ async fn run_pump(
                                         epoch_at_snapshot: 0, // updated on first page
                                         total_available: 0,
                                     };
-                                    // Send the first ScrollbackRequest on the scrollback channel.
-                                    // Note: ch_send was consumed by the drain task — the request
-                                    // is sent by the drain task reading from ch_recv (server side).
-                                    // The client signals via the control stream (ScrollbackRequest
-                                    // travels on the channel's own data stream per Open Question 1).
-                                    // For now, note that the scrollback ch_send is in the drain task.
-                                    // TODO in Task 2b: wire the request send path.
-                                    tracing::debug!("Shift-PageUp: entering scrollback Active mode");
+                                    // Send the initial ScrollbackRequest on the channel's own
+                                    // send stream via req_tx → drain task → ch_send.
+                                    // This avoids the M-2 control/data flow-control deadlock
+                                    // (Open Question 1): requests travel on ch_send, NOT the
+                                    // control stream.
+                                    let req = Message::ScrollbackRequest {
+                                        channel_id: scrollback_channel_id,
+                                        from_line: 0,
+                                        count: 256,
+                                    };
+                                    let _ = scrollback_req_tx.try_send(req);
+                                    tracing::debug!("Shift-PageUp: entering scrollback Active mode, sent initial request");
                                 }
-                                ScrollbackView::Active { offset, .. } => {
-                                    // Already active: page up.
-                                    let o = *offset;
-                                    if let ScrollbackView::Active { offset, .. } = &mut scrollback_view {
-                                        *offset = o.saturating_add(screen.size().1 as usize);
+                                ScrollbackView::Active { offset, lines, pending_request, total_available, .. } => {
+                                    // Already active: page up (increase offset = scroll toward older lines).
+                                    let rows = screen.size().1 as usize;
+                                    let new_offset = offset.saturating_add(rows);
+                                    let lines_len = lines.len();
+                                    let total_avail = *total_available;
+                                    let pend = *pending_request;
+                                    if let ScrollbackView::Active { offset, pending_request, .. } = &mut scrollback_view {
+                                        *offset = new_offset;
+                                        // Lazy prefetch: when near the top of the held buffer and
+                                        // more history is available, issue the next request
+                                        // (SCROLL-01 / Task 2b). Gate: !pending_request AND
+                                        // lines.len() < total_available (not at true top).
+                                        if !pend && (lines_len as u64) < total_avail {
+                                            let req = Message::ScrollbackRequest {
+                                                channel_id: scrollback_channel_id,
+                                                from_line: lines_len as u64,
+                                                count: 256,
+                                            };
+                                            let _ = scrollback_req_tx.try_send(req);
+                                            *pending_request = true;
+                                            tracing::debug!(
+                                                lines_held = lines_len,
+                                                total_available = total_avail,
+                                                "Shift-PageUp: lazy prefetch triggered"
+                                            );
+                                        }
                                     }
                                     tracing::debug!("Shift-PageUp: paging up in scrollback");
                                 }
@@ -1749,20 +1843,18 @@ async fn run_pump(
                         // Handle Shift-PageDown.
                         if csi.shift_pagedown {
                             match &scrollback_view {
-                                ScrollbackView::Active { offset, lines, .. } => {
+                                ScrollbackView::Active { offset, .. } => {
                                     let rows = screen.size().1 as usize;
                                     let current_offset = *offset;
-                                    let lines_len = lines.len();
                                     if current_offset <= rows {
                                         // Paging down past the live boundary: auto-exit (LOCKED).
                                         scrollback_view = ScrollbackView::Live;
                                         tracing::debug!("Shift-PageDown: reached live boundary, exiting scrollback");
                                     } else {
-                                        // Page down.
+                                        // Page down (decrease offset = scroll toward newer lines).
                                         if let ScrollbackView::Active { offset, .. } = &mut scrollback_view {
                                             *offset = current_offset.saturating_sub(rows);
                                         }
-                                        let _ = lines_len;
                                         tracing::debug!("Shift-PageDown: paging down in scrollback");
                                     }
                                 }

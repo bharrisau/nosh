@@ -167,9 +167,12 @@ pub async fn run_channel_task(
 
 /// Run the client-side scrollback channel drain task.
 ///
-/// Reads `ScrollbackPage` frames from `ch_recv` (server → client scrollback
-/// data stream), decodes them via [`nosh_proto::codec::read_message`], and
-/// forwards each to `run_pump` through `page_tx`.
+/// Concurrently:
+/// - Writes `ScrollbackRequest` frames to `ch_send` (client → server) as they
+///   arrive from `req_rx` (sent by `run_pump` when the user pages up).
+/// - Reads `ScrollbackPage` frames from `ch_recv` (server → client) via
+///   [`nosh_proto::codec::read_message`] and forwards each to `run_pump`
+///   through `page_tx`.
 ///
 /// Flow-control (SCROLL-02 / MUX-03):
 /// - Bytes consumed are counted; once `>= CREDIT_REPLENISH_CHUNK` the task
@@ -191,88 +194,118 @@ pub async fn run_channel_task(
 ///
 /// This task MUST NOT call `write_message` on the control stream directly.
 /// All outbound control frames go through `control_tx`.
+///
+/// # `ScrollbackRequest` routing (Open Question 1)
+///
+/// `ScrollbackRequest` travels on the channel's own `ch_send` stream (not the
+/// control stream) to avoid the M-2 control/data flow-control deadlock.
+/// `ch_send` and `ch_recv` are independent halves of the same QUIC bidi
+/// stream; writing to `ch_send` cannot stall reading from `ch_recv`.
 pub async fn run_scrollback_drain_task(
     channel_id: u32,
     mut ch_recv: quinn::RecvStream,
     mut ch_send: quinn::SendStream,
     control_tx: mpsc::Sender<Message>,
     page_tx: mpsc::Sender<Message>,
+    mut req_rx: mpsc::Receiver<Message>,
 ) {
     let mut drained_since_replenish: u64 = 0;
 
     loop {
-        // Decode a length-delimited Message frame from the channel RecvStream.
-        // read_message reads a 4-byte big-endian length prefix + body.
-        match nosh_proto::read_message(&mut ch_recv).await {
-            Ok(msg) => {
-                // Track bytes consumed for flow-control credit.
-                // The frame on the wire is: 4-byte length prefix + body.
-                // We use the postcard-encoded body length (from the codec).
-                // For credit-tracking we count the full wire bytes.
-                let wire_bytes = match nosh_proto::codec::encode(&msg) {
-                    Ok(frame) => frame.len() as u64,
-                    Err(_) => {
-                        // Should never fail for a successfully decoded message.
-                        // If it does, use a conservative byte count.
-                        tracing::debug!(
-                            channel_id,
-                            "scrollback drain: re-encode failed for credit accounting"
-                        );
-                        0
-                    }
-                };
-                drained_since_replenish += wire_bytes;
-
-                // Forward ScrollbackPage to run_pump via page_tx.
-                // Use try_send: if page_tx is full or closed (run_pump snapped
-                // back to Live), drop the page — do NOT buffer unboundedly and
-                // do NOT stop draining (RESEARCH Open Question 3 / T-22-14).
-                if matches!(msg, Message::ScrollbackPage { .. }) {
-                    match page_tx.try_send(msg) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            tracing::debug!(
-                                channel_id,
-                                "scrollback page_tx full — dropping page (run_pump in Live mode)"
-                            );
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            // run_pump has exited; nothing more to do.
-                            tracing::debug!(channel_id, "page_tx closed; scrollback drain exiting");
+        tokio::select! {
+            // Path 1: run_pump wants to send a ScrollbackRequest to the server.
+            // Requests travel on ch_send (channel's own data stream) to avoid the
+            // M-2 control/data flow-control deadlock (Open Question 1).
+            req = req_rx.recv() => {
+                match req {
+                    Some(msg) => {
+                        // Write the request to ch_send (client → server direction).
+                        if nosh_proto::write_message(&mut ch_send, &msg).await.is_err() {
+                            tracing::debug!(channel_id, "scrollback ch_send write error; exiting drain task");
                             break;
                         }
                     }
-                }
-                // Non-ScrollbackPage frames on this channel are unexpected;
-                // they are still drained (counted for credit) and discarded.
-
-                // Replenish credit in chunks so the server is not left waiting.
-                if drained_since_replenish >= CREDIT_REPLENISH_CHUNK {
-                    let bytes = drained_since_replenish;
-                    drained_since_replenish = 0;
-                    if control_tx
-                        .send(Message::ScrollbackCredit { channel_id, bytes })
-                        .await
-                        .is_err()
-                    {
-                        // Session pump has gone away; nothing more to do.
-                        tracing::debug!(
-                            channel_id,
-                            "control_tx closed during scrollback credit grant; exiting"
-                        );
+                    None => {
+                        // run_pump has dropped req_tx; session is ending.
+                        tracing::debug!(channel_id, "scrollback req_rx closed; exiting drain task");
                         break;
                     }
                 }
             }
-            Err(e) => {
-                // EOF or framing error — exit the drain loop.
-                // EOF is the normal server half-close path.
-                tracing::debug!(
-                    channel_id,
-                    err = %e,
-                    "scrollback channel RecvStream ended; closing drain task"
-                );
-                break;
+            // Path 2: server sent a ScrollbackPage frame.
+            msg_result = nosh_proto::read_message(&mut ch_recv) => {
+                match msg_result {
+                    Ok(msg) => {
+                        // Track bytes consumed for flow-control credit.
+                        // The frame on the wire is: 4-byte length prefix + body.
+                        // We use the postcard-encoded body length (from the codec).
+                        // For credit-tracking we count the full wire bytes.
+                        let wire_bytes = match nosh_proto::codec::encode(&msg) {
+                            Ok(frame) => frame.len() as u64,
+                            Err(_) => {
+                                // Should never fail for a successfully decoded message.
+                                // If it does, use a conservative byte count.
+                                tracing::debug!(
+                                    channel_id,
+                                    "scrollback drain: re-encode failed for credit accounting"
+                                );
+                                0
+                            }
+                        };
+                        drained_since_replenish += wire_bytes;
+
+                        // Forward ScrollbackPage to run_pump via page_tx.
+                        // Use try_send: if page_tx is full or closed (run_pump snapped
+                        // back to Live), drop the page — do NOT buffer unboundedly and
+                        // do NOT stop draining (RESEARCH Open Question 3 / T-22-14).
+                        if matches!(msg, Message::ScrollbackPage { .. }) {
+                            match page_tx.try_send(msg) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::debug!(
+                                        channel_id,
+                                        "scrollback page_tx full — dropping page (run_pump in Live mode)"
+                                    );
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    // run_pump has exited; nothing more to do.
+                                    tracing::debug!(channel_id, "page_tx closed; scrollback drain exiting");
+                                    break;
+                                }
+                            }
+                        }
+                        // Non-ScrollbackPage frames on this channel are unexpected;
+                        // they are still drained (counted for credit) and discarded.
+
+                        // Replenish credit in chunks so the server is not left waiting.
+                        if drained_since_replenish >= CREDIT_REPLENISH_CHUNK {
+                            let bytes = drained_since_replenish;
+                            drained_since_replenish = 0;
+                            if control_tx
+                                .send(Message::ScrollbackCredit { channel_id, bytes })
+                                .await
+                                .is_err()
+                            {
+                                // Session pump has gone away; nothing more to do.
+                                tracing::debug!(
+                                    channel_id,
+                                    "control_tx closed during scrollback credit grant; exiting"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // EOF or framing error — exit the drain loop.
+                        // EOF is the normal server half-close path.
+                        tracing::debug!(
+                            channel_id,
+                            err = %e,
+                            "scrollback channel RecvStream ended; closing drain task"
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
@@ -358,8 +391,7 @@ mod tests {
 
     /// Verify run_scrollback_drain_task exports exist (compile-time check).
     ///
-    /// References the not-yet-existing function so the crate fails to compile
-    /// in RED state. Once the function exists the test is a trivial pass.
+    /// References the function so the crate fails to compile if it is absent.
     ///
     /// We can't coerce an async fn to a plain fn pointer, so we use `std::mem::size_of_val`
     /// on the fn item reference to force name resolution.
