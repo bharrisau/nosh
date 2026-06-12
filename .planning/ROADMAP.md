@@ -56,7 +56,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 - [x] **Phase 19: Full-Screen TUI Rendering Correctness** â Real alternate-screen buffer (two-grid model), wide-char/grapheme audit, predictor suppression, OSC OOM bound; makes vim/htop/Claude Code work correctly (completed 2026-06-07)
 - [x] **Phase 20: Repaint Pacing** â Burst multiple state-diff datagrams per tick so full-screen repaints land in ~1 RTT; one epoch per tick; both 999.4 traps designed out architecturally (completed 2026-06-11)
 - [x] **Phase 21: Channel Multiplexing Foundation** â Control-first OPEN/ACCEPT/REJECT on control stream (id 0); discriminant-stability test first; per-channel flow control; clean lifecycle; scrollback channel type declared (completed 2026-06-11)
-- [ ] **Phase 22: Scrollback Sync** â Scrollback delivered over the reliable scrollback channel; credit-based paging; alt-screen gate; Shift-PageUp/PageDown UX; consistent live-grid handoff and reattach survival
+- [x] **Phase 22: Scrollback Sync** â Scrollback delivered over the reliable scrollback channel; credit-based paging; alt-screen gate; Shift-PageUp/PageDown UX; consistent live-grid handoff and reattach survival (completed 2026-06-12)
 
 ## Phase Details
 
@@ -138,7 +138,7 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 - [x] 22-01-PLAN.md — Wire-protocol foundation: discriminant-stability test first, ScrollbackRequest/Page/Credit variants, scrollback_lines accessor, alt-screen exclusion test (SCROLL-01, SCROLL-02, SCROLL-03, SCROLL-05)
 - [x] 22-02-PLAN.md — Server scrollback sender task (reliable SendStream-only, byte-credit, bounded mpsc drop-oldest, atomic epoch capture) + accept-gate flip in both session paths (SCROLL-01, SCROLL-02, SCROLL-05)
 - [x] 22-03-PLAN.md — Client scrollback view: drain task, ScrollbackView state machine, Shift-PageUp/Down CSI interception, snap-back, epoch handoff, cold-reattach re-open (SCROLL-01, SCROLL-04, SCROLL-05)
-- [ ] 22-04-PLAN.md — Integration suite: basic fetch, PTY-latency isolation, drop-oldest, in-order under loss, epoch handoff, post-reattach (SCROLL-01, SCROLL-02, SCROLL-05)
+- [x] 22-04-PLAN.md — Integration suite: basic fetch, PTY-latency isolation, drop-oldest, in-order under loss, epoch handoff, post-reattach (SCROLL-01, SCROLL-02, SCROLL-05)
 
 **Security note**: Pitfalls S-1 through S-5 and M-6 from PITFALLS.md govern this phase. Scrollback must never travel over datagrams (type-level enforcement: scrollback sender accepts only `SendStream`). The `SCROLLBACK_LINE_CAP = 10_000` constant must not be raised without a measured reason. The scrollback sender task must use a bounded channel and drop oldest lines rather than blocking the pump. On cold reattach, the client re-opens the scrollback channel after `ResumeComplete` â channel state is never replayed from the byte buffer.
 
@@ -169,4 +169,4 @@ Full detail archived at `.planning/milestones/v1.2-ROADMAP.md`.
 | 19. Full-Screen TUI Rendering Correctness | 5/5 | Complete    | 2026-06-07 |
 | 20. Repaint Pacing | 2/2 | Complete    | 2026-06-11 |
 | 21. Channel Multiplexing Foundation | 4/4 | Complete    | 2026-06-11 |
-| 22. Scrollback Sync | 3/4 | In Progress|  |
+| 22. Scrollback Sync | 4/4 | Complete   | 2026-06-12 |
