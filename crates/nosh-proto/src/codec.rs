@@ -311,6 +311,35 @@ mod tests {
         }
     }
 
+    /// WR-P-02 / Phase 22: every `ChannelType` variant must encode with its EXACT
+    /// expected postcard discriminant byte. Pins the on-wire discriminant ordering
+    /// so a future enum reordering is caught at test time before any deployment.
+    ///
+    /// postcard encodes enum variants as a leading varint equal to the variant's
+    /// 0-based source-order index:
+    ///   Echo=0, Scrollback=1, PortForward=2, AgentForward=3.
+    #[test]
+    fn channel_type_discriminant_order_is_stable() {
+        use crate::messages::ChannelType;
+        use postcard::to_allocvec;
+
+        let cases: &[(u8, ChannelType)] = &[
+            (0, ChannelType::Echo),
+            (1, ChannelType::Scrollback),
+            (2, ChannelType::PortForward),
+            (3, ChannelType::AgentForward),
+        ];
+        for (expected_disc, ct) in cases {
+            let encoded = to_allocvec(ct).expect("encode ChannelType");
+            assert_eq!(
+                encoded[0], *expected_disc,
+                "ChannelType::{ct:?} must encode with discriminant {expected_disc}; \
+                 encoded[0] = {}",
+                encoded[0]
+            );
+        }
+    }
+
     /// Phase 21 / MUX-06 + Phase 22: all mux `Message` variants must round-trip
     /// exactly through `write_message` → `read_message` (equality preserved).
     #[tokio::test]
