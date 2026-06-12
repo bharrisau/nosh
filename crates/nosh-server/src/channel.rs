@@ -351,13 +351,23 @@ pub async fn run_scrollback_sender_task(
 
                         // If the encoded page exceeds remaining credit, wait for a
                         // Credit event before writing (back-pressure, S-4 / MUX-03).
-                        // This inner loop only exits on sufficient credit or close.
+                        //
+                        // WR-S-02 fix: bound the inner credit-wait with a 30 s timeout.
+                        // Without it, a page that exceeds INITIAL_CREDIT (256 KiB) and a
+                        // client that never grants more credit would block this task forever
+                        // (the events.recv() never returns). On timeout, log and close the
+                        // channel cleanly so the server slot is not permanently leaked.
+                        let credit_wait_deadline =
+                            tokio::time::Instant::now() + Duration::from_secs(30);
                         while remaining_credit < encoded_len {
-                            match events.recv().await {
-                                Some(ChannelEvent::Credit(n)) => {
+                            match tokio::time::timeout_at(
+                                credit_wait_deadline,
+                                events.recv(),
+                            ).await {
+                                Ok(Some(ChannelEvent::Credit(n))) => {
                                     remaining_credit = remaining_credit.saturating_add(n);
                                 }
-                                Some(ChannelEvent::Close) | None => {
+                                Ok(Some(ChannelEvent::Close)) | Ok(None) => {
                                     // Session or channel closed while waiting for credit.
                                     let _ = ch_send.finish();
                                     let _ = tokio::time::timeout(
@@ -367,7 +377,24 @@ pub async fn run_scrollback_sender_task(
                                     let _ = control_tx.send(Message::ChannelClose { channel_id }).await;
                                     return;
                                 }
-                                Some(ChannelEvent::Stream(_, _)) => { /* unexpected; ignore */ }
+                                Ok(Some(ChannelEvent::Stream(_, _))) => { /* unexpected; ignore */ }
+                                Err(_elapsed) => {
+                                    // 30 s credit timeout: client stalled without granting
+                                    // credit. Close the channel cleanly rather than blocking
+                                    // forever (WR-S-02 bounded back-pressure timeout).
+                                    tracing::warn!(
+                                        channel_id,
+                                        "scrollback sender: 30 s credit timeout — \
+                                         closing channel (client stalled)"
+                                    );
+                                    let _ = ch_send.finish();
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        ch_send.stopped(),
+                                    ).await;
+                                    let _ = control_tx.send(Message::ChannelClose { channel_id }).await;
+                                    return;
+                                }
                             }
                         }
 
