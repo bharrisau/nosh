@@ -40,7 +40,8 @@ pub struct ScrollbackCell {
 pub struct ScrollbackLine {
     /// Terminal column width when this line was live (S-3 original width metadata).
     pub width: u16,
-    /// Per-cell content. Length ≤ `width` (trailing blank cells may be omitted).
+    /// Per-cell content. All cells in the line are always sent; length == `width`
+    /// (no trailing-blank omission — every cell is included for correct rendering).
     pub cells: Vec<ScrollbackCell>,
 }
 
