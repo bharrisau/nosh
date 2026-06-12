@@ -2014,6 +2014,20 @@ async fn run_reattach_session(
                         break SessionEnd::ClientClosed;
                     }
 
+                    // IN-S-02: explicit debug-log arm for scrollback control-stream
+                    // frames in run_reattach_session — mirrors run_session's arm above.
+                    // These are protocol errors (scrollback frames must travel on the
+                    // channel's own streams, not the control stream), but are non-fatal.
+                    Ok(Message::ScrollbackRequest { channel_id, .. })
+                    | Ok(Message::ScrollbackPage { channel_id, .. })
+                    | Ok(Message::ScrollbackCredit { channel_id, .. }) => {
+                        tracing::debug!(
+                            channel_id,
+                            "scrollback frame received on control stream during reattach \
+                             (protocol error); ignoring"
+                        );
+                    }
+
                     Ok(_) => {} // ignore any other unexpected frames
                     Err(_) => {
                         break SessionEnd::TransportLost;
