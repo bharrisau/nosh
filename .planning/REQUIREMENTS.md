@@ -42,11 +42,11 @@ Requirements for this milestone. Each maps to a roadmap phase.
 
 <!-- First consumer of the mux layer. Reliable channel only, never datagrams. -->
 
-- [ ] **SCROLL-01**: The client can view terminal history that has scrolled off the visible grid — the server retains scrollback and serves requested lines to the client
-- [ ] **SCROLL-02**: Scrollback is delivered over a reliable channel (never datagrams), paged with client-driven credit-based flow control — no bulk dump, no PTY stall while history is fetched (scrollback sender runs off the main pump)
-- [ ] **SCROLL-03**: Alternate-screen content never enters primary scrollback — history excludes vim/htop/full-screen-app output (gated on `!alt_screen`)
-- [ ] **SCROLL-04**: The client enters scrollback view with Shift-PageUp / pages with Shift-PageUp/PageDown; any keystroke snaps back to the live view and is sent to the shell
-- [ ] **SCROLL-05**: The scrollback↔live-grid handoff is consistent — no gap or duplicated lines at the transition (an `epoch_at_snapshot` / framing contract), and scrollback remains usable across a cold reattach
+- [x] **SCROLL-01**: The client can view terminal history that has scrolled off the visible grid — the server retains scrollback and serves requested lines to the client
+- [x] **SCROLL-02**: Scrollback is delivered over a reliable channel (never datagrams), paged with client-driven credit-based flow control — no bulk dump, no PTY stall while history is fetched (scrollback sender runs off the main pump)
+- [x] **SCROLL-03**: Alternate-screen content never enters primary scrollback — history excludes vim/htop/full-screen-app output (gated on `!alt_screen`)
+- [x] **SCROLL-04**: The client enters scrollback view with Shift-PageUp / pages with Shift-PageUp/PageDown; any keystroke snaps back to the live view and is sent to the shell
+- [x] **SCROLL-05**: The scrollback↔live-grid handoff is consistent — no gap or duplicated lines at the transition (an `epoch_at_snapshot` / framing contract), and scrollback remains usable across a cold reattach
 
 ### Security (SEC)
 
@@ -105,11 +105,11 @@ Which phases cover which requirements. Populated during roadmap creation.
 | MUX-04 | Phase 21 | Complete |
 | MUX-05 | Phase 21 | Complete |
 | MUX-06 | Phase 21 | Complete |
-| SCROLL-01 | Phase 22 | Pending |
-| SCROLL-02 | Phase 22 | Pending |
-| SCROLL-03 | Phase 22 | Pending |
-| SCROLL-04 | Phase 22 | Pending |
-| SCROLL-05 | Phase 22 | Pending |
+| SCROLL-01 | Phase 22 | Complete |
+| SCROLL-02 | Phase 22 | Complete |
+| SCROLL-03 | Phase 22 | Complete |
+| SCROLL-04 | Phase 22 | Complete |
+| SCROLL-05 | Phase 22 | Complete |
 | SEC-03 | Phase 19 | Complete |
 
 **Coverage:**
