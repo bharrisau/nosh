@@ -1404,15 +1404,21 @@ async fn run_pump(
         }
     };
 
-    // Spawn the drain task if the channel was accepted.
-    // The task holds ch_send/ch_recv exclusively (M-6 isolation: M-2 pitfall avoidance).
-    // req_rx feeds ScrollbackRequest frames from run_pump to ch_send (Open Question 1).
+    // WR-C-02: track whether the scrollback channel is available so that
+    // Shift-PageUp only transitions to Active when a working drain task exists.
+    // Without this guard, a failed/rejected channel open would let the keypress
+    // enter Active and send ScrollbackRequests that silently drop — the user
+    // sees a mode transition with no scrollback content ever arriving.
+    //
+    // IN-C-01 fix: move scrollback_ctrl_tx into the drain task (not clone)
+    // since the original sender is unused after this point.
+    let scrollback_available = scrollback_streams.is_some();
     if let Some((ch_send, ch_recv)) = scrollback_streams {
         tokio::spawn(run_scrollback_drain_task(
             scrollback_channel_id,
             ch_recv,
             ch_send,
-            scrollback_ctrl_tx.clone(),
+            scrollback_ctrl_tx, // moved, not cloned — IN-C-01 fix
             page_tx,
             scrollback_req_rx,
         ));
@@ -1825,6 +1831,17 @@ async fn run_pump(
                         if csi.shift_pageup {
                             match &scrollback_view {
                                 ScrollbackView::Live => {
+                                    // WR-C-02: only enter Active when the drain task is
+                                    // running. If the channel open failed or was rejected,
+                                    // scrollback_available is false and we stay in Live mode
+                                    // rather than entering a broken Active state that never
+                                    // delivers pages.
+                                    if !scrollback_available {
+                                        tracing::debug!(
+                                            "Shift-PageUp: scrollback channel unavailable; \
+                                             staying in Live mode"
+                                        );
+                                    } else {
                                     // Enter scrollback mode and issue the first request.
                                     // pending_request=true until the first page arrives.
                                     //
@@ -1854,6 +1871,7 @@ async fn run_pump(
                                     };
                                     let _ = scrollback_req_tx.try_send(req);
                                     tracing::debug!("Shift-PageUp: entering scrollback Active mode, sent initial request");
+                                    } // end scrollback_available guard
                                 }
                                 ScrollbackView::Active { offset, lines, pending_request, total_available, .. } => {
                                     // Already active: page up (increase offset = scroll toward older lines).
