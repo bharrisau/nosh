@@ -1183,8 +1183,13 @@ async fn run_session(
                         // Client is closing its side of the channel (MUX-04).
                         // Signal the task and remove from the map.
                         // Unknown id is a logged no-op — never panic (Pitfall M-4 / T-21-07).
+                        //
+                        // WR-S-01 fix: use send().await for Close (not try_send) so a
+                        // momentarily-full 64-slot queue does not silently drop the signal
+                        // and leave the scrollback sender task alive holding slot_clone
+                        // until connection teardown. Mirrors the WR-01 Stream-event fix.
                         if let Some(task_tx) = channel_map.remove(&channel_id) {
-                            let _ = task_tx.try_send(ChannelEvent::Close);
+                            let _ = task_tx.send(ChannelEvent::Close).await;
                         } else {
                             tracing::debug!(channel_id, "ChannelClose for unknown channel; ignoring");
                         }
@@ -1985,8 +1990,11 @@ async fn run_reattach_session(
                     }
 
                     Ok(Message::ChannelClose { channel_id }) => {
+                        // WR-S-01 fix: use send().await for Close — same rationale as
+                        // run_session arm above. try_send could silently drop the close
+                        // signal when the 64-slot queue is full, leaking the task.
                         if let Some(task_tx) = channel_map.remove(&channel_id) {
-                            let _ = task_tx.try_send(ChannelEvent::Close);
+                            let _ = task_tx.send(ChannelEvent::Close).await;
                         }
                         // Unknown id: no-op (T-21-07 / Pitfall M-4).
                     }
