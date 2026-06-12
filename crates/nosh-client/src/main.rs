@@ -184,6 +184,134 @@ pub enum ScrollbackView {
     },
 }
 
+// ── Scrollback render helper ──────────────────────────────────────────────────
+//
+// `render_scrollback_to_buf` paints the visible window of the scrollback buffer
+// to a `Vec<u8>` using absolute cursor positioning + ANSI SGR attributes.
+//
+// It BYPASSES the `ClientScreen` compositor and predictor entirely — historical
+// lines are rendered directly from the `ScrollbackLine` / `ScrollbackCell`
+// types.  The caller is responsible for async-flushing the buffer to stdout.
+//
+// After this call the caller MUST invoke `screen.reset_physical()` so that,
+// when the view returns to Live, the live `render_to_stdout` path does a full
+// repaint (forcing the physical model out of sync with the scrollback content
+// that was just painted on the terminal).
+//
+// Visible window semantics (SCROLL-04):
+//   offset == 0  → show the most-recent `rows` lines from the buffer.
+//   offset == N  → show lines [len-N-rows .. len-N] (scroll toward history).
+//   If fewer lines are available than the viewport, blank rows are emitted
+//   at the top.
+
+/// Render the scrollback view buffer to `out` using raw ANSI escapes.
+///
+/// * `lines`  — historical lines, oldest-first (as held in `ScrollbackView::Active`).
+/// * `offset` — number of lines from the bottom that are scrolled off-screen.
+/// * `cols`   — terminal width (used to blank incomplete rows).
+/// * `rows`   — terminal height (visible viewport size).
+///
+/// The caller must write `out` to stdout and call `screen.reset_physical()` after
+/// returning so that the subsequent live render forces a full repaint.
+pub fn render_scrollback_to_buf(
+    out: &mut Vec<u8>,
+    lines: &[nosh_proto::messages::ScrollbackLine],
+    offset: usize,
+    cols: u16,
+    rows: u16,
+) {
+    use crossterm::cursor::MoveTo;
+    use crossterm::QueueableCommand as _;
+    use nosh_proto::datagram::CellStyle;
+
+    // Helper: write bytes to the Vec<u8> without ambiguity from AsyncWriteExt.
+    // Vec<u8> implements std::io::Write; use extend_from_slice to sidestep the
+    // trait-resolution ambiguity with tokio::io::AsyncWriteExt::write_all.
+    macro_rules! wbytes {
+        ($dst:expr, $src:expr) => { $dst.extend_from_slice($src) };
+    }
+
+    // Clear the entire screen and position the cursor at the top-left.
+    wbytes!(out, b"\x1b[2J\x1b[H");
+
+    let rows_usize = rows as usize;
+    let cols_usize = cols as usize;
+    let total = lines.len();
+
+    // Bottom of the visible window (exclusive) in lines[] index terms:
+    // when offset == 0 the bottom is `total`; each page-up increments by `rows`.
+    let bottom = total.saturating_sub(offset);
+
+    // Top of the visible window (inclusive):
+    let top = bottom.saturating_sub(rows_usize);
+
+    // Emit each terminal row.
+    for screen_row in 0..rows_usize {
+        let line_idx = top + screen_row;
+
+        // Position cursor at the start of this row.
+        let _ = out.queue(MoveTo(0, screen_row as u16));
+
+        // Reset SGR attributes to default before each row.
+        wbytes!(out, b"\x1b[0m");
+
+        let cells_written: usize = if line_idx < total {
+            let line = &lines[line_idx];
+            let mut last_sgr: Option<(CellStyle, Option<u8>, Option<u8>)> = None;
+
+            for cell in &line.cells {
+                let want_sgr = (cell.style, cell.fg, cell.bg);
+                if last_sgr != Some(want_sgr) {
+                    let mut params = String::from("0");
+                    if cell.style.0 & CellStyle::BOLD != 0 {
+                        params.push_str(";1");
+                    }
+                    if cell.style.0 & CellStyle::ITALIC != 0 {
+                        params.push_str(";3");
+                    }
+                    if cell.style.0 & CellStyle::UNDERLINE != 0 {
+                        params.push_str(";4");
+                    }
+                    if cell.style.0 & CellStyle::REVERSE != 0 {
+                        params.push_str(";7");
+                    }
+                    if let Some(n) = cell.fg {
+                        params.push_str(&format!(";38;5;{n}"));
+                    }
+                    if let Some(n) = cell.bg {
+                        params.push_str(&format!(";48;5;{n}"));
+                    }
+                    let sgr_str = format!("\x1b[{params}m");
+                    wbytes!(out, sgr_str.as_bytes());
+                    last_sgr = Some(want_sgr);
+                }
+
+                let mut char_buf = [0u8; 4];
+                let s = cell.ch.encode_utf8(&mut char_buf);
+                wbytes!(out, s.as_bytes());
+            }
+
+            line.cells.len()
+        } else {
+            // Above the available history: blank row.
+            0
+        };
+
+        // Blank the remainder of the row (reset SGR + spaces).
+        let remaining = cols_usize.saturating_sub(cells_written);
+        if remaining > 0 {
+            wbytes!(out, b"\x1b[0m");
+            for _ in 0..remaining {
+                wbytes!(out, b" ");
+            }
+        }
+    }
+
+    // Park cursor at bottom-left after render (aesthetic; will be overridden by
+    // the next live render on snap-back).
+    let _ = out.queue(MoveTo(0, rows.saturating_sub(1)));
+}
+
 // ── CSI sequence accumulator ──────────────────────────────────────────────────
 //
 // The Shift-PageUp/Down sequences are 6 bytes:
@@ -814,6 +942,172 @@ mod scrollback_view_epoch_tests {
         // In Live mode, ScrollbackPage delivery is a no-op.
         let should_apply = matches!(&view, ScrollbackView::Active { .. });
         assert!(!should_apply, "ScrollbackPage must be dropped while in Live mode");
+    }
+}
+
+// ── Task 3 (gap-closure) tests: render_scrollback_to_buf ─────────────────────
+//
+// Unit tests for the scrollback render helper (SCROLL-01 display gap closure).
+// These tests operate at the output buffer level — no QUIC, no async, no PTY.
+
+#[cfg(test)]
+mod scrollback_render_tests {
+    use super::render_scrollback_to_buf;
+    use nosh_proto::datagram::CellStyle;
+    use nosh_proto::messages::{ScrollbackCell, ScrollbackLine};
+
+    fn blank_line(width: u16) -> ScrollbackLine {
+        ScrollbackLine {
+            width,
+            cells: vec![
+                ScrollbackCell {
+                    ch: ' ',
+                    style: CellStyle(CellStyle::NONE),
+                    fg: None,
+                    bg: None,
+                };
+                width as usize
+            ],
+        }
+    }
+
+    fn text_line(text: &str, width: u16) -> ScrollbackLine {
+        let mut cells: Vec<ScrollbackCell> = text
+            .chars()
+            .map(|c| ScrollbackCell {
+                ch: c,
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+            })
+            .collect();
+        // Pad to width with spaces.
+        while cells.len() < width as usize {
+            cells.push(ScrollbackCell {
+                ch: ' ',
+                style: CellStyle(CellStyle::NONE),
+                fg: None,
+                bg: None,
+            });
+        }
+        cells.truncate(width as usize);
+        ScrollbackLine { width, cells }
+    }
+
+    /// render_scrollback_to_buf with empty lines emits a clear-screen sequence
+    /// and produces non-empty output (the initial blank scrollback frame).
+    #[test]
+    fn empty_lines_emits_clear_screen() {
+        let mut buf = Vec::new();
+        render_scrollback_to_buf(&mut buf, &[], 0, 80, 24);
+        // Must start with ESC [ 2 J (erase-display) followed by ESC [ H (home).
+        assert!(
+            buf.starts_with(b"\x1b[2J\x1b[H"),
+            "render must begin with clear-screen + home: got {:?}",
+            &buf[..buf.len().min(16)]
+        );
+        assert!(!buf.is_empty(), "render must produce non-empty output");
+    }
+
+    /// render_scrollback_to_buf with a single text line contains the text chars
+    /// somewhere in its output.
+    #[test]
+    fn single_line_content_appears_in_output() {
+        let lines = vec![text_line("hello", 10)];
+        let mut buf = Vec::new();
+        render_scrollback_to_buf(&mut buf, &lines, 0, 10, 3);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("hello"),
+            "rendered output must contain 'hello'; got {} bytes",
+            buf.len()
+        );
+    }
+
+    /// With offset == 0 and two lines, both lines appear in the output.
+    #[test]
+    fn offset_zero_shows_most_recent_lines() {
+        let lines = vec![text_line("older", 10), text_line("newer", 10)];
+        let mut buf = Vec::new();
+        render_scrollback_to_buf(&mut buf, &lines, 0, 10, 2);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("older"), "offset=0 with 2-row viewport must show 'older'");
+        assert!(s.contains("newer"), "offset=0 with 2-row viewport must show 'newer'");
+    }
+
+    /// With offset == rows, the viewport shifts one page up — the newer line
+    /// scrolls off the bottom and the older line remains visible (or blank rows
+    /// appear above if there is no more history).
+    #[test]
+    fn offset_rows_shifts_viewport_up() {
+        let lines = vec![
+            text_line("oldest", 10),
+            text_line("middle", 10),
+            text_line("newest", 10),
+        ];
+        let mut buf = Vec::new();
+        // rows=2, offset=2 → show lines[0..2] = oldest + middle; newest scrolls off.
+        render_scrollback_to_buf(&mut buf, &lines, 2, 10, 2);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("oldest"), "paged-up viewport must show 'oldest'");
+        assert!(s.contains("middle"), "paged-up viewport must show 'middle'");
+        assert!(!s.contains("newest"), "paged-up viewport must NOT show 'newest'");
+    }
+
+    /// When offset is larger than the number of available lines, blank rows are
+    /// emitted at the top — no panic, no out-of-bounds.
+    #[test]
+    fn large_offset_produces_blank_rows_without_panic() {
+        let lines = vec![blank_line(10)];
+        let mut buf = Vec::new();
+        render_scrollback_to_buf(&mut buf, &lines, 1000, 10, 5);
+        // Must not panic and must emit the clear-screen preamble.
+        assert!(
+            buf.starts_with(b"\x1b[2J\x1b[H"),
+            "large-offset render must still emit clear-screen"
+        );
+    }
+
+    /// A cell with BOLD style produces the bold SGR code (`;1`) in the output.
+    #[test]
+    fn bold_cell_emits_bold_sgr() {
+        let bold_cell = ScrollbackCell {
+            ch: 'X',
+            style: CellStyle(CellStyle::BOLD),
+            fg: None,
+            bg: None,
+        };
+        let line = ScrollbackLine { width: 1, cells: vec![bold_cell] };
+        let mut buf = Vec::new();
+        render_scrollback_to_buf(&mut buf, &[line], 0, 1, 1);
+        let s = String::from_utf8_lossy(&buf);
+        // Bold SGR contains ";1" within \x1b[...m
+        assert!(
+            s.contains(";1m") || s.contains(";1;"),
+            "bold cell must emit ';1' SGR code; output: {:?}",
+            s
+        );
+        assert!(s.contains('X'), "bold cell character must appear in output");
+    }
+
+    /// A cell with a 256-colour foreground emits the `38;5;N` SGR sequence.
+    #[test]
+    fn fg_color_cell_emits_256_color_sgr() {
+        let colored_cell = ScrollbackCell {
+            ch: 'C',
+            style: CellStyle(CellStyle::NONE),
+            fg: Some(196), // bright red in 256-color palette
+            bg: None,
+        };
+        let line = ScrollbackLine { width: 1, cells: vec![colored_cell] };
+        let mut buf = Vec::new();
+        render_scrollback_to_buf(&mut buf, &[line], 0, 1, 1);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("38;5;196"),
+            "256-color fg cell must emit '38;5;196' SGR; output: {:?}",
+            s
+        );
     }
 }
 
@@ -1780,10 +2074,10 @@ async fn run_pump(
                     match &mut scrollback_view {
                         ScrollbackView::Active {
                             lines,
+                            offset,
                             epoch_at_snapshot,
                             total_available,
                             pending_request,
-                            ..
                         } => {
                             // Prepend new (older) lines to the front of the held buffer.
                             // oldest-first ordering: new_lines are older than lines.
@@ -1799,8 +2093,21 @@ async fn run_pump(
                                 epoch_at_snapshot = new_epoch,
                                 "scrollback page received: view buffer updated"
                             );
-                            // TODO: render scrollback view from lines+offset once
-                            // the rendering path is wired (SCROLL-01 display).
+                            // Render the updated scrollback view (SCROLL-01 display).
+                            // Bypasses predictor/overlay — historical content is rendered
+                            // directly. reset_physical ensures a full live repaint on
+                            // snap-back.
+                            let (cols, rows) = screen.size();
+                            let mut buf: Vec<u8> = Vec::new();
+                            render_scrollback_to_buf(&mut buf, lines, *offset, cols, rows);
+                            screen.reset_physical();
+                            if !buf.is_empty() {
+                                if let Err(e) = stdout.write_all(&buf).await {
+                                    tracing::warn!("scrollback render stdout write_all failed: {e}");
+                                } else if let Err(e) = stdout.flush().await {
+                                    tracing::warn!("scrollback render stdout flush failed: {e}");
+                                }
+                            }
                         }
                         ScrollbackView::Live => {
                             // In Live mode, in-flight pages are dropped (T-22-14 / Open Question 3).
@@ -1883,6 +2190,20 @@ async fn run_pump(
                                     };
                                     let _ = scrollback_req_tx.try_send(req);
                                     tracing::debug!("Shift-PageUp: entering scrollback Active mode, sent initial request");
+                                    // Render the (initially empty) scrollback view immediately on
+                                    // Active entry — clears the screen while pages are loading.
+                                    // reset_physical ensures a full live repaint on snap-back.
+                                    let (cols, rows) = screen.size();
+                                    let mut buf: Vec<u8> = Vec::new();
+                                    render_scrollback_to_buf(&mut buf, &[], 0, cols, rows);
+                                    screen.reset_physical();
+                                    if !buf.is_empty() {
+                                        if let Err(e) = stdout.write_all(&buf).await {
+                                            tracing::warn!("scrollback entry render stdout write_all failed: {e}");
+                                        } else if let Err(e) = stdout.flush().await {
+                                            tracing::warn!("scrollback entry render stdout flush failed: {e}");
+                                        }
+                                    }
                                     } // end scrollback_available guard
                                 }
                                 ScrollbackView::Active { offset, lines, pending_request, total_available, .. } => {
@@ -1914,6 +2235,20 @@ async fn run_pump(
                                         }
                                     }
                                     tracing::debug!("Shift-PageUp: paging up in scrollback");
+                                    // Render updated offset — extract lines+offset after mutation.
+                                    if let ScrollbackView::Active { lines, offset, .. } = &scrollback_view {
+                                        let (cols, rows) = screen.size();
+                                        let mut buf: Vec<u8> = Vec::new();
+                                        render_scrollback_to_buf(&mut buf, lines, *offset, cols, rows);
+                                        screen.reset_physical();
+                                        if !buf.is_empty() {
+                                            if let Err(e) = stdout.write_all(&buf).await {
+                                                tracing::warn!("scrollback pageup render stdout write_all failed: {e}");
+                                            } else if let Err(e) = stdout.flush().await {
+                                                tracing::warn!("scrollback pageup render stdout flush failed: {e}");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1928,12 +2263,43 @@ async fn run_pump(
                                         // Paging down past the live boundary: auto-exit (LOCKED).
                                         scrollback_view = ScrollbackView::Live;
                                         tracing::debug!("Shift-PageDown: reached live boundary, exiting scrollback");
+                                        // Force full live repaint so scrollback content is replaced
+                                        // by the live grid. reset_physical was called on every
+                                        // scrollback render, so a diff against the blank physical
+                                        // model will repaint everything.
+                                        let mut buf: Vec<u8> = Vec::new();
+                                        screen.render_to_stdout(&mut buf).unwrap_or_else(|e| {
+                                            tracing::warn!("snap-back live repaint error: {e}");
+                                        });
+                                        if !buf.is_empty() {
+                                            if let Err(e) = stdout.write_all(&buf).await {
+                                                tracing::warn!("snap-back live repaint stdout write_all failed: {e}");
+                                                screen.reset_physical();
+                                            } else if let Err(e) = stdout.flush().await {
+                                                tracing::warn!("snap-back live repaint stdout flush failed: {e}");
+                                                screen.reset_physical();
+                                            }
+                                        }
                                     } else {
                                         // Page down (decrease offset = scroll toward newer lines).
                                         if let ScrollbackView::Active { offset, .. } = &mut scrollback_view {
                                             *offset = current_offset.saturating_sub(rows);
                                         }
                                         tracing::debug!("Shift-PageDown: paging down in scrollback");
+                                        // Render updated offset.
+                                        if let ScrollbackView::Active { lines, offset, .. } = &scrollback_view {
+                                            let (cols, rows_u16) = screen.size();
+                                            let mut buf: Vec<u8> = Vec::new();
+                                            render_scrollback_to_buf(&mut buf, lines, *offset, cols, rows_u16);
+                                            screen.reset_physical();
+                                            if !buf.is_empty() {
+                                                if let Err(e) = stdout.write_all(&buf).await {
+                                                    tracing::warn!("scrollback pagedown render stdout write_all failed: {e}");
+                                                } else if let Err(e) = stdout.flush().await {
+                                                    tracing::warn!("scrollback pagedown render stdout flush failed: {e}");
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 ScrollbackView::Live => {
@@ -1949,9 +2315,27 @@ async fn run_pump(
                             let bytes_to_process = csi.non_paging_remainder.as_slice();
 
                             // Snap back to Live mode if we were in Active (SCROLL-04 LOCKED).
-                            if matches!(scrollback_view, ScrollbackView::Active { .. }) {
+                            // Force a full live repaint immediately so the user sees the live
+                            // grid rather than the last scrollback frame.
+                            let was_active = matches!(scrollback_view, ScrollbackView::Active { .. });
+                            if was_active {
                                 scrollback_view = ScrollbackView::Live;
                                 tracing::debug!("non-paging keystroke while in scrollback: snapping to Live");
+                                // reset_physical was called on every scrollback render; a diff
+                                // against the blank physical model will repaint the full live grid.
+                                let mut buf: Vec<u8> = Vec::new();
+                                screen.render_to_stdout(&mut buf).unwrap_or_else(|e| {
+                                    tracing::warn!("snap-back live repaint (keystroke) error: {e}");
+                                });
+                                if !buf.is_empty() {
+                                    if let Err(e) = stdout.write_all(&buf).await {
+                                        tracing::warn!("snap-back live repaint (keystroke) stdout write_all failed: {e}");
+                                        screen.reset_physical();
+                                    } else if let Err(e) = stdout.flush().await {
+                                        tracing::warn!("snap-back live repaint (keystroke) stdout flush failed: {e}");
+                                        screen.reset_physical();
+                                    }
+                                }
                             }
 
                             // Now process through the existing escape machine + forward path.
