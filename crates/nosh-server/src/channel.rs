@@ -284,19 +284,31 @@ pub async fn run_scrollback_sender_task(
                         // a u32::MAX request forcing a multi-gigabyte allocation.
                         let count = (count as usize).min(MAX_PAGE_SIZE);
 
-                        // S-5 atomic epoch + scrollback snapshot:
-                        // Read epoch_at_snapshot into a local with Acquire ordering
-                        // immediately before the synchronous with_terminal_state closure.
-                        // There is NO .await between this load and the closure, so the
-                        // epoch and the lines are mutually consistent.
+                        // WR-P-01 fix / S-5 atomic epoch + scrollback snapshot:
+                        // Read epoch_at_snapshot INSIDE the with_terminal_state closure
+                        // so the epoch and scrollback lines are read under the same mutex
+                        // acquisition. This eliminates the TOCTOU window: a PTY task
+                        // cannot push new scrollback lines between the epoch load and the
+                        // mutex lock, preventing a torn read at the scrollback/live seam.
+                        //
+                        // The epoch_src atomic is updated by the diff tick (after releasing
+                        // the terminal_state mutex with Release ordering). Reading it while
+                        // holding the terminal_state mutex means we see a consistent view:
+                        // either the epoch was stored before we locked (we read the latest)
+                        // or the PTY task is still writing under a lock we hold (we read
+                        // the prior epoch, but then the scrollback lines we see are also
+                        // from that same prior state). Either way, no gap or duplicate.
                         //
                         // Concurrency-correctness proof: the integration test
                         // `scrollback_epoch_handoff_no_gap` in plan 22-04 is the
                         // falsifiable S-5 proof that no gap or duplicate occurs across
                         // a concurrent diff tick during a scrollback request.
-                        let epoch_at_snapshot = epoch_src.load(Ordering::Acquire);
-                        let (raw_lines, total_available) = slot.with_terminal_state(|ts| {
-                            ts.scrollback_lines(from_line, count)
+                        let epoch_src_ref = &epoch_src;
+                        let (epoch_at_snapshot, raw_lines, total_available) = slot.with_terminal_state(|ts| {
+                            // Read epoch atomically under the terminal_state lock.
+                            let epoch = epoch_src_ref.load(Ordering::Acquire);
+                            let (lines, total) = ts.scrollback_lines(from_line, count);
+                            (epoch, lines, total)
                         });
 
                         // Convert server-side Cell values to ScrollbackLine wire types.
