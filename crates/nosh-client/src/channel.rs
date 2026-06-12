@@ -244,12 +244,19 @@ pub async fn run_scrollback_drain_task(
                             Ok(frame) => frame.len() as u64,
                             Err(_) => {
                                 // Should never fail for a successfully decoded message.
-                                // If it does, use a conservative byte count.
+                                // WR-C-01 fix: use a conservative non-zero byte count on
+                                // the unlikely re-encode failure path. Returning 0 would
+                                // permanently undercount consumed bytes, starving the
+                                // server's flow-control window and stalling future pages.
+                                // MAX_FRAME_LEN + 4 (the 4-byte length prefix) is the
+                                // largest possible wire frame — an overcount here is safe
+                                // (grants more credit than needed) versus the 0 undercount.
                                 tracing::debug!(
                                     channel_id,
-                                    "scrollback drain: re-encode failed for credit accounting"
+                                    "scrollback drain: re-encode failed for credit accounting; \
+                                     using MAX_FRAME_LEN + 4 as conservative fallback"
                                 );
-                                0
+                                nosh_proto::codec::MAX_FRAME_LEN as u64 + 4
                             }
                         };
                         drained_since_replenish += wire_bytes;
