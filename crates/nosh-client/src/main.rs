@@ -249,6 +249,18 @@ impl CsiAccumulator {
 
         // Append the new bytes to any partial match pending from previous reads.
         self.pending.extend_from_slice(input);
+        // IN-C-02: the doc claims "at most 8 bytes are ever held". Verify this
+        // invariant in debug builds — the longest paging sequence is 6 bytes, so
+        // after extend the pending buffer must not exceed 5 (partial prefix) + any
+        // newly added bytes that together stay below 2 × max_seq = 12. In practice
+        // pending is drained each call, so the realistic bound is 5 (one incomplete
+        // CSI_SHIFT_PAGEUP/DOWN prefix). 16 is a generous debug cap.
+        debug_assert!(
+            self.pending.len() <= 16,
+            "CsiAccumulator.pending exceeded 16 bytes (len={}); \
+             split-read invariant violated",
+            self.pending.len()
+        );
 
         let mut i = 0;
         while i < self.pending.len() {
