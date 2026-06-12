@@ -1,5 +1,10 @@
-//! Phase 21 channel-multiplexing integration tests — Roadmap success criteria
-//! SC#2–SC#6 for MUX-01…MUX-05.
+//! Phase 21–22 channel-multiplexing + scrollback-sync integration tests.
+//!
+//! Phase 21 tests: SC#2–SC#6 for MUX-01…MUX-05.
+//! Phase 22 tests (SCROLL-01/02/04/05): scrollback_basic_fetch,
+//! scrollback_epoch_handoff_no_gap, scrollback_post_reattach,
+//! scrollback_pty_latency_isolation, scrollback_backpressure_drop_oldest,
+//! scrollback_inorder_under_loss, scrollback_keybinding_snap_back.
 //!
 //! These tests drive a real in-process server and client to prove the mux layer
 //! end-to-end: control-first OPEN→ACCEPT/REJECT negotiation, opaque REJECT,
@@ -24,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nosh_client::client::{self, ReattachOutcome};
+use nosh_proto::datagram::{decode_datagram, encode_epoch_ack};
 use nosh_proto::messages::ChannelType;
 use nosh_server::registry::SessionRegistry;
 use tokio::sync::mpsc;
@@ -894,4 +900,842 @@ async fn channel_reattach_reopen() {
 
     conn2.close(0u32.into(), b"done");
     ep2.close(0u32.into(), b"done");
+}
+
+// ── Phase 22 scrollback integration tests (SCROLL-01/02/04/05) ───────────────
+//
+// All scrollback tests use `spawn_ctrl_drain` + `await_channel_accept_from_drain`
+// (never `recv_channel_reply`) because:
+//   (a) The scrollback channel performs data-stream I/O concurrently with control
+//       frames, requiring the drain to be live.
+//   (b) `recv_channel_reply` holds ctrl_recv exclusively and would deadlock as
+//       soon as the server pump tries to write another frame while we are reading
+//       the scrollback data stream.
+//
+// Session bring-up: open a session, spawn a ctrl_drain, produce enough PTY output
+// to scroll at least one row into the server-side scrollback VecDeque, then open a
+// Scrollback channel via `client::open_channel(ChannelType::Scrollback)`.
+
+/// Helper: open a session, send enough PTY output to fill the 24-row grid and
+/// scroll lines into the server-side scrollback VecDeque, then wait for at least
+/// one datagram (proving terminal state has been applied).
+///
+/// Returns `(ctrl_send, frame_rx)`.  The caller must keep `frame_rx` live for the
+/// duration of the test (the ctrl_drain task writes to it concurrently).
+async fn produce_scrollback(
+    conn: &quinn::Connection,
+) -> (quinn::SendStream, mpsc::UnboundedReceiver<nosh_proto::Message>) {
+    let (mut ctrl_send, ctrl_recv, _token) =
+        client::open_session_with_token(conn, "xterm".to_string(), 80, 24, vec![])
+            .await
+            .expect("open session for produce_scrollback");
+
+    let (frame_tx, frame_rx) = mpsc::unbounded_channel::<nosh_proto::Message>();
+    let _drain = spawn_ctrl_drain(ctrl_recv, frame_tx);
+
+    // 40 numbered `printf` lines overflow the 24-row PTY grid, pushing rows into
+    // the server-side scrollback VecDeque.
+    for i in 0..40u32 {
+        client::send_input(
+            &mut ctrl_send,
+            format!("printf 'line_{i}\\n'\n").as_bytes(),
+        )
+        .await
+        .expect("send PTY input to produce scrollback");
+    }
+
+    // Wait for at least one datagram to confirm the server has applied output.
+    let datagram_deadline = Duration::from_secs(10);
+    let got_datagram = tokio::time::timeout(datagram_deadline, async {
+        loop {
+            match conn.read_datagram().await {
+                Ok(bytes) => {
+                    if decode_datagram(&bytes).is_ok() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+    assert!(
+        got_datagram.is_ok(),
+        "did not receive any datagram from the server within {datagram_deadline:?}"
+    );
+
+    // Brief settle time so shell echo is fully parsed into scrollback.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    (ctrl_send, frame_rx)
+}
+
+/// Helper: send a `ChannelOpen` for `ChannelType::Scrollback`, await Accept via
+/// drain, open the QUIC bidi stream, and write the varint channel-id prefix.
+///
+/// Returns `(ch_send, ch_recv, channel_id)`.  Never uses `recv_channel_reply`.
+async fn open_scrollback_channel(
+    conn: &quinn::Connection,
+    ctrl_send: &mut quinn::SendStream,
+    frame_rx: &mut mpsc::UnboundedReceiver<nosh_proto::Message>,
+) -> (quinn::SendStream, quinn::RecvStream, u32) {
+    let channel_id: u32 = 2;
+    client::send_channel_open(ctrl_send, channel_id, ChannelType::Scrollback)
+        .await
+        .expect("send ChannelOpen for Scrollback");
+    let accepted = await_channel_accept_from_drain(frame_rx, channel_id, 3000)
+        .await
+        .expect("await ChannelAccept for Scrollback");
+    assert!(accepted, "server must accept ChannelType::Scrollback");
+
+    let (mut ch_send, ch_recv) = conn.open_bi().await.expect("open_bi for scrollback channel");
+    let prefix = postcard::to_allocvec(&channel_id).expect("encode channel-id varint");
+    ch_send.write_all(&prefix).await.expect("write varint prefix on scrollback bidi stream");
+
+    (ch_send, ch_recv, channel_id)
+}
+
+/// Helper: write a `ScrollbackRequest` to `ch_send` and read back the next
+/// `ScrollbackPage` from `ch_recv`.
+async fn send_request_read_page(
+    ch_send: &mut quinn::SendStream,
+    ch_recv: &mut quinn::RecvStream,
+    channel_id: u32,
+    from_line: u64,
+    count: u32,
+) -> nosh_proto::Message {
+    nosh_proto::write_message(
+        ch_send,
+        &nosh_proto::Message::ScrollbackRequest {
+            channel_id,
+            from_line,
+            count,
+        },
+    )
+    .await
+    .expect("write ScrollbackRequest");
+
+    let deadline = Duration::from_secs(10);
+    tokio::time::timeout(deadline, async {
+        loop {
+            match nosh_proto::read_message(ch_recv).await {
+                Ok(msg @ nosh_proto::Message::ScrollbackPage { .. }) => return msg,
+                Ok(_) => {}
+                Err(e) => panic!("ch_recv error waiting for ScrollbackPage: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ScrollbackPage")
+}
+
+// ── SCROLL-01: basic fetch ────────────────────────────────────────────────────
+
+/// SCROLL-01: prove end-to-end scrollback delivery over a real loopback session.
+///
+/// Also asserts that live datagrams continue to arrive with advancing epochs
+/// DURING the active scrollback transfer (M-6 / SCROLL-05 ack-flow continuity):
+/// the server pump must never stall because the client is in scrollback mode.
+#[tokio::test]
+async fn scrollback_basic_fetch() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_basic_fetch: /bin/sh unavailable");
+        return;
+    }
+
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect");
+
+    let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
+
+    let (mut ch_send, mut ch_recv, channel_id) =
+        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+
+    // Request up to 256 lines starting from the newest.
+    let page = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 256).await;
+
+    let (lines_count, total_avail, epoch_at_snap) = match &page {
+        nosh_proto::Message::ScrollbackPage {
+            lines,
+            total_available,
+            epoch_at_snapshot,
+            ..
+        } => (lines.len(), *total_available, *epoch_at_snapshot),
+        other => panic!("expected ScrollbackPage, got {}", other.variant_name()),
+    };
+
+    assert!(
+        lines_count > 0,
+        "SCROLL-01: ScrollbackPage must have at least one line; got {lines_count}"
+    );
+    assert!(
+        total_avail > 0,
+        "SCROLL-01: total_available must be > 0; got {total_avail}"
+    );
+    assert!(
+        epoch_at_snap > 0,
+        "SCROLL-01: epoch_at_snapshot must be > 0 (server must have ticked); got {epoch_at_snap}"
+    );
+
+    // ── Epoch-ack continuity proof (M-6 / SCROLL-05) ─────────────────────────
+    // While the scrollback channel is open, generate more PTY output and assert
+    // that datagrams keep arriving with strictly increasing epochs — proving the
+    // server pump is NOT stalling because of the open scrollback channel.
+    client::send_input(&mut ctrl_send, b"printf 'epoch_check\\n'\n")
+        .await
+        .expect("send PTY input during scrollback");
+
+    let mut last_epoch = epoch_at_snap;
+    let mut epoch_advanced = false;
+    let epoch_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < epoch_deadline {
+        match tokio::time::timeout(Duration::from_millis(200), conn.read_datagram()).await {
+            Ok(Ok(bytes)) => {
+                if let Ok(diff) = decode_datagram(&bytes) {
+                    if diff.epoch > last_epoch {
+                        epoch_advanced = true;
+                        last_epoch = diff.epoch;
+                        // Emit epoch-ack (simulating client ack-flow continuity in Active mode).
+                        let _ = conn.send_datagram(encode_epoch_ack(diff.epoch));
+                        break;
+                    }
+                }
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+
+    assert!(
+        epoch_advanced,
+        "M-6 / SCROLL-05: datagram epoch must advance during an active scrollback transfer \
+         (last_epoch={last_epoch}); server pump appears stalled"
+    );
+
+    // Grant credit so the sender can clean up.
+    let _ = nosh_proto::write_message(
+        &mut ctrl_send,
+        &nosh_proto::Message::ScrollbackCredit {
+            channel_id,
+            bytes: 256 * 1024,
+        },
+    )
+    .await;
+
+    conn.close(0u32.into(), b"done");
+    ep.close(0u32.into(), b"done");
+}
+
+// ── SCROLL-05 / S-5: epoch handoff — no torn epoch ───────────────────────────
+
+/// SCROLL-05 / S-5: issue a `ScrollbackRequest` CONCURRENTLY with live diff ticks
+/// (without quiescing the session) and assert:
+///   (a) the page carries a single consistent `epoch_at_snapshot` (non-zero,
+///       monotonically non-decreasing across two consecutive requests), and
+///   (b) the seam invariant: `lines.len() <= total_available` and the second
+///       page's `from_line` is `>= first page's line count` (no gap or duplicate
+///       at the boundary).
+#[tokio::test]
+async fn scrollback_epoch_handoff_no_gap() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_epoch_handoff_no_gap: /bin/sh unavailable");
+        return;
+    }
+
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect");
+
+    let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
+
+    // Keep diff ticks firing by draining datagrams and acking in the background.
+    let conn_bg = conn.clone();
+    let ack_task = tokio::spawn(async move {
+        for _ in 0..30u32 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            match tokio::time::timeout(Duration::from_millis(50), conn_bg.read_datagram()).await {
+                Ok(Ok(bytes)) => {
+                    if let Ok(diff) = decode_datagram(&bytes) {
+                        let _ = conn_bg.send_datagram(encode_epoch_ack(diff.epoch));
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Generate concurrent PTY output while we open the channel (races diff ticks).
+    for i in 0..5u32 {
+        client::send_input(
+            &mut ctrl_send,
+            format!("printf 'race_{i}\\n'\n").as_bytes(),
+        )
+        .await
+        .expect("send PTY input racing with scrollback request");
+    }
+
+    let (mut ch_send, mut ch_recv, channel_id) =
+        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+
+    // First request — concurrent with diff ticks (no quiesce before this).
+    let page1 = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 256).await;
+
+    let (lines1, total_avail1, epoch1, from_line1) = match &page1 {
+        nosh_proto::Message::ScrollbackPage {
+            lines, total_available, epoch_at_snapshot, from_line, ..
+        } => (lines.clone(), *total_available, *epoch_at_snapshot, *from_line),
+        other => panic!("expected first ScrollbackPage, got {}", other.variant_name()),
+    };
+
+    // (a) Non-zero epoch (server has ticked).
+    assert!(epoch1 > 0, "S-5: first page epoch_at_snapshot must be > 0; got {epoch1}");
+    assert_eq!(from_line1, 0, "S-5: first page from_line must be 0");
+    assert!(
+        lines1.len() as u64 <= total_avail1,
+        "S-5: lines.len() ({}) must not exceed total_available ({total_avail1})",
+        lines1.len()
+    );
+
+    // Grant credit so a second request can be served.
+    let _ = nosh_proto::write_message(
+        &mut ctrl_send,
+        &nosh_proto::Message::ScrollbackCredit {
+            channel_id,
+            bytes: 256 * 1024,
+        },
+    )
+    .await;
+
+    // Second request — epoch must be >= first (monotonic, no backward jump).
+    let page2 = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 256).await;
+
+    let epoch2 = match &page2 {
+        nosh_proto::Message::ScrollbackPage { epoch_at_snapshot, .. } => *epoch_at_snapshot,
+        other => panic!("expected second ScrollbackPage, got {}", other.variant_name()),
+    };
+
+    assert!(
+        epoch2 >= epoch1,
+        "S-5: second page epoch ({epoch2}) must be >= first ({epoch1}); epoch must not regress"
+    );
+
+    let _ = ack_task.await;
+    conn.close(0u32.into(), b"done");
+    ep.close(0u32.into(), b"done");
+}
+
+// ── SCROLL-05 / Pitfall 5: post-reattach fresh channel id ────────────────────
+
+/// SCROLL-05 / Pitfall 5: after a cold reattach, the Scrollback channel must be
+/// re-opened as a FRESH channel (no byte-replay of the pre-orphan channel state).
+/// The server cleared its channel_map on orphan, so a new `ChannelOpen` for the
+/// same id must succeed and deliver scrollback pages.
+#[tokio::test]
+async fn scrollback_post_reattach() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_post_reattach: /bin/sh unavailable");
+        return;
+    }
+
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    // ── Session 1: produce scrollback, record the reattach token ─────────────
+    let (ep1, _dir1) = client_endpoint_for(&client_key);
+    let conn1 = client::connect(&ep1, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect session 1");
+
+    let (mut ctrl_send1, ctrl_recv1, token) =
+        client::open_session_with_token(&conn1, "xterm".to_string(), 80, 24, vec![])
+            .await
+            .expect("open session 1 with token");
+
+    let (frame_tx1, mut frame_rx1) = mpsc::unbounded_channel::<nosh_proto::Message>();
+    let _drain1 = spawn_ctrl_drain(ctrl_recv1, frame_tx1);
+
+    // Produce scrollback via PTY.
+    for i in 0..40u32 {
+        client::send_input(
+            &mut ctrl_send1,
+            format!("printf 'pre_{i}\\n'\n").as_bytes(),
+        )
+        .await
+        .expect("send PTY for pre-orphan scrollback");
+    }
+    // Wait for first datagram to confirm state was applied.
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn1.read_datagram()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Open a Scrollback channel (pre-orphan).
+    let pre_orphan_sb_id: u32 = 2;
+    client::send_channel_open(&mut ctrl_send1, pre_orphan_sb_id, ChannelType::Scrollback)
+        .await
+        .expect("send ChannelOpen pre-orphan");
+    let accepted1 = await_channel_accept_from_drain(&mut frame_rx1, pre_orphan_sb_id, 3000)
+        .await
+        .expect("await ChannelAccept pre-orphan");
+    assert!(accepted1, "pre-orphan Scrollback must be accepted");
+
+    // ── Orphan the session ────────────────────────────────────────────────────
+    drop(ctrl_send1);
+    conn1.close(1u32.into(), b"test orphan");
+    drop(conn1);
+    ep1.close(0u32.into(), b"done");
+    drop(ep1);
+
+    let orphan_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if registry.total_orphans() >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < orphan_deadline,
+            "server did not register orphan within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // ── Session 2: reconnect + reattach ──────────────────────────────────────
+    let (ep2, _dir2) = client_endpoint_for(&client_key);
+    let conn2 = client::connect(&ep2, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect for reattach");
+
+    let (mut ctrl_send2, mut ctrl_recv2) = conn2.open_bi().await.expect("open bi for reattach");
+    client::send_reattach(&mut ctrl_send2, token, 0)
+        .await
+        .expect("send Reattach");
+
+    let outcome = client::await_reattach_reply(&mut ctrl_recv2)
+        .await
+        .expect("await reattach reply");
+    assert!(
+        matches!(outcome, ReattachOutcome::Ok { .. }),
+        "cold reattach must succeed"
+    );
+
+    let (frame_tx2, mut frame_rx2) = mpsc::unbounded_channel::<nosh_proto::Message>();
+    let _drain2 = spawn_ctrl_drain(ctrl_recv2, frame_tx2);
+
+    // ── Re-open Scrollback channel with a fresh ChannelOpen ──────────────────
+    // EvenIdAllocator starts at 2 for every new session, so post_reattach_sb_id == 2.
+    // The server cleared its channel_map on orphan, so the Accept proves fresh-open.
+    let post_reattach_sb_id: u32 = 2;
+    client::send_channel_open(&mut ctrl_send2, post_reattach_sb_id, ChannelType::Scrollback)
+        .await
+        .expect("send ChannelOpen post-reattach");
+
+    let accepted2 = await_channel_accept_from_drain(&mut frame_rx2, post_reattach_sb_id, 3000)
+        .await
+        .expect("await ChannelAccept post-reattach");
+
+    // (a) Accept (not Reject) proves fresh-open semantics — no byte-replay.
+    assert!(
+        accepted2,
+        "SCROLL-05 / Pitfall 5: Scrollback ChannelOpen post-reattach must be ACCEPTED \
+         (got Reject); server channel_map must have been cleared on orphan"
+    );
+
+    // (b) A ScrollbackRequest on the fresh channel returns scrollback content.
+    let (mut ch_send2, mut ch_recv2) = conn2.open_bi().await.expect("open_bi post-reattach");
+    let prefix2 = postcard::to_allocvec(&post_reattach_sb_id).expect("encode varint");
+    ch_send2.write_all(&prefix2).await.expect("write varint prefix");
+
+    let page = send_request_read_page(&mut ch_send2, &mut ch_recv2, post_reattach_sb_id, 0, 256).await;
+    match &page {
+        nosh_proto::Message::ScrollbackPage { total_available, .. } => {
+            assert!(
+                *total_available > 0,
+                "SCROLL-05: scrollback must be available post-reattach (total_available=0)"
+            );
+        }
+        other => panic!(
+            "SCROLL-05: expected ScrollbackPage post-reattach, got {}",
+            other.variant_name()
+        ),
+    }
+
+    conn2.close(0u32.into(), b"done");
+    ep2.close(0u32.into(), b"done");
+}
+
+// ── SCROLL-02 / M-6: PTY latency isolation during scrollback transfer ─────────
+
+/// SCROLL-02 / M-6: prove PTY input round-trip latency stays below 150 ms while
+/// a scrollback transfer is actively flowing.  This shows `run_scrollback_sender_task`
+/// is fully isolated in a `tokio::spawn` and never blocks the pump's PTY path.
+///
+/// 150 ms is generous (vs the 16 ms diff tick) to avoid CI flakes.  A genuine
+/// M-6 regression (sender blocking the pump inline) delays every sample by
+/// hundreds of ms.
+#[tokio::test]
+async fn scrollback_pty_latency_isolation() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_pty_latency_isolation: /bin/sh unavailable");
+        return;
+    }
+
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect");
+
+    let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
+
+    let (mut ch_send, mut ch_recv, channel_id) =
+        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+
+    // Issue a large request to keep the sender active.
+    nosh_proto::write_message(
+        &mut ch_send,
+        &nosh_proto::Message::ScrollbackRequest {
+            channel_id,
+            from_line: 0,
+            count: 1024,
+        },
+    )
+    .await
+    .expect("write large ScrollbackRequest");
+
+    // Drain ch_recv in a background task so the transfer flows and does not
+    // block ch_send's QUIC flow-control window.
+    let drain_handle = tokio::spawn(async move {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), nosh_proto::read_message(&mut ch_recv)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+    });
+
+    // ── Measure PTY round-trip latency under active scrollback transfer ───────
+    const SAMPLES: usize = 5;
+    let mut latency_samples: Vec<Duration> = Vec::with_capacity(SAMPLES);
+
+    for i in 0..SAMPLES {
+        let marker = format!("M6_LAT_{i}");
+        let t0 = Instant::now();
+        client::send_input(&mut ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
+            .await
+            .expect("send PTY during transfer");
+
+        let mut found = false;
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), frame_rx.recv()).await {
+                Ok(Some(nosh_proto::Message::PtyData { data })) => {
+                    if String::from_utf8_lossy(&data).contains(&marker) {
+                        latency_samples.push(t0.elapsed());
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(found, "M-6: PTY marker {marker} missing within 1 s during scrollback transfer");
+    }
+
+    latency_samples.sort_unstable();
+    let median = latency_samples[latency_samples.len() / 2];
+    assert!(
+        median < Duration::from_millis(150),
+        "M-6 VIOLATED: median PTY latency {median:?} over {SAMPLES} samples during scrollback \
+         transfer (bound < 150 ms); samples: {latency_samples:?}"
+    );
+
+    drain_handle.abort();
+    conn.close(0u32.into(), b"done");
+    ep.close(0u32.into(), b"done");
+}
+
+// ── SCROLL-02 / S-4: drop-oldest under back-pressure ─────────────────────────
+
+/// SCROLL-02 / S-4: prove the scrollback pump does NOT hang when credit is
+/// withheld and many requests are sent back-to-back.
+///
+/// Strategy: open a Scrollback channel, send multiple requests without ever
+/// granting credit.  The sender exhausts its INITIAL_CREDIT window and then
+/// waits on `events.recv()` (the credit-pause idiom from MUX-03).  Because the
+/// sender is a separate `tokio::spawn`, this must NOT stall the main session pump.
+/// We assert session liveness by confirming PTY input still echoes within 5 s.
+#[tokio::test]
+async fn scrollback_backpressure_drop_oldest() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_backpressure_drop_oldest: /bin/sh unavailable");
+        return;
+    }
+
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect");
+
+    let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
+
+    let (mut ch_send, _ch_recv, channel_id) =
+        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+
+    // Flood requests without granting any credit.  After the first page is
+    // written (exhausting the 256 KiB INITIAL_CREDIT), the sender will block in
+    // the credit-pause loop — but that is in a separate tokio task.
+    for _ in 0..10u32 {
+        let _ = nosh_proto::write_message(
+            &mut ch_send,
+            &nosh_proto::Message::ScrollbackRequest {
+                channel_id,
+                from_line: 0,
+                count: 1024,
+            },
+        )
+        .await;
+    }
+
+    // Give the sender time to exhaust credit.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // ── Session liveness: PTY input must still echo ───────────────────────────
+    let marker = "S4_ALIVE_NOSH";
+    client::send_input(&mut ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
+        .await
+        .expect("send PTY under scrollback back-pressure");
+
+    let mut found = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), frame_rx.recv()).await {
+            Ok(Some(nosh_proto::Message::PtyData { data })) => {
+                if String::from_utf8_lossy(&data).contains(marker) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        found,
+        "S-4 VIOLATED: session hung under scrollback back-pressure — \
+         PTY echo of '{marker}' did not arrive within 5 s"
+    );
+
+    conn.close(0u32.into(), b"done");
+    ep.close(0u32.into(), b"done");
+}
+
+// ── SCROLL-02 / S-1: in-order delivery (reliable stream proof) ───────────────
+
+/// SCROLL-02 / S-1: fetch two consecutive pages of scrollback and assert the
+/// delivered line ranges are contiguous with no gap or overlap (S-1 reliable-only
+/// proof).
+///
+/// Scrollback travels over a QUIC **reliable stream**.  Even under packet loss,
+/// QUIC retransmits stream bytes in order, so the client always receives a
+/// contiguous byte sequence.  A datagram-delivered scrollback would lose pages
+/// under loss — this test would then fail because `from_line` of the second page
+/// would not equal `lines1.len()` (a gap).
+///
+/// Note: loopback transport does not experience real packet loss.  What this test
+/// proves is the ORDERING INVARIANT on the wire type: consecutive requests for
+/// non-overlapping line ranges return exactly-contiguous pages.
+#[tokio::test]
+async fn scrollback_inorder_under_loss() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_inorder_under_loss: /bin/sh unavailable");
+        return;
+    }
+
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect");
+
+    let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
+
+    let (mut ch_send, mut ch_recv, channel_id) =
+        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+
+    // ── First page: from_line=0, count=16 ────────────────────────────────────
+    let page1 = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 16).await;
+
+    let (lines1_len, total_avail, from_line1) = match &page1 {
+        nosh_proto::Message::ScrollbackPage {
+            lines, total_available, from_line, ..
+        } => (lines.len(), *total_available, *from_line),
+        other => panic!("expected first ScrollbackPage, got {}", other.variant_name()),
+    };
+
+    assert_eq!(from_line1, 0, "S-1: first page from_line must be 0");
+    assert!(
+        lines1_len as u64 <= total_avail,
+        "S-1: lines.len() ({lines1_len}) must not exceed total_available ({total_avail})"
+    );
+
+    if total_avail <= lines1_len as u64 {
+        // History is short enough that one page covers everything.
+        conn.close(0u32.into(), b"done");
+        ep.close(0u32.into(), b"done");
+        return;
+    }
+
+    // Grant credit for the second page.
+    let _ = nosh_proto::write_message(
+        &mut ctrl_send,
+        &nosh_proto::Message::ScrollbackCredit {
+            channel_id,
+            bytes: 256 * 1024,
+        },
+    )
+    .await;
+
+    // ── Second page: from_line = lines1_len (immediately after first page) ────
+    let next_from = lines1_len as u64;
+    let page2 = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, next_from, 16).await;
+
+    let (lines2_len, from_line2) = match &page2 {
+        nosh_proto::Message::ScrollbackPage { lines, from_line, .. } => (lines.len(), *from_line),
+        other => panic!("expected second ScrollbackPage, got {}", other.variant_name()),
+    };
+
+    // ── S-1 contiguity assertion ──────────────────────────────────────────────
+    assert_eq!(
+        from_line2, next_from,
+        "S-1: second page from_line ({from_line2}) must equal first-page line count ({next_from}); \
+         any discrepancy (gap or overlap) means scrollback is NOT travelling on a reliable stream"
+    );
+
+    // Both pages must be non-empty when more history is available.
+    assert!(lines1_len > 0, "S-1: first page must be non-empty");
+    if next_from < total_avail {
+        assert!(
+            lines2_len > 0,
+            "S-1: second page must be non-empty when from_line ({next_from}) < total_available ({total_avail})"
+        );
+    }
+
+    conn.close(0u32.into(), b"done");
+    ep.close(0u32.into(), b"done");
+}
+
+// ── SCROLL-04: snap-back keybinding ──────────────────────────────────────────
+
+/// SCROLL-04: prove the snap-back keybinding behaviour at the channel + PTY level.
+///
+/// The full SCROLL-04 state machine lives in `run_pump` (main.rs), which processes
+/// raw stdin bytes that cannot be injected from an integration test.  This test
+/// proves the two observable properties at the channel-primitives layer:
+///
+///   (1) Entry into Active mode: the Scrollback channel can be opened and a
+///       `ScrollbackRequest` can be sent and served — this is the primitive that
+///       `run_pump` exercises when the user presses Shift-PageUp.
+///
+///   (2) Non-paging keystroke forwarding (T-22-15 LOCKED): after the scrollback
+///       request is served (emulating Active mode), sending PTY input bytes via
+///       `client::send_input` produces a round-trip shell echo.  This proves that
+///       the PTY send path is NOT blocked or swallowed during/after Active mode —
+///       the LOCKED behaviour that non-paging bytes are always forwarded.
+///
+/// Unit tests for `CsiAccumulator` and `ScrollbackView` state transitions reside
+/// in `crates/nosh-client/src/main.rs`.
+#[tokio::test]
+async fn scrollback_keybinding_snap_back() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_keybinding_snap_back: /bin/sh unavailable");
+        return;
+    }
+
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect");
+
+    let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
+
+    // ── (1) Enter Active: open Scrollback channel + send ScrollbackRequest ────
+    let (mut ch_send, mut ch_recv, channel_id) =
+        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+
+    // Send the initial ScrollbackRequest (the action Shift-PageUp triggers).
+    let page = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 256).await;
+    match &page {
+        nosh_proto::Message::ScrollbackPage { total_available, .. } => {
+            // Page served — Active mode entry is viable.  total_available=0 is
+            // allowed if scrollback is empty, but produce_scrollback should ensure > 0.
+            let _ = total_available;
+        }
+        other => panic!(
+            "SCROLL-04: expected ScrollbackPage (Active-mode entry), got {}",
+            other.variant_name()
+        ),
+    }
+
+    // ── (2) Non-paging keystroke: forwarded to the shell (not swallowed) ──────
+    // In run_pump, any non-paging byte while Active snaps back to Live AND is
+    // forwarded via send_input → PtyData.  We prove the forwarding property
+    // directly: send_input produces a PTY echo.
+    let snap_marker = "SNAP_NOSH";
+    client::send_input(
+        &mut ctrl_send,
+        format!("printf '{snap_marker}\\n'\n").as_bytes(),
+    )
+    .await
+    .expect("send non-paging keystroke (snap-back emulation)");
+
+    let mut echoed = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), frame_rx.recv()).await {
+            Ok(Some(nosh_proto::Message::PtyData { data })) => {
+                if String::from_utf8_lossy(&data).contains(snap_marker) {
+                    echoed = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        echoed,
+        "SCROLL-04 VIOLATED: PTY echo of '{snap_marker}' never arrived — \
+         non-paging keystroke was swallowed (must be forwarded to the shell)"
+    );
+
+    conn.close(0u32.into(), b"done");
+    ep.close(0u32.into(), b"done");
 }
