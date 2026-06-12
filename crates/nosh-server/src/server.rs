@@ -1243,15 +1243,25 @@ async fn run_session(
                         break SessionEnd::ClientClosed;
                     }
 
-                    // Scrollback frames on the control stream are protocol errors:
+                    // ScrollbackCredit is a client→server credit grant that travels on
+                    // the control stream (same direction as ChannelCredit). Route it to
+                    // the channel task exactly like ChannelCredit. Unknown id is a logged
+                    // no-op — never panic (Pitfall M-4 / T-21-07).
+                    Ok(Message::ScrollbackCredit { channel_id, bytes }) => {
+                        if let Some(task_tx) = channel_map.get(&channel_id) {
+                            let _ = task_tx.try_send(ChannelEvent::Credit(bytes));
+                        } else {
+                            tracing::debug!(channel_id, "ScrollbackCredit for unknown channel; ignoring");
+                        }
+                    }
+
                     // ScrollbackRequest must travel on the scrollback channel's own
-                    // RecvStream (M-2 deadlock avoidance); ScrollbackPage and
-                    // ScrollbackCredit are server→client frames that the client task
-                    // writes on ch_send, never on the control stream.
-                    // Log and ignore — do not close the session for a misdirected frame.
+                    // RecvStream (M-2 deadlock avoidance); ScrollbackPage is a
+                    // server→client frame the server writes on ch_send, never on the
+                    // control stream. Both are protocol errors here — log and ignore
+                    // without closing the session.
                     Ok(Message::ScrollbackRequest { channel_id, .. })
-                    | Ok(Message::ScrollbackPage { channel_id, .. })
-                    | Ok(Message::ScrollbackCredit { channel_id, .. }) => {
+                    | Ok(Message::ScrollbackPage { channel_id, .. }) => {
                         tracing::debug!(
                             channel_id,
                             "scrollback frame received on control stream (protocol error); ignoring"
@@ -2014,13 +2024,24 @@ async fn run_reattach_session(
                         break SessionEnd::ClientClosed;
                     }
 
-                    // IN-S-02: explicit debug-log arm for scrollback control-stream
-                    // frames in run_reattach_session — mirrors run_session's arm above.
-                    // These are protocol errors (scrollback frames must travel on the
-                    // channel's own streams, not the control stream), but are non-fatal.
+                    // ScrollbackCredit is a client→server credit grant travelling on
+                    // the control stream — mirrors run_session's arm and the ChannelCredit
+                    // arm above. Route it to the channel task. Unknown id is a logged
+                    // no-op — never panic (Pitfall M-4 / T-21-07).
+                    Ok(Message::ScrollbackCredit { channel_id, bytes }) => {
+                        if let Some(task_tx) = channel_map.get(&channel_id) {
+                            let _ = task_tx.try_send(ChannelEvent::Credit(bytes));
+                        } else {
+                            tracing::debug!(channel_id, "ScrollbackCredit for unknown channel (reattach); ignoring");
+                        }
+                    }
+
+                    // IN-S-02: ScrollbackRequest must travel on the channel's own
+                    // RecvStream (M-2 deadlock avoidance); ScrollbackPage is a
+                    // server→client frame that must not appear on the control stream.
+                    // Both are protocol errors here — log and ignore without closing.
                     Ok(Message::ScrollbackRequest { channel_id, .. })
-                    | Ok(Message::ScrollbackPage { channel_id, .. })
-                    | Ok(Message::ScrollbackCredit { channel_id, .. }) => {
+                    | Ok(Message::ScrollbackPage { channel_id, .. }) => {
                         tracing::debug!(
                             channel_id,
                             "scrollback frame received on control stream during reattach \

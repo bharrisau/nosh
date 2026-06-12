@@ -1739,3 +1739,135 @@ async fn scrollback_keybinding_snap_back() {
     conn.close(0u32.into(), b"done");
     ep.close(0u32.into(), b"done");
 }
+
+// ── SCROLL-02 / deep-paging credit replenishment ──────────────────────────────
+
+/// Regression test for the ScrollbackCredit routing bug (gap-closure 22-06).
+///
+/// Root cause: the server's control-stream handler lumped `ScrollbackCredit` into
+/// the "scrollback frame on control stream = protocol error, log and ignore" arm.
+/// So credit grants the client sent were silently dropped — the server's
+/// `run_scrollback_sender_task` started with `INITIAL_CREDIT = 256 KiB`, deducted
+/// per page, and could never be replenished.  Once cumulative `ScrollbackPage` wire
+/// bytes exceeded 256 KiB the sender blocked in the credit-wait loop, hit the 30 s
+/// timeout, and closed the channel.
+///
+/// Fix: `ScrollbackCredit` is split into its own arm (mirroring `ChannelCredit`)
+/// in both `run_session` and `run_reattach_session`.
+///
+/// This test uses the existing `produce_scrollback` helper (40 lines) and then
+/// repeatedly re-requests the same range from `from_line=0`, granting
+/// `ScrollbackCredit` back after each page.  Since the server deducts the encoded
+/// page size from `remaining_credit` on every request, cumulative deductions reach
+/// TARGET_BYTES (512 KiB) — beyond INITIAL_CREDIT (256 KiB) — only if credit is
+/// actually delivered to the sender task.
+///
+/// Without the server fix this test fails: the 15 s page-read timeout fires once
+/// cumulative credit deductions exhaust the 256 KiB window (sender blocks).
+/// With the fix, pages keep flowing and the loop completes.
+#[tokio::test]
+async fn scrollback_deep_paging_replenishes_credit() {
+    if !have_sh() {
+        eprintln!("skipping scrollback_deep_paging_replenishes_credit: /bin/sh unavailable");
+        return;
+    }
+
+    // ── Set up a session with scrollback content (reuse existing helper) ─────
+    let registry = SessionRegistry::new(5, Duration::ZERO);
+    let client_key = TestKey::generate();
+    let server = server_with_key(registry.clone(), &client_key).await;
+
+    let (ep, _dir) = client_endpoint_for(&client_key);
+    let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
+        .await
+        .expect("connect");
+
+    // `produce_scrollback` generates 40 numbered lines and waits for a datagram
+    // to confirm the server has processed them.  That is sufficient history for
+    // real pages.
+    let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
+
+    // ── Open a scrollback channel ─────────────────────────────────────────────
+    let (mut ch_send, mut ch_recv, channel_id) =
+        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+
+    // ── Deep-paging loop: request pages and grant credit after each ───────────
+    //
+    // Strategy: always request from_line=0 so the server serves a real page on
+    // every iteration and deducts its encoded size from remaining_credit.  After
+    // each page arrives, grant that many bytes back via ScrollbackCredit on the
+    // control stream.  Accumulate bytes until TARGET_BYTES (512 KiB) — well past
+    // INITIAL_CREDIT (256 KiB) — to prove replenishment is live end-to-end.
+    //
+    // With the bug (ScrollbackCredit silently dropped), remaining_credit drains to 0
+    // after ~256 KiB; the sender blocks in the credit-wait loop and the 15 s timeout
+    // fires.  With the fix, each grant reaches ChannelEvent::Credit and pages keep
+    // flowing.
+    const INITIAL_CREDIT: u64 = 256 * 1024;
+    const TARGET_BYTES: u64 = INITIAL_CREDIT * 2; // must exceed 256 KiB to prove replenishment
+
+    let mut cumulative_bytes: u64 = 0;
+    let mut pages_received: u32 = 0;
+
+    while cumulative_bytes < TARGET_BYTES {
+        // Always request from_line=0 so every iteration forces a real page.
+        nosh_proto::write_message(
+            &mut ch_send,
+            &nosh_proto::Message::ScrollbackRequest {
+                channel_id,
+                from_line: 0,
+                count: 40,
+            },
+        )
+        .await
+        .expect("write ScrollbackRequest");
+
+        // Read back the ScrollbackPage.  15 s gives generous CI headroom while
+        // still catching the bug (the sender blocks until the 30 s WR-S-02 timeout).
+        let page = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match nosh_proto::read_message(&mut ch_recv).await {
+                    Ok(msg @ nosh_proto::Message::ScrollbackPage { .. }) => return msg,
+                    Ok(_) => {}
+                    Err(e) => panic!("ch_recv error in deep-paging loop: {e}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!(
+            "scrollback_deep_paging_replenishes_credit: 15 s timeout reading ScrollbackPage \
+             (page {pages_received}, cumulative_bytes={cumulative_bytes}) — \
+             server credit-wait loop never unblocked (SCROLL-02 / gap 22-06)"
+        ));
+
+        // Measure the encoded wire size (mirrors how the server deducts from remaining_credit).
+        let encoded_len = nosh_proto::codec::encode(&page)
+            .expect("encode ScrollbackPage for credit measurement")
+            .len() as u64;
+
+        cumulative_bytes += encoded_len;
+        pages_received += 1;
+
+        // Grant credit equal to the encoded cost of the page we just consumed.
+        // Critical path: with the bug this is silently dropped and the server stalls;
+        // with the fix it reaches ChannelEvent::Credit and replenishes the window.
+        nosh_proto::write_message(
+            &mut ctrl_send,
+            &nosh_proto::Message::ScrollbackCredit {
+                channel_id,
+                bytes: encoded_len,
+            },
+        )
+        .await
+        .expect("write ScrollbackCredit on control stream");
+    }
+
+    assert!(
+        cumulative_bytes >= TARGET_BYTES,
+        "deep-paging loop exited early: cumulative_bytes={cumulative_bytes} < TARGET={TARGET_BYTES}"
+    );
+    assert!(pages_received > 0, "deep-paging loop: no pages received at all");
+
+    conn.close(0u32.into(), b"done");
+    ep.close(0u32.into(), b"done");
+}
