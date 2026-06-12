@@ -6,7 +6,11 @@
 
 The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux), and v1.1 (M3) added roaming + a native Windows client. v1.2 (M4) built the headline UX differentiator on that foundation — predictive local echo — and hardened nosh into a daily-drivable tool. v1.3 (M5) builds the channel-multiplexing foundation and native scrollback sync, and fixes the rendering/pacing defects that currently make full-screen TUI apps unusable.
 
-## Current Milestone: v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
+## Current Milestone: (none — planning next via `/gsd:new-milestone`)
+
+v1.3 (M5) shipped 2026-06-12. The next milestone is not yet defined; likely candidates from the deferred backlog are port/agent forwarding (FWD-01/02), file transfer (XFER-01), the Phase 18 security design pass (SEC-01/02), and Windows ConPTY native server (M6).
+
+## Last Shipped Milestone: v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness (shipped 2026-06-12)
 
 **Goal:** Build nosh's channel-multiplexing foundation and native scrollback sync, and fix the rendering/pacing defects that make full-screen TUI apps unusable today — so nosh handles vim/htop/Claude Code and large repaints correctly.
 
@@ -36,9 +40,11 @@ A single QUIC connection on UDP/443 can carry a live interactive shell, authenti
 
 ## Current State
 
-**Shipped:** v1.2 (M4 Predictive Echo + Daily-Driver Readiness) — 2026-06-07. Core phases 10-17. Audit 17/19 requirements satisfied, cross-phase integration 8/8 seams wired (no broken/orphaned), all E2E flows complete. Delivered the headline differentiator — speculative local echo over QUIC state-sync datagrams (Mosh-style SSP: epoch tracking, conservative reset, noecho suppression, adaptive-RTT, wide-char) — on an authoritative server terminal-state model, plus the QoL pack (loss banner, OSC 52 clipboard, terminal title, RTT status) and a Windows CI gate. Predictive echo was live-validated on a native Windows client → Linux server (PREDICT-07). Backlog items 999.1 (server attack-surface fuzz-hardening — ~18h campaign, zero crashes, `docs/999.1-SECURITY.md`), 999.3 and 999.4 also shipped this cycle.
+**Shipped:** v1.3 (M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness) — 2026-06-12. Phases 19-22, 15 plans. Audit 19/19 requirements satisfied; cross-phase integration 5/5 seams wired; all E2E flows complete. Delivered: a genuine two-grid alternate-screen model + width-accurate wide-char/grapheme rendering (vim/htop/Claude Code now render correctly), burst repaint pacing (~1 RTT full-screen repaints, noecho invariant preserved), a control-first channel-multiplexing foundation (OPEN/ACCEPT/REJECT, per-channel credit flow control, append-only discriminant stability), and native scrollback sync over a dedicated reliable channel (client-driven credit paging off the main pump, Shift-PageUp/Down + snap-back, alt-screen exclusion, epoch-consistent live handoff, reattach survival). Two real blockers were caught by independent opus verification during close and fixed + regression-tested before shipping: the scrollback render path (gap 22-05) and the end-to-end credit-replenishment loop (gap 22-06).
 
-All three foundational/UX milestones are now proven: v1.0 established the QUIC+SSH-key+PTY architecture on Linux; v1.1 added roaming-tolerant session persistence (migration + 1-RTT cold reattach) and a native Windows client; v1.2 added predictive echo and daily-driver readiness.
+All four milestones are now proven: v1.0 established the QUIC+SSH-key+PTY architecture on Linux; v1.1 added roaming-tolerant session persistence (migration + 1-RTT cold reattach) and a native Windows client; v1.2 added predictive echo and daily-driver readiness; v1.3 added channel multiplexing, scrollback, and full-screen TUI correctness.
+
+**Previously shipped:** v1.2 (M4 Predictive Echo + Daily-Driver Readiness) — 2026-06-07, core phases 10-17, audit 17/19, predictive echo live-validated on a native Windows client → Linux server (PREDICT-07).
 
 **Deferred to a future milestone:** Phase 18 — Security Design Pass (SEC-01 threat-model doc, SEC-02 interactive TOFU fingerprint-confirm prompt). (Note: TOFU/known_hosts pinning + host-key-mismatch hard-fail already exist and were re-verified in 999.1; SEC-02 is the interactive first-contact prompt.)
 
@@ -75,14 +81,18 @@ All three foundational/UX milestones are now proven: v1.0 established the QUIC+S
 
 - ✓ Sparse size-bounded datagram wire format in `nosh-proto`: `StateDiff` (changed cells, monotonic epoch, dims+cursor), total `encode_datagram` (cursor-priority fill, STRICT cap), hardened `decode_datagram` (never panics, MAX_RUNS guard), round-trip + size-cap tests — v1.2 Phase 11 (SYNC-01). Validated in Phase 11: 2026-06-01.
 
+<!-- v1.3 (M5) — validated 2026-06-12 (audit 19/19). -->
+
+- ✓ Full-screen TUI rendering correctness: genuine two-grid alternate-screen model, width-accurate wide-char/grapheme rendering, predictor suppressed in cursor-addressing mode, bounded post-auth OSC OOM — v1.3 Phase 19 (TUI-01..05, SEC-03). Windows visual re-test deferred (see Deferred Items).
+- ✓ Repaint pacing: burst multiple state-diff datagrams per tick (~1 RTT full-screen repaints), one epoch per tick, noecho invariant proven by a required CI gate, both 999.4 traps designed out — v1.3 Phase 20 (PACE-01..03).
+- ✓ Channel multiplexing + per-channel flow control: control-first OPEN/ACCEPT/REJECT on control channel id 0, per-channel credit windows, clean half/full-close lifecycle, append-only discriminant stability, mobility-safe re-establish — v1.3 Phase 21 (MUX-01..06).
+- ✓ Scrollback sync: history served over a dedicated reliable channel with client-driven credit paging off the main pump, Shift-PageUp/Down + snap-back, alt-screen exclusion, epoch-consistent live handoff, reattach survival — v1.3 Phase 22 (SCROLL-01..05).
+
 ### Active
 
-<!-- v1.3 (M5) scope — being decomposed into REQUIREMENTS.md / ROADMAP.md. -->
+<!-- v1.3 (M5) scope — SHIPPED 2026-06-12. Mux + scrollback + TUI correctness + repaint pacing. See Validated above and MILESTONES.md. -->
 
-- Channel multiplexing + per-channel flow control: control-first OPEN/ACCEPT/REJECT on control channel id 0 before binding a stream; per-channel flow-control windows
-- Scrollback sync: native server-side scrollback synced to the client beyond the live grid (first consumer of the mux layer)
-- Full-screen TUI rendering correctness (999.5): genuine alternate-screen buffer (`?1049h`/`?1049l` save/restore/clear, not a no-op flag) + cell-width/grapheme audit
-- Repaint pacing (999.6): burst datagrams per tick so full-screen repaints land in ~1 RTT, without breaking the noecho security invariant (one epoch per tick)
+<!-- Candidates for the next milestone (not yet committed): port/agent forwarding (FWD-01/02), file transfer (XFER-01), Phase 18 security design pass (SEC-01/02), Windows ConPTY native server (M6). Define via /gsd:new-milestone. -->
 
 <!-- v1.2 (M4) scope — SHIPPED 2026-06-07. Predictive echo + QoL pack + pre-auth fuzz-hardening. See MILESTONES.md and Validated below. -->
 - ✓ Predictive local echo (SSP-style speculative overlay, epoch tracking, noecho suppression, adaptive-RTT, wide-char) — v1.2; live-validated Windows→Linux (PREDICT-07)
@@ -150,4 +160,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-07 after starting milestone v1.3 (M5)*
+*Last updated: 2026-06-12 after shipping milestone v1.3 (M5)*

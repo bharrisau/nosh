@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
-status: milestone_complete
-stopped_at: Milestone complete (Phase 22 was final phase)
-last_updated: 2026-06-12T01:26:20.900Z
-last_activity: 2026-06-11 -- Phase 22 execution started
+status: Awaiting next milestone
+stopped_at: Phase 21 Plan 01 complete
+last_updated: "2026-06-12T01:51:54.998Z"
+last_activity: 2026-06-12 — Milestone v1.3 completed and archived
 progress:
   total_phases: 4
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 15
-  completed_plans: 27
-  percent: 75
+  completed_plans: 17
+  percent: 100
 ---
 
 # Project State
@@ -25,14 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-07)
 
 ## Current Position
 
-Phase: 22
-Plan: Not started
-Status: Milestone complete
-Last activity: 2026-06-12
-
-```
-Progress: [█████████░] 91%
-```
+Phase: Milestone v1.3 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-06-12 — Milestone v1.3 completed and archived
 
 ## Performance Metrics
 
@@ -134,6 +130,9 @@ Items acknowledged and carried forward:
 | v2 (M6) | Windows ConPTY / native server (PLAT-01) | Deferred to M6 | Init |
 | v2 (M6) | Windows ssh-agent / Pageant signing (PLAT-02) | Deferred post-v1.1 | v1.1 scoping |
 | v2 (M7) | WebTransport / NAT topologies | Deferred to M7 | Init |
+| Phase 19 | Windows visual re-test of full-screen TUI rendering (19-HUMAN-UAT.md, 4 scenarios; VERIFICATION human_needed) | Open — operator TODO; Linux verified, Windows pending | v1.3 close (2026-06-12) |
+| Backlog 999.3 | Client terminal rendering correctness pack — VERIFICATION human_needed | Deferred (parking-lot, not v1.3 core) | v1.3 close (2026-06-12) |
+| Debug | phase17-round2-triage debug session (investigating, 2026-06-02) | Stale (pre-v1.3) — review or close | v1.3 close (2026-06-12) |
 
 ## Session Continuity
 
@@ -143,6 +142,4 @@ Resume file: .planning/phases/21-channel-multiplexing-foundation/21-01-SUMMARY.m
 
 ## Operator Next Steps
 
-- Start Phase 19: `/gsd:plan-phase 19`
-- Investigation-first: reproduce the garbled-TUI bug on Linux before fixing (PITFALLS mandate)
-- Decide wire-format strategy for `StateDiff` width field before Phase 19 coding begins
+- Start the next milestone with /gsd-new-milestone

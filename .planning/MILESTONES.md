@@ -1,5 +1,22 @@
 # Milestones
 
+## v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness (Shipped: 2026-06-12)
+
+**Phases completed:** 4 phases (19-22), 15 plans
+
+**Key accomplishments:**
+
+- **Full-screen TUI rendering correctness (Phase 19)** — replaced the no-op alt-screen flag with a genuine two-grid model in `TerminalState`, made wide characters/grapheme clusters width-accurate, suppressed the predictor in cursor-addressing mode, and bounded the post-auth OSC OOM vector. vim/htop/Claude Code now render correctly.
+- **Repaint pacing (Phase 20)** — `send_burst()` drains a full `StateDiff` in one tick (BURST_CAP=64, one epoch per tick) so full-screen repaints land in ~1 RTT instead of one MTU per 16 ms; both reverted-999.4 traps (R-1 infinite-spin, R-2 noecho-epoch) are designed out architecturally and guarded by a required noecho CI gate.
+- **Channel multiplexing foundation (Phase 21)** — control-first OPEN/ACCEPT/REJECT on control stream id 0, append-only discriminant-stability test as the first commit, per-channel credit-based flow control, and clean half/full-close lifecycle.
+- **Scrollback sync (Phase 22)** — historical lines served over a dedicated reliable channel with client-driven credit paging off the main pump, Shift-PageUp/Down with snap-back, alt-screen exclusion, S-5 atomic epoch handoff, and survival across migration + cold reattach.
+
+**Verification notes:** Two real blockers were caught by independent verification during milestone close and fixed + regression-tested before shipping — (1) the client buffered scrollback pages but never rendered them (opus phase verifier; gap 22-05), and (2) the scrollback credit-replenishment loop was broken end-to-end so deep paging >256 KiB stalled (opus integration checker; gap 22-06, RED/GREEN-confirmed).
+
+**Known deferred items at close:** 4 (see STATE.md Deferred Items) — Phase 19 Windows visual re-test, 999.3 backlog verification, a stale phase-17 debug session. None block v1.3's Linux core.
+
+---
+
 ## v1.2 M4 Predictive Echo + Daily-Driver Readiness (Shipped: 2026-06-07)
 
 **Phases completed:** 12 phases, 29 plans, 24 tasks
