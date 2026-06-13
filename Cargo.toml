@@ -32,6 +32,11 @@ anyhow = "1"
 async-trait = "0.1.89"
 thiserror = "1"
 windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
+wtransport = { version = "0.7.1", default-features = false, features = ["self-signed", "ring", "quinn"] }
+# Pin time to =0.3.47 — wtransport issue #311 (still open 2026-06-13): time 0.3.48+
+# has a breaking change in the dependency graph that causes build failures when
+# wtransport is present. Remove this pin when wtransport 0.7.2 closes issue #311.
+time = "=0.3.47"
 
 [profile.release]
 opt-level = 2
