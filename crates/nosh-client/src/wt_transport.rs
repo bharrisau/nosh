@@ -137,6 +137,23 @@ impl NoshTransport for WtransportTransport {
         // wtransport::Connection::close(error_code: VarInt, reason: &[u8]) — verified.
         self.0.close(VarInt::from_u32(code), reason)
     }
+
+    fn export_keying_material(
+        &self,
+        output: &mut [u8; 32],
+        label: &[u8],
+        context: &[u8],
+    ) -> anyhow::Result<()> {
+        // Delegate to the underlying quinn::Connection via quic_connection().
+        // quic_connection() is gated on the "quinn" feature — confirmed active
+        // in workspace Cargo.toml (features = [..., "quinn"]).
+        // Both TLS endpoints of the same WebTransport session derive identical
+        // bytes given the same label, context, and output length (RFC 9266 / D-01).
+        self.0
+            .quic_connection()
+            .export_keying_material(output, label, context)
+            .map_err(|e| anyhow::anyhow!("export_keying_material failed: {e:?}"))
+    }
 }
 
 // ── WtransportSendStream ───────────────────────────────────────────────────────

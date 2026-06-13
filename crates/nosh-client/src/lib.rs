@@ -3,6 +3,8 @@
 
 pub mod channel; // Phase 21: per-channel drain task + even-id allocator
 pub mod client;
+#[cfg(feature = "webtransport")]
+pub mod inner_auth; // Phase 25 Plan 03: WebTransport inner SSH-key auth + TOFU prompt
 pub mod platform;
 pub mod predictor; // NEW: PredictionOverlay, PendingPrediction, Validity, InputAction
 pub mod quinn_transport; // Phase 24: Quinn pass-through wrappers over NoshTransport

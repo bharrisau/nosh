@@ -1233,6 +1233,7 @@ dependencies = [
  "quinn",
  "rustls",
  "serde_json",
+ "sha2 0.10.9",
  "ssh-agent-client-rs",
  "ssh-key",
  "tempfile",
