@@ -14,7 +14,6 @@ use ed25519_dalek::SigningKey;
 use nosh_auth::{InProcessEd25519Signer, NoshPublicKey, RawEd25519Signer};
 use nosh_client::client::{self, ClientIdentity};
 use nosh_client::quinn_transport::QuinnTransport;
-use nosh_proto::transport_trait::NoshTransport;
 use nosh_server::registry::SessionRegistry;
 use nosh_server::server::{self, AuthLimits};
 use ssh_key::private::Ed25519Keypair;
