@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 
 use nosh_proto::Message;
 use nosh_proto::messages::ScrollbackLine;
+use nosh_proto::{NoshSendStream, NoshRecvStream};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -38,7 +39,11 @@ pub enum ChannelEvent {
     /// Delivered after the client opens the QUIC bidi stream carrying the
     /// channel-id varint prefix. The task holds onto these for all subsequent
     /// channel I/O.
-    Stream(quinn::SendStream, quinn::RecvStream),
+    ///
+    /// D-02 / SC#4: the streams are boxed trait objects so the channel task is
+    /// transport-agnostic. Phase 24 can deliver WebTransport streams here without
+    /// any change to the channel task itself.
+    Stream(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>),
     /// The peer has granted additional send credit (bytes, MUX-03).
     Credit(u64),
     /// Peer or local side initiated close; the task should finish and return.
@@ -57,7 +62,7 @@ pub const MAX_PAGE_SIZE: usize = 1024;
 
 // ── Varint helper ─────────────────────────────────────────────────────────────
 
-/// Read a postcard/LEB128-encoded `u32` varint from a QUIC `RecvStream`.
+/// Read a postcard/LEB128-encoded `u32` varint from a `NoshRecvStream`.
 ///
 /// Reads at most 5 bytes (the maximum encoding for a `u32`). Returns `Err` on
 /// a truncated stream, a malformed continuation byte after 5 bytes, or an
@@ -66,7 +71,7 @@ pub const MAX_PAGE_SIZE: usize = 1024;
 /// The encoding matches `postcard::to_allocvec(&channel_id_u32)`: each byte
 /// contributes 7 bits of the value (little-endian); the high bit of each byte
 /// signals that more bytes follow. For channel ids 0–127 this is a single byte.
-pub async fn read_varint_u32(recv: &mut quinn::RecvStream) -> anyhow::Result<u32> {
+pub async fn read_varint_u32(recv: &mut dyn NoshRecvStream) -> anyhow::Result<u32> {
     let mut value: u32 = 0;
     let mut shift: u32 = 0;
 
@@ -127,15 +132,19 @@ pub async fn run_channel_task(
     // Run the echo loop (test-only behaviour) or a production stub.
     run_channel_task_inner(
         channel_id,
-        &mut ch_send,
-        &mut ch_recv,
+        &mut *ch_send,
+        &mut *ch_recv,
         &mut events,
         &control_tx,
     )
     .await;
 
     // Half-close: finish the send side and give the peer a moment to drain.
-    let _ = ch_send.finish();
+    // CRITICAL (T-23-06): NoshSendStream::finish() is async fn — MUST .await.
+    // An un-awaited finish() builds a Future that is dropped unpolled, silently
+    // skipping the QUIC half-close. The let _ = suppresses must_use so this
+    // compiles without .await, making it a silent regression.
+    let _ = ch_send.finish().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), ch_send.stopped()).await;
 
     // Notify the pump to remove this channel from the map.
@@ -150,8 +159,8 @@ pub async fn run_channel_task(
 /// control-stream notification always run regardless of how the inner loop exits.
 async fn run_channel_task_inner(
     channel_id: u32,
-    ch_send: &mut quinn::SendStream,
-    ch_recv: &mut quinn::RecvStream,
+    ch_send: &mut dyn NoshSendStream,
+    ch_recv: &mut dyn NoshRecvStream,
     events: &mut mpsc::Receiver<ChannelEvent>,
     _control_tx: &mpsc::Sender<Message>,
 ) {
@@ -209,7 +218,7 @@ async fn run_channel_task_inner(
 /// # Security invariants
 ///
 /// - **S-1 reliable-only at the type level:** the signature accepts only
-///   `&mut quinn::SendStream` — there is no `&quinn::Connection` parameter and
+///   `&mut dyn NoshSendStream` — there is no connection parameter and
 ///   therefore no datagram-send path is reachable from this function body.
 ///   A grep over the function body for the datagram token is the falsifiable proof.
 ///
@@ -240,8 +249,8 @@ async fn run_channel_task_inner(
 pub async fn run_scrollback_sender_task(
     channel_id: u32,
     slot: Arc<crate::registry::SessionSlot>,
-    ch_send: &mut quinn::SendStream,
-    ch_recv: &mut quinn::RecvStream,
+    ch_send: &mut dyn NoshSendStream,
+    ch_recv: &mut dyn NoshRecvStream,
     events: &mut mpsc::Receiver<ChannelEvent>,
     control_tx: &mpsc::Sender<Message>,
     epoch_src: Arc<std::sync::atomic::AtomicU64>,
@@ -267,7 +276,9 @@ pub async fn run_scrollback_sender_task(
         tokio::select! {
             // Read the next ScrollbackRequest from the channel's own RecvStream
             // (M-2: never the control stream).
-            msg = nosh_proto::codec::read_message(ch_recv) => {
+            // Phase 23 (SC#2): use read_message_ns to read via NoshRecvStream
+            // trait object (Box<dyn NoshRecvStream> does not impl AsyncRead+Unpin).
+            msg = nosh_proto::read_message_ns(ch_recv) => {
                 match msg {
                     Ok(Message::ScrollbackRequest { channel_id: req_cid, from_line, count }) => {
                         // Ignore requests for a different channel_id (protocol error; logged,
@@ -369,7 +380,8 @@ pub async fn run_scrollback_sender_task(
                                 }
                                 Ok(Some(ChannelEvent::Close)) | Ok(None) => {
                                     // Session or channel closed while waiting for credit.
-                                    let _ = ch_send.finish();
+                                    // CRITICAL (T-23-06): finish() is async — MUST .await.
+                                    let _ = ch_send.finish().await;
                                     let _ = tokio::time::timeout(
                                         Duration::from_secs(2),
                                         ch_send.stopped(),
@@ -387,7 +399,8 @@ pub async fn run_scrollback_sender_task(
                                         "scrollback sender: 30 s credit timeout — \
                                          closing channel (client stalled)"
                                     );
-                                    let _ = ch_send.finish();
+                                    // CRITICAL (T-23-06): finish() is async — MUST .await.
+                                    let _ = ch_send.finish().await;
                                     let _ = tokio::time::timeout(
                                         Duration::from_secs(2),
                                         ch_send.stopped(),
@@ -433,7 +446,8 @@ pub async fn run_scrollback_sender_task(
     }
 
     // Half-close: finish the send side and give the peer a moment to drain.
-    let _ = ch_send.finish();
+    // CRITICAL (T-23-06): NoshSendStream::finish() is async fn — MUST .await.
+    let _ = ch_send.finish().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), ch_send.stopped()).await;
 
     // Notify the pump to remove this channel from the map (A4: route via control_tx,
@@ -453,8 +467,8 @@ pub async fn run_scrollback_sender_task(
 #[cfg(any(test, feature = "test-support"))]
 async fn run_echo_loop(
     _channel_id: u32,
-    ch_send: &mut quinn::SendStream,
-    ch_recv: &mut quinn::RecvStream,
+    ch_send: &mut dyn NoshSendStream,
+    ch_recv: &mut dyn NoshRecvStream,
     events: &mut mpsc::Receiver<ChannelEvent>,
 ) {
     let mut remaining_credit: u64 = INITIAL_CREDIT;
