@@ -2,9 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
-status: planning
-last_updated: "2026-06-13T00:01:39.199Z"
-last_activity: 2026-06-13
+status: Roadmap created; ready for Phase 23
+stopped_at: Phases 23-28 context gathered (batched discussion)
+last_updated: "2026-06-13T03:36:58.453Z"
+last_activity: 2026-06-13 — v1.4 roadmap written (Phases 23-28)
 progress:
   total_phases: 6
   completed_phases: 0
@@ -128,9 +129,9 @@ Items acknowledged and carried forward from previous milestones:
 
 ## Session Continuity
 
-Last session: 2026-06-13
-Stopped at: v1.4 roadmap creation (Phases 23-28)
-Resume file: .planning/ROADMAP.md
+Last session: 2026-06-13T03:36:58.433Z
+Stopped at: Phases 23-28 context gathered (batched discussion)
+Resume file: .planning/phases/23-transport-abstraction-seam/23-CONTEXT.md
 
 ## Operator Next Steps
 
