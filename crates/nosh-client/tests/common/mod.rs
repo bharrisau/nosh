@@ -227,6 +227,86 @@ pub fn have_sh() -> bool {
     std::path::Path::new("/bin/sh").exists()
 }
 
+// ── WebTransport test harness (webtransport feature only) ─────────────────────
+
+/// A running in-process WebTransport server with its bound address.
+///
+/// Spawns a `wtransport::Endpoint<Server>` on an ephemeral loopback port using
+/// a freshly generated self-signed outer TLS cert, then runs
+/// `run_wt_accept_loop` with the test-support auth bypass on a background task.
+#[cfg(feature = "webtransport")]
+pub struct WtTestServer {
+    pub addr: SocketAddr,
+    /// SHA-256 hash of the self-signed TLS cert — use with
+    /// `wtransport::ClientConfig::builder().with_server_certificate_hashes([hash])`.
+    pub cert_hash: wtransport::tls::Sha256Digest,
+    pub registry: Arc<SessionRegistry>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "webtransport")]
+impl Drop for WtTestServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn an in-process WebTransport server on an ephemeral loopback port.
+///
+/// Uses `Identity::self_signed` (wtransport `self-signed` feature) to generate
+/// a fresh outer TLS cert valid for ≤ 14 days. The server runs
+/// `run_wt_accept_loop` with the test-support auth bypass on a background task.
+///
+/// The returned `WtTestServer` carries the bound `addr` and the cert's
+/// SHA-256 `hash` so the test client can use `with_server_certificate_hashes`.
+///
+/// Returns `None` if `/bin/sh` is unavailable (caller should skip the test).
+#[cfg(feature = "webtransport")]
+pub async fn spawn_wt_server(shell: Option<String>) -> Option<WtTestServer> {
+    use nosh_server::wt_transport::run_wt_accept_loop;
+    use nosh_server::server::AuthLimits;
+    use wtransport::{Identity, ServerConfig, Endpoint};
+
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    // Generate a self-signed TLS identity for the outer layer (D-04 test variant).
+    // SANs must match the host we dial ("127.0.0.1") so wtransport's SNI check passes.
+    let identity = Identity::self_signed(&["localhost", "127.0.0.1"])
+        .expect("self-signed identity generation must not fail");
+
+    // Capture the cert hash BEFORE consuming identity (clone_identity required because
+    // Identity is not Clone directly — it exposes clone_identity() to make it explicit).
+    let cert_hash = identity
+        .certificate_chain()
+        .as_slice()
+        .first()
+        .expect("self-signed identity has exactly one cert")
+        .hash();
+
+    let server_config = ServerConfig::builder()
+        .with_bind_address(bind)
+        .with_identity(identity)
+        .build();
+
+    let endpoint = Endpoint::server(server_config).expect("bind WT test endpoint");
+    let addr = endpoint.local_addr().expect("WT endpoint local_addr");
+
+    let registry = SessionRegistry::new(5, std::time::Duration::ZERO);
+    let registry_for_task = registry.clone();
+
+    let handle = tokio::spawn(async move {
+        let _ = run_wt_accept_loop(
+            endpoint,
+            registry_for_task,
+            AuthLimits::default(),
+            shell,
+        )
+        .await;
+    });
+
+    Some(WtTestServer { addr, cert_hash, registry, handle })
+}
+
 /// Prove an authenticated connection yields a USABLE session: open a PTY
 /// session, echo a unique marker via the remote shell, and confirm it comes
 /// back. Replaces the Phase 2 stream-echo usability probe now that the server

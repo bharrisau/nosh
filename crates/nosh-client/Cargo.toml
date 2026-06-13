@@ -57,8 +57,12 @@ ssh-agent-client-rs = "1.1"
 windows-sys = { workspace = true }
 
 [dev-dependencies]
-nosh-server = { path = "../nosh-server", features = ["test-support"] }
+nosh-server = { path = "../nosh-server", features = ["test-support", "webtransport"] }
 nosh-auth = { path = "../nosh-auth", features = ["test-support"] }
+# wtransport dev-dep: the webtransport.rs integration test uses wtransport types
+# directly (Identity, ServerConfig, ClientConfig, etc.) — exposed to test targets
+# when built with --features webtransport.
+wtransport = { workspace = true }
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std", "alloc"] }
 ed25519-dalek = "2.2"
 tokio = { workspace = true, features = ["signal", "process"] }
