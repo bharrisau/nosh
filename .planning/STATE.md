@@ -1,17 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.3
-milestone_name: M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness
-status: Awaiting next milestone
-stopped_at: Phase 21 Plan 01 complete
-last_updated: "2026-06-12T01:51:54.998Z"
-last_activity: 2026-06-12 — Milestone v1.3 completed and archived
+milestone: v1.4
+milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
+status: planning
+last_updated: "2026-06-13T00:01:39.199Z"
+last_activity: 2026-06-13
 progress:
-  total_phases: 4
-  completed_phases: 4
-  total_plans: 15
-  completed_plans: 17
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -25,10 +24,10 @@ See: .planning/PROJECT.md (updated 2026-06-07)
 
 ## Current Position
 
-Phase: Milestone v1.3 complete
+Phase: Not started (defining requirements)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-06-12 — Milestone v1.3 completed and archived
+Status: Defining requirements
+Last activity: 2026-06-13 — Milestone v1.4 started
 
 ## Performance Metrics
 

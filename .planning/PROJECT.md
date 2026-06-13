@@ -6,9 +6,19 @@
 
 The M0–M2 **architecture-validation spike** shipped in v1.0 (the three foundational bets proven end-to-end on Linux), and v1.1 (M3) added roaming + a native Windows client. v1.2 (M4) built the headline UX differentiator on that foundation — predictive local echo — and hardened nosh into a daily-drivable tool. v1.3 (M5) builds the channel-multiplexing foundation and native scrollback sync, and fixes the rendering/pacing defects that currently make full-screen TUI apps unusable.
 
-## Current Milestone: (none — planning next via `/gsd:new-milestone`)
+## Current Milestone: v1.4 M7 Remote Access over HTTP/3 + Security Hardening
 
-v1.3 (M5) shipped 2026-06-12. The next milestone is not yet defined; likely candidates from the deferred backlog are port/agent forwarding (FWD-01/02), file transfer (XFER-01), the Phase 18 security design pass (SEC-01/02), and Windows ConPTY native server (M6).
+**Goal:** Let nosh be reached securely across the public internet through an HTTP/3 reverse proxy, with the SSH-key handshake as an inner auth layer inside the WebTransport tunnel — and complete the deferred security hardening so it's safe to expose, proven end-to-end by a guided interactive UAT pass.
+
+**Target features:**
+- WebTransport-over-HTTP/3 reverse-proxy mode — nosh runs as WebTransport inside an HTTP/3 tunnel so it survives a QUIC-terminating proxy (e.g. nginx); SSH-key mutual auth moves to an inner handshake inside the tunnel (ET's outer-transport / inner-handshake model)
+- Migration handover behind the proxy — roaming continues to work in the proxied topology where end-to-end connection-ID migration is broken by the proxy
+- Security design pass (Phase 18) — SEC-01 threat-model doc covering the new internet-exposed topology; SEC-02 interactive TOFU fingerprint-confirm prompt on first contact
+- Client trust-boundary hardening (999.2 / SEC-04) — harden the client against a malicious or compromised server
+- OSC OOM bound re-check (999.7) — re-verify the post-auth OSC accumulation bound (Phase-16 mitigation reasoning was found incorrect in the 999.1 review)
+- Interactive UAT clearing — a guided, step-by-step validation session (not a dumped doc) covering both the carried-forward backlog (Phase 19 Windows alt-screen re-test, 999.3 rendering pack, 999.4 Windows predictive-echo, green Windows CI confirm) and the new M7 remote-access path
+
+**Key context:** NAT hole-punch/relay is explicitly deferred to a later milestone — this milestone is the reverse-proxy path only. The reverse-proxy topology terminates QUIC at the proxy, which is why the inner-auth layer is mandatory (not optional) and why L4 UDP passthrough is the wrong answer (QUIC's routing key is the connection ID, not the 5-tuple). Likely new crate: `wtransport`. The interactive UAT walkthrough is a defining process requirement: one item at a time, conversational (`/gsd:verify-work` style), confirm each before moving on.
 
 ## Last Shipped Milestone: v1.3 M5 Channel Multiplexing, Scrollback Sync & TUI Rendering Correctness (shipped 2026-06-12)
 
@@ -90,9 +100,16 @@ All four milestones are now proven: v1.0 established the QUIC+SSH-key+PTY archit
 
 ### Active
 
-<!-- v1.3 (M5) scope — SHIPPED 2026-06-12. Mux + scrollback + TUI correctness + repaint pacing. See Validated above and MILESTONES.md. -->
+<!-- v1.4 (M7) scope — committed 2026-06-13. Remote HTTP/3 access + security hardening + interactive UAT. REQ-IDs defined in REQUIREMENTS.md; phases in ROADMAP.md. -->
 
-<!-- Candidates for the next milestone (not yet committed): port/agent forwarding (FWD-01/02), file transfer (XFER-01), Phase 18 security design pass (SEC-01/02), Windows ConPTY native server (M6). Define via /gsd:new-milestone. -->
+- [ ] WebTransport-over-HTTP/3 reverse-proxy mode with inner SSH-key auth (WT-*)
+- [ ] Migration handover behind a QUIC-terminating proxy (WT-*)
+- [ ] Security design pass — threat-model doc + interactive TOFU fingerprint prompt (SEC-01/02)
+- [ ] Client trust-boundary hardening (SEC-04 / 999.2)
+- [ ] OSC OOM bound re-check (999.7)
+- [ ] Interactive guided UAT clearing — carried-forward backlog + new M7 path
+
+<!-- v1.3 (M5) scope — SHIPPED 2026-06-12. Mux + scrollback + TUI correctness + repaint pacing. See Validated above and MILESTONES.md. -->
 
 <!-- v1.2 (M4) scope — SHIPPED 2026-06-07. Predictive echo + QoL pack + pre-auth fuzz-hardening. See MILESTONES.md and Validated below. -->
 - ✓ Predictive local echo (SSP-style speculative overlay, epoch tracking, noecho suppression, adaptive-RTT, wide-char) — v1.2; live-validated Windows→Linux (PREDICT-07)
@@ -160,4 +177,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-12 after shipping milestone v1.3 (M5)*
+*Last updated: 2026-06-13 after starting milestone v1.4 (M7 Remote Access over HTTP/3 + Security Hardening)*
