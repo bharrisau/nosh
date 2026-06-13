@@ -4,8 +4,8 @@ milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
 status: executing
 stopped_at: Phase 25 wave-2 (25-02 server + 25-03 client) merged to main; quick-fix 260614-47b restored the integration-test gate to green. HEAD = 54a1d4b.
-last_updated: "2026-06-13T19:25:26.246Z"
-last_activity: 2026-06-14 -- 25-02/25-03 merged; TOFU test-harness regression quick-fixed; full gate green
+last_updated: "2026-06-13T19:47:43.966Z"
+last_activity: 2026-06-13
 progress:
   total_phases: 6
   completed_phases: 3
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 
 ## Current Position
 
-Phase: 25 (inner-ssh-key-handshake-tofu-prompt) — EXECUTING
-Plan: 4 of 4 (25-01/02/03 merged to main; 25-04 next)
+Phase: 26
+Plan: Not started
 Status: Executing Phase 25 — wave-2 merged, post-merge gate green
-Last activity: 2026-06-14 -- 25-02/25-03 merged; TOFU test-harness regression quick-fixed; full gate green
+Last activity: 2026-06-13
 
 ```
 Progress: [██████████] 100%
@@ -55,6 +55,7 @@ Progress: [██████████] 100%
 | 28. Interactive UAT Clearing | 0/? | - | - |
 | 23 | 2 | - | - |
 | 24 | 5 | - | - |
+| 25 | 4 | - | - |
 
 **Recent Trend:**
 

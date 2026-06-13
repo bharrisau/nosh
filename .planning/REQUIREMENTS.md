@@ -85,6 +85,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | UAT-02 | Phase 28 | Pending |
 
 **Coverage:**
+
 - v1.4 requirements: 12 total
 - Mapped to phases: 12
 - Unmapped: 0 ✓
