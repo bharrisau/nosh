@@ -1174,6 +1174,22 @@ struct Args {
     /// is active (the RTT title takes precedence — Pitfall 5).
     #[arg(long)]
     status: bool,
+
+    /// Connect using WebTransport over HTTP/3 instead of raw QUIC (D-08, WT-05).
+    ///
+    /// The server must be started with `--mode webtransport`. The outer TLS is
+    /// validated via the OS CA trust store (server must have a CA-signed cert).
+    /// Inner SSH-key mutual auth is not yet enforced (Phase 25).
+    ///
+    /// Only available when the binary is built with `--features webtransport`.
+    #[arg(long)]
+    webtransport: bool,
+
+    /// WebTransport URL path (used with --webtransport; default "/nosh").
+    ///
+    /// The full WebTransport URL is constructed as `https://{host}:{port}{wt_path}`.
+    #[arg(long, default_value = "/nosh")]
+    wt_path: String,
 }
 
 fn default_known_hosts() -> anyhow::Result<PathBuf> {
@@ -1317,6 +1333,97 @@ async fn main() -> anyhow::Result<()> {
 
     // Outer reconnect supervisor loop (D-10).
     loop {
+        // ── Transport selection (D-08, WT-05) ─────────────────────────────────
+        // When --webtransport is supplied, skip the native quinn endpoint and
+        // connect via WebTransport instead. Both paths produce a
+        // `Box<dyn NoshTransport>` fed into the SAME generic pump — no duplicated
+        // session logic. When --webtransport is not compiled in, `args.webtransport`
+        // is always `false` and the native path runs unconditionally.
+
+        // Gate: if --webtransport was passed to a binary without the feature, error.
+        if args.webtransport {
+            #[cfg(not(feature = "webtransport"))]
+            {
+                eprintln!("\r\nnosh: --webtransport requires this binary to be built with \
+                           the 'webtransport' Cargo feature (cargo build --features webtransport)\r");
+                exit_code = 1;
+                break;
+            }
+        }
+
+        #[cfg(feature = "webtransport")]
+        if args.webtransport {
+            // ── WebTransport connect path ──────────────────────────────────────
+            let url = format!("https://{}:{}{}", args.host, args.port, args.wt_path);
+            let wt_config = nosh_client::wt_transport::build_wt_client_config();
+            let conn = match nosh_client::wt_transport::connect_wt(wt_config, &url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("webtransport connect failed: {e}");
+                    eprintln!("\r\nnosh: reconnecting…\r");
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = quit_during_backoff(&mut stdin_quit) => {
+                            eprintln!("\r\nnosh: quit\r");
+                            break;
+                        }
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                    continue;
+                }
+            };
+
+            let pump_outcome = if let Some(tok) = token {
+                let reattach_result = reattach_session(
+                    &*conn,
+                    tok,
+                    highest_applied,
+                    &mut highest_applied,
+                    &mut resize,
+                    &mut token,
+                    args.predict,
+                    args.status,
+                )
+                .await;
+                reattach_result.unwrap_or(PumpOutcome::TransportDrop)
+            } else {
+                let fresh_result = fresh_session(
+                    &*conn,
+                    term.clone(),
+                    cols,
+                    rows,
+                    &mut highest_applied,
+                    &mut resize,
+                    &mut token,
+                    args.predict,
+                    args.status,
+                )
+                .await;
+                fresh_result.unwrap_or(PumpOutcome::TransportDrop)
+            };
+
+            // Close via trait method; no quinn Endpoint::wait_idle() in WT mode.
+            conn.close(0, b"pump ended");
+
+            match pump_outcome {
+                PumpOutcome::CleanExit(code) => { exit_code = code; break; }
+                PumpOutcome::UserQuit => { break; }
+                PumpOutcome::TransportDrop => {
+                    eprintln!("\r\nnosh: reconnecting…\r");
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = quit_during_backoff(&mut stdin_quit) => {
+                            eprintln!("\r\nnosh: quit\r");
+                            break;
+                        }
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                }
+            }
+            continue; // re-enter reconnect loop for the WT path
+        }
+
+        // ── Native QUIC connect path (default, D-06) ──────────────────────────
         // Build a fresh endpoint and connection for this attempt.
         let endpoint = match client::make_endpoint(&identity, known_hosts.clone(), args.host.clone()) {
             Ok(e) => e,
