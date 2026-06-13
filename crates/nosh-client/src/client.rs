@@ -15,6 +15,7 @@ use nosh_auth::{
 #[cfg(unix)]
 use nosh_auth::AgentSigner;
 use nosh_proto::messages::ChannelType;
+use nosh_proto::transport_trait::{NoshTransport, NoshSendStream, NoshRecvStream};
 use nosh_proto::Message;
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig};
 
@@ -223,22 +224,29 @@ pub async fn connect(
 /// Open a bidirectional stream, send `payload`, and return the echoed bytes
 /// (TRANS-02). The caller asserts the result equals `payload`.
 pub async fn stream_echo_roundtrip(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     payload: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
     send.write_all(payload).await.context("stream write")?;
-    send.finish().context("stream finish")?;
-    let echoed = recv
-        .read_to_end(READ_LIMIT)
-        .await
-        .context("stream read_to_end")?;
+    send.finish().await.context("stream finish")?;
+    let mut buf = vec![0u8; READ_LIMIT];
+    let mut echoed = Vec::new();
+    loop {
+        match recv.read(&mut buf).await.context("stream read")? {
+            Some(0) | None => break,
+            Some(n) => echoed.extend_from_slice(&buf[..n]),
+        }
+        if echoed.len() >= READ_LIMIT {
+            break;
+        }
+    }
     Ok(echoed)
 }
 
 /// Send a datagram and return the echoed datagram (TRANS-03/04). Asserts
 /// datagrams are enabled (`max_datagram_size().is_some()`) and the payload fits.
-pub async fn datagram_roundtrip(conn: &quinn::Connection, payload: Bytes) -> anyhow::Result<Bytes> {
+pub async fn datagram_roundtrip(conn: &dyn NoshTransport, payload: Bytes) -> anyhow::Result<Bytes> {
     let max = conn
         .max_datagram_size()
         .context("datagrams not enabled (max_datagram_size is None)")?;
@@ -247,14 +255,14 @@ pub async fn datagram_roundtrip(conn: &quinn::Connection, payload: Bytes) -> any
         "datagram payload {} exceeds max_datagram_size {max}",
         payload.len()
     );
-    conn.send_datagram(payload).context("send_datagram")?;
+    conn.send_datagram(payload).map_err(|e| anyhow::anyhow!("{e}")).context("send_datagram")?;
     let echoed = conn.read_datagram().await.context("read_datagram")?;
     Ok(echoed)
 }
 
 /// Run a stream echo and a datagram round-trip CONCURRENTLY, proving streams
 /// and datagrams coexist on one connection without interference (TRANS-04).
-pub async fn concurrent_roundtrip(conn: &quinn::Connection) -> anyhow::Result<()> {
+pub async fn concurrent_roundtrip(conn: &dyn NoshTransport) -> anyhow::Result<()> {
     let stream_payload = b"concurrent-stream-payload".to_vec();
     let datagram_payload = Bytes::from_static(b"concurrent-datagram-payload");
 
@@ -489,16 +497,16 @@ pub enum ReattachOutcome {
 ///
 /// The token MUST NOT be logged — log only the identity fingerprint (D-07).
 pub async fn open_session_with_token(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     term: String,
     cols: u16,
     rows: u16,
     env: Vec<(String, String)>,
-) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream, [u8; 16])> {
+) -> anyhow::Result<(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>, [u8; 16])> {
     let (send, mut recv) = open_session(conn, term, cols, rows, env).await?;
     // Read the next frame; the server sends SessionOpened immediately after
     // registering the slot (before any PTY output — guaranteed by the server).
-    match nosh_proto::read_message(&mut recv).await {
+    match nosh_proto::read_message_ns(&mut *recv).await {
         Ok(Message::SessionOpened { token }) => Ok((send, recv, token)),
         // W3 / D-07: never Debug a frame (could carry a token) — use the variant name.
         Ok(other) => anyhow::bail!("expected SessionOpened, got {}", other.variant_name()),
@@ -514,11 +522,11 @@ pub async fn open_session_with_token(
 /// since the last fresh open. The server replays all chunks with
 /// `seq >= last_acked_seq`.
 pub async fn send_reattach(
-    send: &mut quinn::SendStream,
+    send: &mut dyn NoshSendStream,
     token: [u8; 16],
     last_acked_seq: u64,
 ) -> anyhow::Result<()> {
-    nosh_proto::write_message(send, &Message::Reattach { token, last_acked_seq })
+    nosh_proto::write_message_ns(send, &Message::Reattach { token, last_acked_seq })
         .await
         .context("send Reattach")
 }
@@ -526,16 +534,16 @@ pub async fn send_reattach(
 /// Send a periodic `Ack { seq }` frame (D-08 continuous acking). `seq` is the
 /// next-expected-seq == count of output chunks the client has applied (same
 /// convention as `Message::Reattach::last_acked_seq`).
-pub async fn send_ack(send: &mut quinn::SendStream, seq: u64) -> anyhow::Result<()> {
-    nosh_proto::write_message(send, &Message::Ack { seq })
+pub async fn send_ack(send: &mut dyn NoshSendStream, seq: u64) -> anyhow::Result<()> {
+    nosh_proto::write_message_ns(send, &Message::Ack { seq })
         .await
         .context("send Ack")
 }
 
 /// Read the server's reply to a `Reattach` frame (the first frame on the new
 /// stream after sending `Reattach`). Returns `ReattachOutcome::Ok` or `::Err`.
-pub async fn await_reattach_reply(recv: &mut quinn::RecvStream) -> anyhow::Result<ReattachOutcome> {
-    match nosh_proto::read_message(recv).await {
+pub async fn await_reattach_reply(recv: &mut dyn NoshRecvStream) -> anyhow::Result<ReattachOutcome> {
+    match nosh_proto::read_message_ns(recv).await {
         Ok(Message::ReattachOk {
             new_token,
             replaying_from_seq,
@@ -560,17 +568,17 @@ pub async fn await_reattach_reply(recv: &mut quinn::RecvStream) -> anyhow::Resul
 ///   closing the connection after sending ReattachErr): returns
 ///   `(ReattachOutcome::Err, vec![], 0)`.
 pub async fn reattach_collect(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     token: [u8; 16],
     last_acked_seq: u64,
 ) -> anyhow::Result<(ReattachOutcome, Vec<u8>, i32)> {
     let (mut send, mut recv) = conn.open_bi().await.context("open bi for reattach")?;
-    send_reattach(&mut send, token, last_acked_seq).await?;
+    send_reattach(&mut *send, token, last_acked_seq).await?;
     // await_reattach_reply may fail with a connection error if the server closed
     // the connection (on rejection, the server sends ReattachErr then closes the
     // connection). Treat any read error here as a ReattachErr outcome — the
     // server has indicated rejection by closing the connection.
-    let outcome = match await_reattach_reply(&mut recv).await {
+    let outcome = match await_reattach_reply(&mut *recv).await {
         Ok(o) => o,
         Err(_) => ReattachOutcome::Err,
     };
@@ -578,7 +586,7 @@ pub async fn reattach_collect(
         ReattachOutcome::Err => Ok((ReattachOutcome::Err, Vec::new(), 0)),
         ref ok @ ReattachOutcome::Ok { .. } => {
             let ok_clone = ok.clone();
-            let (output, exit_code) = collect_until_close(&mut recv).await?;
+            let (output, exit_code) = collect_until_close(&mut *recv).await?;
             Ok((ok_clone, output, exit_code))
         }
     }
@@ -586,15 +594,15 @@ pub async fn reattach_collect(
 
 /// Open the session bidi stream and send the `SessionOpen` frame.
 pub async fn open_session(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     term: String,
     cols: u16,
     rows: u16,
     env: Vec<(String, String)>,
-) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
+) -> anyhow::Result<(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>)> {
     let (mut send, recv) = conn.open_bi().await.context("open session stream")?;
-    nosh_proto::write_message(
-        &mut send,
+    nosh_proto::write_message_ns(
+        &mut *send,
         &Message::SessionOpen {
             term,
             cols,
@@ -608,8 +616,8 @@ pub async fn open_session(
 }
 
 /// Send keystrokes (or any input bytes) as a `PtyData` frame.
-pub async fn send_input(send: &mut quinn::SendStream, bytes: &[u8]) -> anyhow::Result<()> {
-    nosh_proto::write_message(
+pub async fn send_input(send: &mut dyn NoshSendStream, bytes: &[u8]) -> anyhow::Result<()> {
+    nosh_proto::write_message_ns(
         send,
         &Message::PtyData {
             data: bytes.to_vec(),
@@ -620,8 +628,8 @@ pub async fn send_input(send: &mut quinn::SendStream, bytes: &[u8]) -> anyhow::R
 }
 
 /// Send a window resize (SESS-05).
-pub async fn send_resize(send: &mut quinn::SendStream, cols: u16, rows: u16) -> anyhow::Result<()> {
-    nosh_proto::write_message(send, &Message::Resize { cols, rows })
+pub async fn send_resize(send: &mut dyn NoshSendStream, cols: u16, rows: u16) -> anyhow::Result<()> {
+    nosh_proto::write_message_ns(send, &Message::Resize { cols, rows })
         .await
         .context("send Resize")
 }
@@ -634,7 +642,7 @@ pub async fn send_resize(send: &mut quinn::SendStream, cols: u16, rows: u16) -> 
 /// Phase 6: reads and discards the `SessionOpened` frame (the initial reattach
 /// token) that the server now sends right after session open.
 pub async fn run_session_collect(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     term: &str,
     cols: u16,
     rows: u16,
@@ -644,16 +652,16 @@ pub async fn run_session_collect(
     // open_session_with_token reads the SessionOpened frame and discards the token.
     let (mut send, mut recv, _token) =
         open_session_with_token(conn, term.to_string(), cols, rows, env).await?;
-    send_input(&mut send, input_script).await?;
-    collect_until_close(&mut recv).await
+    send_input(&mut *send, input_script).await?;
+    collect_until_close(&mut *recv).await
 }
 
 /// Read frames from `recv`, appending `PtyData` payloads to a buffer, until a
 /// `SessionClose` (returning its exit code) or the stream closes (exit code 0).
-pub async fn collect_until_close(recv: &mut quinn::RecvStream) -> anyhow::Result<(Vec<u8>, i32)> {
+pub async fn collect_until_close(recv: &mut dyn NoshRecvStream) -> anyhow::Result<(Vec<u8>, i32)> {
     let mut output = Vec::new();
     loop {
-        match nosh_proto::read_message(recv).await {
+        match nosh_proto::read_message_ns(recv).await {
             Ok(Message::PtyData { data }) => output.extend_from_slice(&data),
             Ok(Message::SessionClose { exit_code, .. }) => return Ok((output, exit_code)),
             Ok(_) => {} // ignore unexpected control frames in the headless driver
@@ -679,11 +687,11 @@ pub enum ChannelAcceptOutcome {
 /// MUX-01: the OPEN/ACCEPT handshake is completed on the control stream before
 /// any data stream is bound.
 pub async fn send_channel_open(
-    control_send: &mut quinn::SendStream,
+    control_send: &mut dyn NoshSendStream,
     channel_id: u32,
     channel_type: ChannelType,
 ) -> anyhow::Result<()> {
-    nosh_proto::write_message(
+    nosh_proto::write_message_ns(
         control_send,
         &Message::ChannelOpen {
             channel_id,
@@ -711,11 +719,11 @@ pub async fn send_channel_open(
 ///
 /// W3 / D-07: frame payloads are never logged — only variant names.
 pub async fn await_channel_accept(
-    control_recv: &mut quinn::RecvStream,
+    control_recv: &mut dyn NoshRecvStream,
     expected_id: u32,
 ) -> anyhow::Result<ChannelAcceptOutcome> {
     loop {
-        match nosh_proto::read_message(control_recv).await {
+        match nosh_proto::read_message_ns(control_recv).await {
             Ok(Message::ChannelAccept { channel_id }) if channel_id == expected_id => {
                 return Ok(ChannelAcceptOutcome::Accepted);
             }
@@ -758,12 +766,12 @@ pub async fn await_channel_accept(
 /// The varint prefix binds the stream to the logical channel id independently of
 /// the QUIC stream id, so the mapping survives QUIC connection migration.
 pub async fn open_channel(
-    conn: &quinn::Connection,
-    control_send: &mut quinn::SendStream,
-    control_recv: &mut quinn::RecvStream,
+    conn: &dyn NoshTransport,
+    control_send: &mut dyn NoshSendStream,
+    control_recv: &mut dyn NoshRecvStream,
     channel_id: u32,
     channel_type: ChannelType,
-) -> anyhow::Result<Option<(quinn::SendStream, quinn::RecvStream)>> {
+) -> anyhow::Result<Option<(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>)>> {
     send_channel_open(control_send, channel_id, channel_type).await?;
 
     match await_channel_accept(control_recv, channel_id).await? {

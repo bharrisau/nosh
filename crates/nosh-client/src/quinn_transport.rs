@@ -1,12 +1,12 @@
 //! Pure pass-through Quinn wrappers over the `nosh-proto` transport traits
-//! (Phase 23 / D-04 / SC#3).
+//! (Phase 24 / D-04 / SC#3 — client side).
 //!
 //! `QuinnTransport`, `QuinnSendStream`, and `QuinnRecvStream` are thin newtype
 //! wrappers. Each method is a direct delegation to the underlying `quinn` type
 //! with no added logic, buffering, or retries — their only purpose is to satisfy
 //! the `NoshTransport` / `NoshSendStream` / `NoshRecvStream` trait bounds so the
-//! session pump can be transport-agnostic (Phase 24 plugs the WebTransport
-//! wrapper into the same seam).
+//! session pump can be transport-agnostic (WebTransport client plugs into the
+//! same seam in Plan 04).
 //!
 //! # CRITICAL: `finish()` vs `.await`
 //!
@@ -16,7 +16,7 @@
 //! this body. The async wrapper exists solely so trait-object callers can write
 //! `.finish().await`. DO NOT add `.await` inside this wrapper.
 //!
-//! Trait-object CALLERS in `channel.rs` / `server.rs` MUST `.await` every
+//! Trait-object CALLERS in `client.rs` / `main.rs` MUST `.await` every
 //! `.finish()` call — an un-awaited `Pin<Box<dyn Future>>` would silently skip
 //! the QUIC half-close.
 //!
@@ -115,7 +115,7 @@ impl NoshSendStream for QuinnSendStream {
     async fn finish(&mut self) -> anyhow::Result<()> {
         // quinn 0.11: SendStream::finish() is SYNCHRONOUS (fn finish(&mut self)).
         // The trait's async fn exists only for object-safety. Do NOT .await here.
-        // Trait-object callers in channel.rs / server.rs MUST .await this method.
+        // Trait-object callers in client.rs / main.rs MUST .await this method.
         let _ = self.0.finish();
         Ok(())
     }

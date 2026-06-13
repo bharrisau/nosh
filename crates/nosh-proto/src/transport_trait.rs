@@ -104,6 +104,30 @@ pub trait NoshTransport: Send + Sync + 'static {
     /// Peer socket address (used for logging and migration detection).
     fn remote_address(&self) -> SocketAddr;
 
+    /// Measured round-trip time for the connection path (smoothed RTT).
+    ///
+    /// Used by the predictive-echo overlay to time prediction culling (D-17-02a).
+    /// Returns `Duration::ZERO` if the transport does not expose RTT
+    /// (e.g. WebTransport in Mode A before per-path metrics are available).
+    ///
+    /// Quinn wrapper: delegates to `quinn::Connection::rtt()`.
+    fn rtt(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    /// Returns `true` when the connection is known to be closed or lost.
+    ///
+    /// Used to gate the connection-loss overlay (QOL-01 / BUG-C fix): datagram
+    /// silence is NOT connection loss on an idle healthy shell. Only activate the
+    /// overlay when the connection is confirmed closed.
+    ///
+    /// Returns `false` by default — WebTransport transports can override if they
+    /// expose a synchronous close-reason query. Quinn wrapper: delegates to
+    /// `quinn::Connection::close_reason().is_some()`.
+    fn is_closed(&self) -> bool {
+        false
+    }
+
     /// Close the connection with an application error code and reason bytes.
     ///
     /// The `code` is a `u32`; Quinn wrappers convert to `quinn::VarInt` via
@@ -246,4 +270,44 @@ pub async fn read_message_ns(
         ))
     })?;
     crate::codec::decode(&body)
+}
+
+// ── Blanket impls for Box<dyn NoshSendStream> / Box<dyn NoshRecvStream> ────────
+//
+// These allow callers to hold a `Box<dyn NoshSendStream>` value and pass
+// `&mut boxed_stream` directly to helpers that accept `&mut (impl NoshSendStream)`.
+// Without these impls, callers would need to write `&mut *boxed_stream` at every
+// call site (deref-coercion for &mut is not automatic). Blanket impls also mean
+// `tokio::spawn(task(boxed_send, boxed_recv))` works without explicit dereffing.
+
+#[async_trait]
+impl NoshSendStream for Box<dyn NoshSendStream> {
+    async fn write_all(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        (**self).write_all(data).await
+    }
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        (**self).flush().await
+    }
+    async fn finish(&mut self) -> anyhow::Result<()> {
+        (**self).finish().await
+    }
+    async fn stopped(&mut self) -> anyhow::Result<()> {
+        (**self).stopped().await
+    }
+    fn reset(&mut self, code: u32) {
+        (**self).reset(code)
+    }
+}
+
+#[async_trait]
+impl NoshRecvStream for Box<dyn NoshRecvStream> {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+        (**self).read_exact(buf).await
+    }
+    async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<Option<usize>> {
+        (**self).read(buf).await
+    }
+    fn stop(&mut self, code: u32) {
+        (**self).stop(code)
+    }
 }

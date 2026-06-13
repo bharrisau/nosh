@@ -21,6 +21,7 @@ webtransport = ["dep:wtransport"]
 [dependencies]
 nosh-proto = { path = "../nosh-proto" }
 nosh-auth = { path = "../nosh-auth" }
+async-trait = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true, features = ["signal", "io-std"] }
