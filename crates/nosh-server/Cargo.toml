@@ -21,6 +21,7 @@ name = "nosh-server"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 nosh-proto = { path = "../nosh-proto" }
 nosh-auth = { path = "../nosh-auth" }
 quinn = { workspace = true }

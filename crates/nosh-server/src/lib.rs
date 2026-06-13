@@ -3,6 +3,7 @@
 
 pub mod channel;
 pub mod pty_io;
+pub mod quinn_transport;
 pub mod registry;
 pub mod server;
 pub mod session;
