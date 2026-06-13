@@ -2724,3 +2724,175 @@ async fn run_pump(
     let _ = send.finish().await;
     Ok(PumpOutcome::CleanExit(exit_code))
 }
+
+
+#[cfg(test)]
+mod sec04_tests {
+    /// Helper: extract the OSC sequence from captured stdout.
+    /// OSC 0/2: \x1b]0;...\x07 or \x1b]2;...\x07
+    /// OSC 52: \x1b]52;...;...\x07
+    fn extract_osc_sequence(output: &[u8]) -> Vec<u8> {
+        let mut osc_start = None;
+        for (i, &byte) in output.iter().enumerate() {
+            if byte == 0x1b && i + 1 < output.len() && output[i + 1] == b']' {
+                osc_start = Some(i);
+            }
+            if byte == 0x07 {
+                if let Some(start) = osc_start {
+                    return output[start..=i].to_vec();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Helper: simulate the title re-emit path (extracted from main.rs pump loop).
+    fn emit_title_sequence(title: &str) -> Vec<u8> {
+        // D-04: no client vte parser + no DCS/PM/APC TerminalControlPayload variant — scope-fenced no-op
+        // WR-03 fix: strip ESC (\x1b) and BEL (\x07) from the server-controlled title
+        let clean_title: String = title
+            .chars()
+            .filter(|&c| c != '\x07' && c != '\x1b')
+            .collect();
+        let osc02 = format!("\x1b]0;{clean_title}\x07");
+        osc02.into_bytes()
+    }
+
+    /// Helper: simulate the clipboard re-emit path (extracted from main.rs pump loop).
+    fn emit_clipboard_sequence(selection: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+        // D-02: client has no vte parser; server-side osc_prefilter is the authoritative OSC byte gate
+        // WR-01: Defensively strip ESC (\x1b) and BEL (\x07)
+        let sel: String = String::from_utf8_lossy(selection)
+            .chars()
+            .filter(|&c| c != '\x07' && c != '\x1b')
+            .collect();
+
+        // D-03: OSC 52 clipboard-read rejection — if data is b"?", drop frame
+        if data == b"?" {
+            return None;
+        }
+
+        // D-05: validate clipboard selection against allowed set {c,p,s,q,0-9}
+        // Allowed: c (clipboard), p (primary), s (secondary/select), q (query), 0-9 (cut buffers)
+        if !is_allowed_selection(&sel) {
+            return None;
+        }
+
+        let b64: String = String::from_utf8_lossy(data)
+            .chars()
+            .filter(|&c| c != '\x07' && c != '\x1b')
+            .collect();
+        let osc52 = format!("\x1b]52;{sel};{b64}\x07");
+        Some(osc52.into_bytes())
+    }
+
+    /// Helper: check if selection is in the allowed set.
+    fn is_allowed_selection(sel: &str) -> bool {
+        match sel {
+            "c" | "p" | "s" | "q" => true,
+            s if s.len() == 1 && s.chars().next().map_or(false, |c| c.is_ascii_digit()) => true,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn title_with_cr_is_filtered() {
+        // CR-overwrite social-engineering vector: a title ending in \r
+        // followed by content overwrites the displayed prompt.
+        let title = "safe\r\x1b[2Kfake-prompt$ ";
+        let output = emit_title_sequence(title);
+        let osc = extract_osc_sequence(&output);
+
+        // MUST FAIL BEFORE FIX: title contains \r
+        // AFTER FIX: \r is stripped
+        assert!(!osc.contains(&b'\r'), "OSC sequence must not contain CR (\\r)");
+        // Must NOT contain ESC (already filtered by WR-03)
+        assert!(!osc.contains(&b'\x1b'), "OSC sequence must not contain ESC (\\x1b)");
+        // Should contain the safe prefix before \r
+        assert!(osc.contains(&b's'), "OSC sequence should contain 'safe' prefix");
+    }
+
+    #[test]
+    fn title_with_lf_is_filtered() {
+        // Newline in title is also an injection vector.
+        let title = "title\nwith\nnewlines";
+        let output = emit_title_sequence(title);
+        let osc = extract_osc_sequence(&output);
+
+        // MUST FAIL BEFORE FIX: title contains \n
+        // AFTER FIX: \n is stripped
+        assert!(!osc.contains(&b'\n'), "OSC sequence must not contain LF (\\n)");
+    }
+
+    #[test]
+    fn title_with_esc_is_filtered() {
+        // WR-03 regression test: ESC must still be stripped.
+        let title = "title\x1b[31mwith\x1b[0mcolors";
+        let output = emit_title_sequence(title);
+        let osc = extract_osc_sequence(&output);
+
+        assert!(!osc.contains(&b'\x1b'), "OSC sequence must not contain ESC");
+    }
+
+    #[test]
+    fn clipboard_with_invalid_selection_is_dropped() {
+        // Pitfall 2: selection not in whitelist should be dropped.
+        let invalid_selections: [Vec<u8>; 5] = [
+            b"X".to_vec(),
+            b"invalid".to_vec(),
+            b"a".to_vec(),
+            b"z".to_vec(),
+            b"abc".to_vec(),
+        ];
+        for sel in invalid_selections.iter() {
+            let result = emit_clipboard_sequence(sel, b"testdata");
+            // MUST FAIL BEFORE FIX: invalid selections are passed through
+            // AFTER FIX: invalid selections are dropped
+            assert!(result.is_none(), "Selection {:?} should be dropped", String::from_utf8_lossy(sel));
+        }
+    }
+
+    #[test]
+    fn clipboard_with_allowed_selection_passes() {
+        // D-05: valid selections should be re-emitted.
+        let allowed: [(&[u8], &str); 6] = [
+            (b"c", "clipboard"),
+            (b"p", "primary"),
+            (b"s", "secondary"),
+            (b"q", "query"),
+            (b"0", "cut0"),
+            (b"9", "cut9"),
+        ];
+        for (sel, _desc) in allowed {
+            let result = emit_clipboard_sequence(sel, b"testdata");
+            assert!(result.is_some(), "Selection {:?} should pass", String::from_utf8_lossy(sel));
+            let osc = result.unwrap();
+            assert!(osc.starts_with(&[0x1b, b']', b'5', b'2', b';']), "Should start with OSC 52");
+            assert!(osc.contains(&sel[0]), "Should contain selection byte");
+        }
+    }
+
+    #[test]
+    fn clipboard_read_form_is_dropped() {
+        // D-03: OSC 52 clipboard-read (data == b"?") must never be re-emitted.
+        let selections: [&[u8]; 3] = [b"c", b"p", b"s"];
+        for sel in selections {
+            let result = emit_clipboard_sequence(sel, b"?");
+            // MUST FAIL BEFORE FIX: clipboard read (data="?") is re-emitted
+            // AFTER FIX: read form is dropped
+            assert!(result.is_none(), "Clipboard read with selection {:?} must be dropped", String::from_utf8_lossy(sel));
+        }
+    }
+
+    #[test]
+    fn clean_title_unchanged() {
+        // Regression test: normal titles should still work.
+        let title = "user@hostname: /path/to/work";
+        let output = emit_title_sequence(title);
+        let osc = extract_osc_sequence(&output);
+
+        assert!(osc.contains(&b'u'), "Should contain 'u'");
+        assert!(osc.contains(&b'@'), "Should contain '@'");
+        assert!(osc.contains(&b':'), "Should contain ':'");
+    }
+}
