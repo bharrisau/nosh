@@ -318,6 +318,54 @@ mod tests {
         }
     }
 
+    /// Phase 27 / D-07: `TerminalControlPayload` variant order is append-only.
+    ///
+    /// postcard encodes enum variants by source-order position. Adding Hyperlink
+    /// after Title preserves Clipboard and Title encodings. This test validates:
+    /// 1. Clipboard and Title encode to the same discriminants as before.
+    /// 2. Hyperlink encodes to the next discriminant (2).
+    /// 3. Round-trip encoding/decoding works for all three variants.
+    #[test]
+    fn terminal_control_payload_order_is_append_only() {
+        use crate::messages::TerminalControlPayload;
+        use postcard::to_allocvec;
+
+        // Clipboard should be discriminant 0
+        let clipboard = TerminalControlPayload::Clipboard {
+            selection: b"c".to_vec(),
+            data: b"testdata".to_vec(),
+        };
+        let enc = to_allocvec(&clipboard).expect("encode Clipboard");
+        assert_eq!(enc[0], 0, "Clipboard must encode to discriminant 0");
+
+        // Title should be discriminant 1
+        let title = TerminalControlPayload::Title {
+            title: "test".to_string(),
+        };
+        let enc = to_allocvec(&title).expect("encode Title");
+        assert_eq!(enc[0], 1, "Title must encode to discriminant 1");
+
+        // Hyperlink should be discriminant 2 (new variant, after Title)
+        let hyperlink = TerminalControlPayload::Hyperlink {
+            uri: "https://example.com".to_string(),
+        };
+        let enc = to_allocvec(&hyperlink).expect("encode Hyperlink");
+        assert_eq!(enc[0], 2, "Hyperlink must encode to discriminant 2");
+
+        // Round-trip test: decode and verify equality
+        let decoded_clipboard: TerminalControlPayload =
+            postcard::from_bytes(&to_allocvec(&clipboard).unwrap()).unwrap();
+        assert_eq!(clipboard, decoded_clipboard, "Clipboard round-trip must preserve data");
+
+        let decoded_title: TerminalControlPayload =
+            postcard::from_bytes(&to_allocvec(&title).unwrap()).unwrap();
+        assert_eq!(title, decoded_title, "Title round-trip must preserve data");
+
+        let decoded_hyperlink: TerminalControlPayload =
+            postcard::from_bytes(&to_allocvec(&hyperlink).unwrap()).unwrap();
+        assert_eq!(hyperlink, decoded_hyperlink, "Hyperlink round-trip must preserve data");
+    }
+
     /// Phase 25 / D-04: `InnerAuthFail` must encode to exactly 1 byte (discriminant
     /// only — fieldless). Adding any field would create a key-existence or
     /// signature-validity oracle, violating the no-oracle invariant.

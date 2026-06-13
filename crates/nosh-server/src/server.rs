@@ -867,8 +867,9 @@ pub(crate) async fn run_session(
                         // OSC 52 clipboard-write detected during parse, and forward them to
                         // the client over the RELIABLE stream (not datagrams — no MTU limit).
                         // Write-only OSC 52: read/query form already dropped in osc_dispatch.
+                        // Phase 27 (D-07): drain OSC 8 hyperlinks (scheme-whitelisted at boundary).
                         // Client re-emits these to stdout, bypassing the compositor.
-                        let (drained_title, drained_clipboard) = slot.drain_terminal_control();
+                        let (drained_title, drained_clipboard, drained_hyperlink) = slot.drain_terminal_control();
                         if let Some(title) = drained_title {
                             if nosh_proto::write_message_ns(
                                 &mut *send,
@@ -887,6 +888,17 @@ pub(crate) async fn run_session(
                                     selection,
                                     data,
                                 }),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break SessionEnd::TransportLost;
+                            }
+                        }
+                        if let Some(uri) = drained_hyperlink {
+                            if nosh_proto::write_message_ns(
+                                &mut *send,
+                                &Message::TerminalControl(TerminalControlPayload::Hyperlink { uri }),
                             )
                             .await
                             .is_err()
@@ -1787,8 +1799,9 @@ pub(crate) async fn run_reattach_session(
                         // OSC 52 clipboard-write detected during parse, and forward them to
                         // the client over the RELIABLE stream (not datagrams — no MTU limit).
                         // Write-only OSC 52: read/query form already dropped in osc_dispatch.
+                        // Phase 27 (D-07): drain OSC 8 hyperlinks (scheme-whitelisted at boundary).
                         // Client re-emits these to stdout, bypassing the compositor.
-                        let (drained_title, drained_clipboard) = slot.drain_terminal_control();
+                        let (drained_title, drained_clipboard, drained_hyperlink) = slot.drain_terminal_control();
                         if let Some(title) = drained_title {
                             if nosh_proto::write_message_ns(
                                 &mut *send,
@@ -1807,6 +1820,17 @@ pub(crate) async fn run_reattach_session(
                                     selection,
                                     data,
                                 }),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break SessionEnd::TransportLost;
+                            }
+                        }
+                        if let Some(uri) = drained_hyperlink {
+                            if nosh_proto::write_message_ns(
+                                &mut *send,
+                                &Message::TerminalControl(TerminalControlPayload::Hyperlink { uri }),
                             )
                             .await
                             .is_err()

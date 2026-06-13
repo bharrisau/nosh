@@ -448,6 +448,17 @@ pub enum TerminalControlPayload {
         /// The terminal window title string. Bounded to `MAX_TITLE_BYTES` (1024).
         title: String,
     },
+    /// OSC 8 hyperlink passthrough (D-07).
+    ///
+    /// The server detected an OSC 8 hyperlink sequence and forwards the URI
+    /// to the client after validating the scheme against a whitelist
+    /// (http, https, mailto, file). The client re-emits `\x1b]8;;<uri>\x07`
+    /// directly to stdout. Schemes like `javascript:` and `data:` are stripped
+    /// at the server boundary and never reach this variant.
+    Hyperlink {
+        /// The hyperlink URI (scheme-whitelisted at the server boundary).
+        uri: String,
+    },
 }
 
 /// The logical channel type carried in a [`Message::ChannelOpen`] frame.

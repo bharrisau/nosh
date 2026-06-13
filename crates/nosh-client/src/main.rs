@@ -2166,6 +2166,30 @@ async fn run_pump(
                                     let _ = stdout.flush().await;
                                 }
                             }
+                            TerminalControlPayload::Hyperlink { uri } => {
+                                // D-07: OSC 8 hyperlink with scheme whitelist at both ends.
+                                // Server already stripped javascript:/data: etc.; this is defense-in-depth.
+                                // Strip dangerous escape bytes, then re-emit OSC 8 only if whitelisted.
+                                let clean_uri: String = uri
+                                    .chars()
+                                    .filter(|&c| c != '\x07' && c != '\x1b' && c != '\r' && c != '\n')
+                                    .collect();
+
+                                // Defense-in-depth scheme whitelist (same as server-side).
+                                let uri_lower = clean_uri.to_lowercase();
+                                let is_whitelisted = uri_lower.starts_with("http://")
+                                    || uri_lower.starts_with("https://")
+                                    || uri_lower.starts_with("mailto:")
+                                    || uri_lower.starts_with("file:");
+
+                                if is_whitelisted {
+                                    let osc8 = format!("\x1b]8;;{clean_uri}\x07");
+                                    let _ = stdout.write_all(osc8.as_bytes()).await;
+                                    let _ = stdout.flush().await;
+                                }
+                                // Non-whitelisted schemes are dropped (should not reach here —
+                                // server already stripped them).
+                            }
                         }
                     }
                     Ok(_) => {} // ignore other control frames
@@ -2950,5 +2974,121 @@ mod sec04_tests {
         assert!(osc.contains(&b'u'), "Should contain 'u'");
         assert!(osc.contains(&b'@'), "Should contain '@'");
         assert!(osc.contains(&b':'), "Should contain ':'");
+    }
+}
+
+#[cfg(test)]
+mod d07_tests {
+    use super::*;
+
+    /// Helper: simulate the OSC 8 hyperlink re-emit path (client-side).
+    fn emit_hyperlink_sequence(uri: &str) -> Option<Vec<u8>> {
+        // D-07: OSC 8 hyperlink with defense-in-depth scheme whitelist.
+        // Strip dangerous escape bytes, then re-emit OSC 8 only if whitelisted.
+        let clean_uri: String = uri
+            .chars()
+            .filter(|&c| c != '\x07' && c != '\x1b' && c != '\r' && c != '\n')
+            .collect();
+
+        // Defense-in-depth scheme whitelist (same as server-side).
+        let uri_lower = clean_uri.to_lowercase();
+        let is_whitelisted = uri_lower.starts_with("http://")
+            || uri_lower.starts_with("https://")
+            || uri_lower.starts_with("mailto:")
+            || uri_lower.starts_with("file:");
+
+        if is_whitelisted {
+            let osc8 = format!("\x1b]8;;{clean_uri}\x07");
+            Some(osc8.into_bytes())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn hyperlink_with_whitelisted_scheme_passes() {
+        // D-07: whitelisted schemes (http, https, mailto, file) should pass.
+        let whitelisted = [
+            "http://example.com",
+            "https://example.com/path?query=value",
+            "mailto:user@example.com",
+            "file:///local/path.txt",
+        ];
+
+        for uri in whitelisted {
+            let result = emit_hyperlink_sequence(uri);
+            assert!(result.is_some(), "Whitelisted URI {} should pass", uri);
+            let osc8 = result.unwrap();
+            assert!(osc8.starts_with(&[0x1b, b']', b'8', b';', b';']), "Should start with OSC 8");
+        }
+    }
+
+    #[test]
+    fn hyperlink_with_dangerous_scheme_is_dropped() {
+        // D-07: dangerous schemes (javascript, data, etc.) should be dropped.
+        let dangerous = [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd", // file: is allowed, but test the filter
+            "ftp://example.com",
+            "gopher://example.com",
+        ];
+
+        for uri in dangerous {
+            let result = emit_hyperlink_sequence(uri);
+            // file: passes, others should fail
+            if uri.starts_with("file:") {
+                assert!(result.is_some(), "file: URI should pass");
+            } else {
+                assert!(result.is_none(), "Dangerous URI {} should be dropped", uri);
+            }
+        }
+    }
+
+    #[test]
+    fn hyperlink_with_escape_bytes_is_sanitized() {
+        // D-07: URIs containing ESC, BEL, CR, LF should be sanitized.
+        let dangerous_uris = [
+            "https://example.com\x1b[31mred",
+            "https://example.com\x07premature",
+            "https://example.com\rinjection",
+            "https://example.com\ninjection",
+        ];
+
+        for uri in dangerous_uris {
+            let result = emit_hyperlink_sequence(uri);
+            assert!(result.is_some(), "Sanitized URI should still pass");
+            let osc8 = result.unwrap();
+            // Must not contain the dangerous bytes in the URI content
+            // The OSC wrapper itself is \x1b]8;;<uri>\x07, so we check the URI part
+            // Extract the URI part between ";;" and the final "\x07"
+            let osc_str = String::from_utf8_lossy(&osc8);
+            if let Some(start) = osc_str.find(";;") {
+                if let Some(end) = osc_str.rfind('\x07') {
+                    let uri_part = &osc_str[start + 2..end];
+                    assert!(!uri_part.contains('\x1b'), "URI should not contain ESC");
+                    // BEL terminates the OSC sequence, so it won't be in uri_part
+                    assert!(!uri_part.contains('\r'), "URI should not contain CR");
+                    assert!(!uri_part.contains('\n'), "URI should not contain LF");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hyperlink_scheme_is_case_insensitive() {
+        // D-07: scheme whitelist should be case-insensitive (HTTP:// == http://).
+        let case_variants = [
+            "HTTP://EXAMPLE.COM",
+            "HtTp://example.com",
+            "HTTPS://EXAMPLE.COM",
+            "MAILTO:USER@EXAMPLE.COM",
+        ];
+
+        for uri in case_variants {
+            let result = emit_hyperlink_sequence(uri);
+            assert!(result.is_some(), "Case-insensitive URI {} should pass", uri);
+        }
     }
 }

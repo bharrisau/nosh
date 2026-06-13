@@ -200,6 +200,10 @@ pub struct TerminalState {
     /// Last parsed OSC 52 clipboard-write payload (D-12-04 — detection only;
     /// forwarding is Phase 16). Replaced on each new OSC 52 sequence.
     osc52_pending: Option<(Vec<u8>, Vec<u8>)>,
+    /// Last parsed OSC 8 hyperlink payload (D-07 — scheme-whitelisted passthrough).
+    /// Replaced on each new OSC 8 sequence. Only URIs with whitelisted schemes
+    /// (http, https, mailto, file) are stored; others are stripped at the boundary.
+    osc8_hyperlink_pending: Option<String>,
     /// The vte parser (holds the Paul Williams state machine across `advance` calls).
     /// NEVER access directly — always use `advance` which implements the borrow-split.
     parser: vte::Parser,
@@ -254,6 +258,7 @@ impl TerminalState {
             echo_state: EchoState::default(),
             title: None,
             osc52_pending: None,
+            osc8_hyperlink_pending: None,
             parser: vte::Parser::default(),
             sgr: SgrState::default(),
             saved_primary: None,
@@ -779,6 +784,19 @@ impl TerminalState {
         self.osc52_pending.take()
     }
 
+    /// Drain the pending OSC 8 hyperlink payload, returning it (if any) and clearing the field
+    /// (Option::take semantics — prevents double-forwarding).
+    ///
+    /// Used by Phase 27 forwarding (D-07): after `push_output_and_parse`, the session loop
+    /// calls this to collect any pending OSC 8 hyperlink for forwarding to the client
+    /// over the reliable stream as `Message::TerminalControl(Hyperlink{..})`.
+    ///
+    /// Returns `None` if no OSC 8 hyperlink was pending, or if the pending value was
+    /// already drained by a prior call.
+    pub fn take_osc8_hyperlink(&mut self) -> Option<String> {
+        self.osc8_hyperlink_pending.take()
+    }
+
     /// Drain the pending window title, returning it (if any) and clearing the field
     /// (Option::take semantics — prevents double-forwarding).
     ///
@@ -1137,9 +1155,34 @@ impl vte::Perform for TerminalState {
                 let capped_data = &data[..data.len().min(OSC_52_MAX_BYTES)];
                 self.osc52_pending = Some((selection.to_vec(), capped_data.to_vec()));
             }
+            b"8" => {
+                // OSC 8 hyperlink passthrough (D-07 — scheme-whitelisted).
+                // OSC 8 form: `ESC ] 8 ; <params> ; <URI> BEL` or `ST`.
+                // <params> is usually empty for hyperlinks; <URI> is the target.
+                // Only whitelist-safe schemes are forwarded; others are stripped.
+                if let Some(uri_bytes) = params.get(2) {
+                    if let Ok(uri) = std::str::from_utf8(uri_bytes) {
+                        // D-07: scheme whitelist — strip dangerous schemes at the boundary.
+                        // Allowed: http://, https://, mailto:, file: (no // for file:)
+                        // Rejected: javascript:, data:, vbscript:, and all other schemes.
+                        let uri_lower = uri.to_lowercase();
+                        let is_whitelisted = uri_lower.starts_with("http://")
+                            || uri_lower.starts_with("https://")
+                            || uri_lower.starts_with("mailto:")
+                            || uri_lower.starts_with("file:");
+
+                        if is_whitelisted {
+                            self.osc8_hyperlink_pending = Some(uri.to_string());
+                        }
+                        // Non-whitelisted schemes are silently dropped (security gate).
+                    }
+                    // Invalid UTF-8 URIs are dropped (defensive-in-depth).
+                }
+                // Missing URI parameter: drop (malformed OSC 8).
+            }
             _ => {
-                // Scope fence: all other OSC codes (e.g. OSC 7 working dir, OSC 8 hyperlinks,
-                // sixel OSC) are intentionally ignored per D-12-02b.
+                // Scope fence: all other OSC codes (e.g. OSC 7 working dir, sixel OSC)
+                // are intentionally ignored per D-12-02b.
             }
         }
     }
@@ -1165,6 +1208,7 @@ impl vte::Perform for TerminalState {
                 self.echo_state = EchoState::default();
                 self.title = None;
                 self.osc52_pending = None;
+                self.osc8_hyperlink_pending = None;
                 // Clear saved_primary so a subsequent ?1049l cannot restore
                 // stale pre-reset content (Pitfall 5 / RIS invariant, D-19-01).
                 self.saved_primary = None;
