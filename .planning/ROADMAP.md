@@ -217,6 +217,6 @@ Plans:
 | 23. Transport Abstraction Seam | 2/2 | Complete    | 2026-06-13 |
 | 24. WebTransport Endpoint + Mode A | 5/5 | Complete    | 2026-06-13 |
 | 25. Inner SSH-Key Handshake + TOFU Prompt | 4/4 | Complete    | 2026-06-13 |
-| 26. Migration Handover over WebTransport | 2/2 | Complete   | 2026-06-13 |
+| 26. Migration Handover over WebTransport | 2/2 | Complete    | 2026-06-13 |
 | 27. Security Hardening Pass | 0/? | Not started | - |
 | 28. Interactive UAT Clearing | 0/? | Not started | - |
