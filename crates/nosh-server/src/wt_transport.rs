@@ -373,6 +373,33 @@ pub enum InnerAuthMode {
 /// keys and `InnerAuthMode::Required`. For Phase-24 datagram-pump tests, pass
 /// `InnerAuthMode::TestBypass` so those tests remain green without needing
 /// client-side inner-auth support.
+///
+/// # WebTransport Session-Loss Detection
+///
+/// A WebTransport session loss surfaces to the client via three detection paths,
+/// all of which return `PumpOutcome::TransportDrop` from the client pump:
+///
+/// **Path A (stream read error):** When the WT session drops, `read_message_ns`
+/// on the reliable control stream returns an error → `PumpOutcome::TransportDrop`
+/// (main.rs ~2125). This is the primary detection path.
+///
+/// **Path B (datagram read error):** `read_datagram` calls `receive_datagram()`,
+/// which returns an error when the session is closed → `PumpOutcome::TransportDrop`
+/// (main.rs ~2271).
+///
+/// **Path C (silence + connection-closed gate):** After 5 seconds of datagram
+/// silence, the pump checks `conn.is_closed()`. For WT, `WtransportTransport::is_closed()`
+/// returns `true` when `quic_connection().close_reason().is_some()` (wt_transport.rs:133).
+/// The silence arm ONLY shows the connection-loss overlay when `is_closed()` is true;
+/// it never returns `TransportDrop` from this arm (main.rs ~2305).
+///
+/// **Critical asymmetry:** Native-QUIC path migration keeps the connection alive
+/// via connection IDs — `read_datagram` continues working and NO `TransportDrop`
+/// fires. WebTransport session loss requires a fresh WT CONNECT; Paths A and B
+/// fire on actual session death, not on path changes.
+///
+/// **Integration test coverage:** `wt06_seamless_resume_over_webtransport` (Plan 26-01)
+/// forces a client-side transport drop and proves seamless resume via Reattach.
 pub async fn run_wt_accept_loop(
     endpoint: wtransport::Endpoint<Server>,
     registry: Arc<SessionRegistry>,
