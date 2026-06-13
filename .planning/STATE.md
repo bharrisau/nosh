@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
-status: planning
+status: executing
 stopped_at: Completed 23-01-PLAN.md (transport trait definitions + codec helpers)
-last_updated: "2026-06-13T08:31:59.907Z"
-last_activity: 2026-06-13 -- Phase 25 planning complete
+last_updated: "2026-06-13T08:46:33.726Z"
+last_activity: 2026-06-13 -- Phase 25 execution started
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 11
-  completed_plans: 7
+  completed_plans: 8
   percent: 33
 ---
 
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 25 — inner ssh key handshake tofu prompt
+**Current focus:** Phase 25 — inner-ssh-key-handshake-tofu-prompt
 
 ## Current Position
 
-Phase: 25
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-06-13 -- Phase 25 planning complete
+Phase: 25 (inner-ssh-key-handshake-tofu-prompt) — EXECUTING
+Plan: 2 of 4
+Status: Executing Phase 25
+Last activity: 2026-06-13 -- Phase 25 execution started
 
 ```
-Progress: [██████████] 100%
+Progress: [███████░░░] 73%
 ```
 
 ## Performance Metrics
@@ -141,7 +141,7 @@ Items acknowledged and carried forward from previous milestones:
 
 ## Session Continuity
 
-Last session: 2026-06-13T07:36:44.715Z
+Last session: 2026-06-13T08:46:33.703Z
 Stopped at: Completed 23-01-PLAN.md (transport trait definitions + codec helpers)
 Resume file: .planning/phases/23-transport-abstraction-seam/23-01-SUMMARY.md
 

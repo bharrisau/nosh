@@ -14,7 +14,7 @@ Direct WebTransport mode (Mode A — nosh binds its own listener on UDP/443) is 
 - [x] **WT-01**: A `NoshTransport` / `NoshSendStream` / `NoshRecvStream` abstraction lets the session pump (live session, cold reattach, channels, scrollback) run over either native QUIC or WebTransport with no behavioural change — all existing tests pass unchanged against the Quinn wrapper
 - [x] **WT-02**: User can start the server in direct WebTransport mode (Mode A) — it binds its own `wtransport` listener on UDP/443 and accepts WebTransport-over-HTTP/3 connections, with outer TLS configured from the existing nosh cert/key material
 - [x] **WT-03**: A client can connect to the WebTransport endpoint and reach a fully interactive shell — datagram state-sync, predictive echo, reliable control/scrollback channels all carried over the WebTransport session
-- [ ] **WT-04**: The WebTransport session performs an inner SSH-key mutual handshake (server checked against `authorized_keys`, server host key checked against `known_hosts`) before any session-open or reattach frame is processed; the handshake is bound to the outer TLS session (RFC 9266 `tls-exporter`, or a documented CSPRNG-nonce fallback) so a terminating proxy cannot relay it; inner-auth failure is opaque (no key-existence or signature-validity oracle)
+- [x] **WT-04**: The WebTransport session performs an inner SSH-key mutual handshake (server checked against `authorized_keys`, server host key checked against `known_hosts`) before any session-open or reattach frame is processed; the handshake is bound to the outer TLS session (RFC 9266 `tls-exporter`, or a documented CSPRNG-nonce fallback) so a terminating proxy cannot relay it; inner-auth failure is opaque (no key-existence or signature-validity oracle)
 - [x] **WT-05**: Transport selection is explicit (CLI flag); a server started in WebTransport-only mode rejects raw-QUIC connections (downgrade protection)
 - [ ] **WT-06**: A client survives a network change in WebTransport mode — it detects session loss, reconnects, re-runs the inner handshake, and resumes the orphaned server-side session via 1-RTT cold reattach with byte-exact replay; concurrent same-token reattach resolves atomically to exactly one active session
 
@@ -74,7 +74,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | WT-01 | Phase 23 | Complete |
 | WT-02 | Phase 24 | Complete |
 | WT-03 | Phase 24 | Complete |
-| WT-04 | Phase 25 | Pending |
+| WT-04 | Phase 25 | Complete |
 | WT-05 | Phase 24 | Complete |
 | WT-06 | Phase 26 | Pending |
 | SEC-01 | Phase 27 | Pending |
