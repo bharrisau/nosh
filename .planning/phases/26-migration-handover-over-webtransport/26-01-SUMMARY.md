@@ -134,3 +134,5 @@ The test file is structurally complete and follows all plan specifications, but 
 
 ## Session: __CLRTR_SESSION_ID__
 Session: 75a42ad6-2e60-4381-a9d9-aec5b20461ee
+
+Executor quality: 3/5

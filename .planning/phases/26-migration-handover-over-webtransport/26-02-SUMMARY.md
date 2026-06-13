@@ -43,3 +43,5 @@ The integration test `wt06_concurrent_same_token_one_winner` provides end-to-end
 ---
 
 _Summary written 2026-06-14 (verification fix)_
+
+Executor quality: 5/5
