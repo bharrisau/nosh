@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
-status: Roadmap created; ready for Phase 23
+status: executing
 stopped_at: Phases 23-28 context gathered (batched discussion)
-last_updated: "2026-06-13T04:29:37.752Z"
-last_activity: 2026-06-13 — v1.4 roadmap written (Phases 23-28)
+last_updated: "2026-06-13T04:41:00.526Z"
+last_activity: 2026-06-13 -- Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 2
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 23 — Transport Abstraction Seam
+**Current focus:** Phase 23 — transport-abstraction-seam
 
 ## Current Position
 
-Phase: 23 — Transport Abstraction Seam
-Plan: —
-Status: Roadmap created; ready for Phase 23
-Last activity: 2026-06-13 — v1.4 roadmap written (Phases 23-28)
+Phase: 23 (transport-abstraction-seam) — EXECUTING
+Plan: 2 of 2
+Status: Executing Phase 23
+Last activity: 2026-06-13 -- Phase 23 execution started
 
 ```
-Progress: [░░░░░░░░░░░░░░░░░░░░] 0% (0/6 phases)
+Progress: [█████░░░░░] 50%
 ```
 
 ## Performance Metrics
@@ -61,6 +61,10 @@ Progress: [░░░░░░░░░░░░░░░░░░░░] 0% (0/6
 
 *Updated after each plan completion*
 
+| Plan | Duration (s) | Tasks | Files |
+|------|-------------|-------|-------|
+| 23-transport-abstraction-seam P01 | 493 | 2 | 5 |
+
 ## Accumulated Context
 
 ### Decisions
@@ -80,6 +84,9 @@ Recent decisions affecting current work:
 - v1.4 roadmap: SEC-04 client hardening lands in Phase 27 (before UAT); must ship before the server is internet-exposed
 - v1.4 roadmap: WT-STRETCH-01 (Mode B Envoy proxy) is not a committed phase; it is future scope only
 - v1.4 roadmap: Datagram MTU in WebTransport mode uses `wtransport::Connection::max_datagram_payload_size()` not `conn.max_datagram_size()` — Quarter Stream ID capsule overhead is ~8-20 bytes smaller than raw QUIC MTU (Pitfall WT-2)
+- 23-01: `async-trait 0.1.89` used for object-safe async traits — native AFIT `impl Future` is not dyn-compatible; D-02 mandates `Box<dyn NoshSendStream>` so `#[async_trait]` is mandatory on all three trait definitions
+- 23-01: `send_datagram`/`datagram_send_buffer_space` stay synchronous — `send_burst` calls them in a tight non-async loop; making them async would force a design regression
+- 23-01: `write_message_ns`/`read_message_ns` added to `transport_trait.rs` (not `codec.rs`) — `Box<dyn NoshSendStream>` does not implement `AsyncWrite + Unpin`; helpers delegate to trait methods with identical wire format
 
 ### Pending Todos
 
@@ -129,10 +136,10 @@ Items acknowledged and carried forward from previous milestones:
 
 ## Session Continuity
 
-Last session: 2026-06-13T03:36:58.433Z
-Stopped at: Phases 23-28 context gathered (batched discussion)
-Resume file: .planning/phases/23-transport-abstraction-seam/23-CONTEXT.md
+Last session: 2026-06-13T04:39:28Z
+Stopped at: Completed 23-01-PLAN.md (transport trait definitions + codec helpers)
+Resume file: .planning/phases/23-transport-abstraction-seam/23-01-SUMMARY.md
 
 ## Operator Next Steps
 
-- Start Phase 23 with `/gsd:plan-phase 23`
+- Execute Phase 23 Plan 02 with `/gsd:execute-phase 23` (Quinn wrapper impls + server/client refactor)
