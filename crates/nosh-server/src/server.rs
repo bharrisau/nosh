@@ -190,7 +190,7 @@ const EPOCH_SNAPSHOT_CAP: usize = 16;
 /// 1 MiB send buffer. Its sole purpose is DoS/resource bounding (T-20-02).
 const BURST_CAP: usize = 64;
 /// QUIC application close code for a protocol violation (bad first frame).
-const CLOSE_PROTOCOL: u32 = 1;
+pub(crate) const CLOSE_PROTOCOL: u32 = 1;
 /// QUIC application close code for peer identity extraction failure (should
 /// never happen on an AuthorizedKeysVerifier-enforced connection — D-04).
 const CLOSE_AUTH: u32 = 2;
@@ -628,12 +628,12 @@ async fn recv_or_pending<T>(rx: &mut Option<tokio::sync::mpsc::Receiver<T>>) -> 
 }
 
 /// Session-open parameters (collapsed to reduce argument count past clippy's limit).
-struct SessionOpenParams {
-    term: String,
-    cols: u16,
-    rows: u16,
-    client_env: Vec<(String, String)>,
-    shell_override: Option<String>,
+pub(crate) struct SessionOpenParams {
+    pub(crate) term: String,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) client_env: Vec<(String, String)>,
+    pub(crate) shell_override: Option<String>,
 }
 
 /// Drive a single PTY session over the established bidi stream.
@@ -647,7 +647,7 @@ struct SessionOpenParams {
 /// Phase 6: after registering the slot, emits `SessionOpened { token }` so the
 /// client can reattach later. Also handles `Ack { seq }` frames during the pump
 /// loop (D-08 continuous acking).
-async fn run_session(
+pub(crate) async fn run_session(
     conn: Box<dyn NoshTransport>,
     peer: SocketAddr,
     identity: nosh_auth::NoshPublicKey,
@@ -1565,7 +1565,7 @@ async fn run_session(
 ///
 /// ALL rejection causes emit the same opaque `ReattachErr` wire frame (D-07
 /// no-oracle invariant). Token and new_token are NEVER logged.
-async fn run_reattach_session(
+pub(crate) async fn run_reattach_session(
     conn: Box<dyn NoshTransport>,
     peer: SocketAddr,
     identity: nosh_auth::NoshPublicKey,
