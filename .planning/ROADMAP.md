@@ -151,7 +151,11 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
   3. The reattach token is rotated on every successful reattach so an intercepted token cannot be replayed
   4. A simulated network change (client IP swap in a test) causes a seamless session resume with no visible shell disruption beyond a brief reconnecting notice
 
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 26-01-PLAN.md — SC#4 seamless-resume-over-WebTransport integration test + WT session-loss-detection doc
+- [ ] 26-02-PLAN.md — MH-2 concurrent same-token reattach integration test over WebTransport
 
 ### Phase 27: Security Hardening Pass
 
