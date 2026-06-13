@@ -2115,4 +2115,129 @@ mod tests {
 
         slot.sighup();
     }
+
+    // ── Phase 26: MH-2 concurrent reattach guard (deterministic) ─────────────────────
+
+    /// MH-2 deterministic proof: two concurrent reattach attempts with the SAME token
+    /// resolve atomically to exactly one winner, one loser (NotOrphaned).
+    ///
+    /// This is the GENUINE MH-2 guard test — it races two `SessionRegistry::reattach`
+    /// calls directly at the registry lock (NOT through the full server path with token
+    /// rotation). The ONLY thing that can reject the loser here is the atomic
+    /// `Orphaned → Reconnecting` state guard (registry.rs:712-713).
+    ///
+    /// Unlike `wt06_concurrent_same_token_one_winner` in webtransport.rs (where the loser
+    /// is excluded by token rotation AFTER the winner completes `run_reattach_session`),
+    /// this test does NOT rotate the token between the two calls — both calls use the
+    /// SAME un-rotated token. The registry mutex serialises the two attempts, making the
+    /// outcome deterministic:
+    /// - First `reattach` succeeds → slot becomes Reconnecting, returns Ok.
+    /// - Second `reattach` observes `state == Reconnecting` → returns Err(NotOrphaned).
+    ///
+    /// ADVERSARIAL: If the `state != Orphaned` guard were removed, BOTH calls would
+    /// return Ok (the slot would transition to Reconnecting twice) and this test would
+    /// FAIL. This makes the MH-2 atomic guard genuinely falsifiable.
+    #[test]
+    fn reattach_concurrent_same_token_one_winner() {
+        if !have_sh() {
+            eprintln!("skipping reattach_concurrent_same_token_one_winner: /bin/sh unavailable");
+            return;
+        }
+        let identity = test_key(0xC4);
+        let raw = *identity.key32();
+        let registry = SessionRegistry::new(5, Duration::ZERO);
+
+        // Create a session, register it, and orphan it.
+        let sess = open_sh_session(test_key(0xC4));
+        let slot = SessionSlot::new(sess);
+        registry.register_active(slot.clone());
+        registry.orphan(&slot);
+        assert_eq!(registry.orphan_count(&raw), 1);
+
+        // Capture the CURRENT reattach token (do NOT rotate it — we want both calls
+        // to use the SAME token so they race the state guard, not token rotation).
+        let token = slot.token();
+
+        // Race two concurrent reattach calls with the SAME token + identity.
+        // The registry mutex serialises the two attempts, so the outcome is deterministic:
+        // whichever call acquires the lock first transitions the slot to Reconnecting;
+        // the second call observes state == Reconnecting and is rejected by the guard.
+        let registry1 = &registry;
+        let registry2 = &registry;
+        let token1 = token;
+        let token2 = token;
+        let identity1 = identity.clone();
+        let identity2 = identity.clone();
+
+        let (r1, r2) = std::thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                // First concurrent reattach attempt.
+                registry1.reattach(&token1, &identity1)
+            });
+            let h2 = s.spawn(|| {
+                // Second concurrent reattach attempt (SAME token, SAME identity).
+                registry2.reattach(&token2, &identity2)
+            });
+            let r1 = h1.join().unwrap();
+            let r2 = h2.join().unwrap();
+            (r1, r2)
+        });
+
+        // ADVERSARIAL CORE: exactly ONE call must succeed, ONE must fail with
+        // NotOrphaned. The failure reason is the load-bearing assertion — if the
+        // `state != Orphaned` guard were removed, both would succeed and this would
+        // fail (or both would return Ok, violating the "exactly one winner" invariant).
+        let ok_count = match (&r1, &r2) {
+            (Ok(_), Ok(_)) => 2,
+            (Ok(_), Err(_)) => 1,
+            (Err(_), Ok(_)) => 1,
+            (Err(_), Err(_)) => 0,
+        };
+        let err_count = match (&r1, &r2) {
+            (Err(_), Err(_)) => 2,
+            (Err(_), Ok(_)) => 1,
+            (Ok(_), Err(_)) => 1,
+            (Ok(_), Ok(_)) => 0,
+        };
+
+        assert_eq!(
+            ok_count, 1,
+            "MH-2 atomic guard: expected exactly one reattach to succeed, got {}",
+            ok_count
+        );
+        assert_eq!(
+            err_count, 1,
+            "MH-2 atomic guard: expected exactly one reattach to fail, got {}",
+            err_count
+        );
+
+        // CRITICAL: the failure MUST be NotOrphaned (the specific MH-2 guard rejection),
+        // not NotFound (token mismatch) or IdentityMismatch.
+        match (&r1, &r2) {
+            (Ok(_), Err(ReattachReject::NotOrphaned)) => {}
+            (Err(ReattachReject::NotOrphaned), Ok(_)) => {}
+            (Ok(_), Err(other)) => {
+                panic!("MH-2 loser must fail with NotOrphaned, got {:?}", other);
+            }
+            (Err(other), Ok(_)) => {
+                panic!("MH-2 loser must fail with NotOrphaned, got {:?}", other);
+            }
+            (Ok(_), Ok(_)) => {
+                panic!("MH-2 VIOLATED: both reattach calls succeeded — atomic guard missing");
+            }
+            (Err(_), Err(_)) => {
+                panic!("MH-2 VIOLATED: both reattach calls failed — one should succeed");
+            }
+        }
+
+        // Verify the slot is now Reconnecting (the winner's transition).
+        assert_eq!(
+            slot.state(),
+            SlotState::Reconnecting,
+            "slot must be Reconnecting after the winning reattach"
+        );
+
+        // Cleanup.
+        slot.sighup();
+    }
 }

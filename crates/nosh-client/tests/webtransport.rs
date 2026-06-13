@@ -263,17 +263,24 @@ async fn wt03_raw_quic_downgrade_rejected() {
 
 /// SC#2 / MH-2: two clients with the same token resolve to exactly one active session.
 ///
-/// This adversarial integration test proves the double-attach guard holds over two
-/// concurrent real WebTransport connections. The test:
+/// This end-to-end integration test proves the "exactly one winner" property over two
+/// concurrent real WebTransport connections with full inner auth on each path. The test:
 /// 1. Establishes a fresh WT session and captures its token.
 /// 2. Drops the first connection to orphan the slot (so reattach is permitted).
 /// 3. Races two concurrent reattach attempts with the SAME token over SEPARATE WT
 ///    connections, each re-running inner auth before sending Reattach.
 /// 4. Asserts exactly one `ReattachOutcome::Ok` and exactly one `ReattachOutcome::Err`.
 ///
-/// The adversarial core: if the `state != Orphaned` guard in `SessionRegistry::reattach`
-/// (registry.rs:712-713) were removed, BOTH attempts could succeed → `ok_count == 1`
-/// would fail. The test does NOT assert which connection wins (the race is nondeterministic).
+/// **IMPORTANT:** This test proves the end-to-end "one winner" property, but the loser
+/// is excluded by TOKEN ROTATION (the winner completes `run_reattach_session` and rotates
+/// the token before the loser reaches the registry lookup), NOT by the atomic MH-2 state
+/// guard. The genuine proof of the `Orphaned → Reconnecting` atomic guard is the
+/// deterministic unit test `reattach_concurrent_same_token_one_winner` in
+/// `nosh-server/src/registry.rs` — that test races two `SessionRegistry::reattach` calls
+/// directly at the registry lock without token rotation, so the ONLY rejection mechanism
+/// is the `state != Orphaned` check. This integration test validates the full stack
+/// (inner auth + reattach) behaves correctly end-to-end; the registry unit test validates
+/// the atomic guard itself.
 ///
 /// Note: This test does NOT call `client::reattach_collect` (which opens a fresh pre-auth
 /// bi stream). The WT server gates Reattach behind inner auth on the FIRST accepted stream,
@@ -513,7 +520,8 @@ async fn wt06_concurrent_same_token_one_winner() {
     );
 
     // Note: we do NOT assert which connection won — the race is nondeterministic.
-    // This test exercises the same atomic `Orphaned → Reconnecting` guard that the
-    // registry unit tests cover (registry.rs:708-718), now over two concurrent real
-    // WebTransport connections with full inner auth on each path.
+    // The loser is excluded by token rotation (NotFound), not by the atomic
+    // NotOrphaned guard — see the test docstring for details. The genuine MH-2
+    // atomic guard proof is `reattach_concurrent_same_token_one_winner` in
+    // `nosh-server/src/registry.rs`.
 }
