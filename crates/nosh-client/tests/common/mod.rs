@@ -475,3 +475,15 @@ pub async fn session_marker_usable(conn: &quinn::Connection, marker: &str) -> bo
         _ => false,
     }
 }
+
+/// Build a WT client config with certificate pinning.
+///
+/// This is the test-only path — production clients use `with_native_certs`.
+/// Shared helper used by both `wt_reattach.rs` and `webtransport.rs`.
+#[cfg(feature = "webtransport")]
+pub fn client_config_with_pinning(cert_hash: &wtransport::tls::Sha256Digest) -> wtransport::ClientConfig {
+    wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes([cert_hash.clone()])
+        .build()
+}

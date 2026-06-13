@@ -18,23 +18,11 @@ use std::time::Duration;
 use nosh_client::client::{self, send_input};
 use nosh_client::inner_auth::run_inner_auth_client;
 use nosh_client::wt_transport::connect_wt;
-use nosh_proto::{Message};
-use nosh_proto::transport_trait::{read_message_ns, write_message_ns};
-use wtransport::ClientConfig;
+use nosh_proto::{Message, read_message_ns, write_message_ns};
 
 mod common;
 
 const SH: &str = "/bin/sh";
-
-/// Helper: build a WT client config with certificate pinning.
-///
-/// This is the test-only path — production clients use `with_native_certs`.
-fn client_config_with_pinning(cert_hash: &wtransport::tls::Sha256Digest) -> ClientConfig {
-    ClientConfig::builder()
-        .with_bind_default()
-        .with_server_certificate_hashes([cert_hash.clone()])
-        .build()
-}
 
 /// SC#4 / WT-06: seamless resume over WebTransport after a simulated network change.
 ///
@@ -88,7 +76,7 @@ async fn wt06_seamless_resume_over_webtransport() {
 
     // Build the WT client config trusting the server's self-signed cert by hash.
     let url = format!("https://127.0.0.1:{}/nosh", server.addr.port());
-    let config = client_config_with_pinning(&server.cert_hash);
+    let config = common::client_config_with_pinning(&server.cert_hash);
 
     // Connect to the server (first WT session).
     let transport1 = tokio::time::timeout(
@@ -179,6 +167,14 @@ async fn wt06_seamless_resume_over_webtransport() {
     // that the marker appears in replayed output), but track it honestly.
     let highest_applied = 0; // We're not tracking chunks for this test.
 
+    // ASSERT that the marker appeared in the original session output.
+    // This ensures the PTY was actually running before we dropped the connection.
+    let before_str = String::from_utf8_lossy(&output_before_drop);
+    assert!(
+        before_str.contains("MARK26A"),
+        "MARK26A marker was never printed in the original session output (PTY likely not running)"
+    );
+
     // ── Step 3: SIMULATE NETWORK CHANGE — drop the first WT transport ────────
 
     // Drop the first WT transport to sever the session. This triggers the server
@@ -190,14 +186,23 @@ async fn wt06_seamless_resume_over_webtransport() {
 
     // Wait for the server to register the slot as Orphaned.
     // The server transitions to Orphaned on TransportLost (server.rs:1500-1505).
-    // We don't have a public registry query for orphan state, so we use a bounded
-    // grace sleep (300ms) — the transition is near-instantaneous in the test env.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Poll the orphan count instead of a hardcoded sleep to avoid CI flakes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let orphans = server.registry.total_orphans();
+        if orphans > 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for slot to transition to Orphaned (still 0 orphans after 10s)");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // ── Step 4: RECONNECT — fresh WT session + inner auth + Reattach ───────────
 
     // Reconnect with a fresh WT session.
-    let config2 = client_config_with_pinning(&server.cert_hash);
+    let config2 = common::client_config_with_pinning(&server.cert_hash);
     let transport2 = tokio::time::timeout(
         Duration::from_secs(10),
         connect_wt(config2, &url),
@@ -243,9 +248,10 @@ async fn wt06_seamless_resume_over_webtransport() {
 
     // ASSERT 2: token rotation — new_token differs from the original.
     // This fails if rotation were removed (D-05 regression).
-    assert_ne!(
-        new_token, token,
-        "new_token must differ from token (D-05 rotation)"
+    // D-07: Do NOT print token bytes in assertion output.
+    assert!(
+        new_token != token,
+        "reattach token must rotate on success (D-05 rotation) (D-07: token bytes not displayed)"
     );
 
     // ASSERT 3: truncated flag is false (buffer was not truncated in this short test).

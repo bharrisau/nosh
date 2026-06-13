@@ -389,7 +389,7 @@ pub enum InnerAuthMode {
 ///
 /// **Path C (silence + connection-closed gate):** After 5 seconds of datagram
 /// silence, the pump checks `conn.is_closed()`. For WT, `WtransportTransport::is_closed()`
-/// returns `true` when `quic_connection().close_reason().is_some()` (wt_transport.rs:133).
+/// returns `true` when `quic_connection().close_reason().is_some()` (wt_transport.rs:131).
 /// The silence arm ONLY shows the connection-loss overlay when `is_closed()` is true;
 /// it never returns `TransportDrop` from this arm (main.rs ~2305).
 ///

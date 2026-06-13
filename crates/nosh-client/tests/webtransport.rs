@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use nosh_client::client;
 use nosh_proto::datagram::decode_datagram;
-use wtransport::ClientConfig;
 
 mod common;
 
@@ -311,7 +310,7 @@ async fn wt06_concurrent_same_token_one_winner() {
 
     // Step 5: dial the server and establish a fresh session to capture the token.
     let url = format!("https://127.0.0.1:{}/nosh", server.addr.port());
-    let config = client_config_with_pinning(&server.cert_hash);
+    let config = common::client_config_with_pinning(&server.cert_hash);
     let transport = tokio::time::timeout(
         Duration::from_secs(10),
         connect_wt(config, &url),
@@ -369,9 +368,19 @@ async fn wt06_concurrent_same_token_one_winner() {
     drop(recv);
     drop(transport);
 
-    // Wait for the slot to transition to Orphaned (bounded ~300ms).
-    // Comment references server.rs:1500 orphan poll for context.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the slot to transition to Orphaned by polling the orphan count.
+    // Avoids race-prone hardcoded sleep that can fail in slow CI environments.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let orphans = server.registry.total_orphans();
+        if orphans > 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for slot to transition to Orphaned (still 0 orphans after 10s)");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Step 7: RACE two concurrent reattach attempts with the SAME token.
     // Each connection is fresh and re-runs inner auth before sending Reattach.
@@ -388,7 +397,7 @@ async fn wt06_concurrent_same_token_one_winner() {
     let (outcome1, outcome2) = tokio::join!(
         async move {
             // Connection 1: connect, inner auth, reattach.
-            let config = client_config_with_pinning(&cert_hash_1);
+            let config = common::client_config_with_pinning(&cert_hash_1);
             let transport = tokio::time::timeout(
                 Duration::from_secs(10),
                 connect_wt(config, &url_1),
@@ -432,7 +441,7 @@ async fn wt06_concurrent_same_token_one_winner() {
         },
         async move {
             // Connection 2: connect, inner auth, reattach (SAME token, SAME identity).
-            let config = client_config_with_pinning(&cert_hash_2);
+            let config = common::client_config_with_pinning(&cert_hash_2);
             let transport = tokio::time::timeout(
                 Duration::from_secs(10),
                 connect_wt(config, &url_2),
@@ -507,16 +516,4 @@ async fn wt06_concurrent_same_token_one_winner() {
     // This test exercises the same atomic `Orphaned → Reconnecting` guard that the
     // registry unit tests cover (registry.rs:708-718), now over two concurrent real
     // WebTransport connections with full inner auth on each path.
-}
-
-// ── Helper: build a WT client config with certificate pinning ───────────────────
-
-/// Build a WT client config that trusts the server's self-signed cert by hash.
-///
-/// This is the test-only path — production clients use `with_native_certs`.
-fn client_config_with_pinning(cert_hash: &wtransport::tls::Sha256Digest) -> ClientConfig {
-    ClientConfig::builder()
-        .with_bind_default()
-        .with_server_certificate_hashes([cert_hash.clone()])
-        .build()
 }
