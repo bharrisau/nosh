@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use nosh_auth::{InProcessEd25519Signer, NoshPublicKey, RawEd25519Signer};
+use nosh_auth::{InProcessEd25519Signer, NoshPublicKey, RawEd25519Signer, TofuPolicy};
 use nosh_client::client::{self, ClientIdentity};
 use nosh_client::quinn_transport::QuinnTransport;
 use nosh_server::registry::SessionRegistry;
@@ -145,11 +145,15 @@ pub async fn spawn_server_with_registry(
 }
 
 /// Build a client endpoint pinning the server against `known_hosts`.
+///
+/// Uses `TofuPolicy::Silent` to avoid blocking on stdin during tests (tests are
+/// not exercising the interactive prompt; the no-TTY fail-closed and real-auth
+/// adversarial paths are covered in Phase 25-04).
 pub fn client_endpoint(
     identity: ClientIdentity,
     known_hosts: PathBuf,
 ) -> anyhow::Result<quinn::Endpoint> {
-    client::make_endpoint(&identity, known_hosts, HOST)
+    client::make_endpoint_with_policy(&identity, known_hosts, HOST, TofuPolicy::Silent)
 }
 
 /// Build a client endpoint that writes a qlog trace to `qlog_path` (D-05).
@@ -160,6 +164,10 @@ pub fn client_endpoint(
 /// the endpoint is built WITHOUT qlog and a warning is printed — qlog setup
 /// failure must not fail the connection; Plan 02's qlog artifact assertion will
 /// surface the missing file.
+///
+/// Uses `TofuPolicy::Silent` to avoid blocking on stdin during tests (tests are
+/// not exercising the interactive prompt; the no-TTY fail-closed and real-auth
+/// adversarial paths are covered in Phase 25-04).
 pub fn client_endpoint_with_qlog(
     identity: ClientIdentity,
     known_hosts: PathBuf,
@@ -196,7 +204,13 @@ pub fn client_endpoint_with_qlog(
         }
     }
 
-    client::make_endpoint_with_transport(&identity, known_hosts, HOST, transport)
+    client::make_endpoint_with_transport_and_policy(
+        &identity,
+        known_hosts,
+        HOST,
+        transport,
+        TofuPolicy::Silent,
+    )
 }
 
 /// Bind a fresh `127.0.0.1:0` UDP socket. Used by `rebind_client` to allocate

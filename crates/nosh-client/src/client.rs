@@ -11,6 +11,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use nosh_auth::{
     AgentSigningKey, FileSigner, HostKeyVerifier, NoshClientCertResolver, RawEd25519Signer,
+    TofuPolicy,
 };
 #[cfg(unix)]
 use nosh_auth::AgentSigner;
@@ -98,10 +99,26 @@ fn ssh_agent_connect(path: &Path) -> anyhow::Result<ssh_agent_client_rs::Client>
 /// Build a quinn `ClientConfig` with SSH-key mutual auth: pin the server host
 /// key against `known_hosts` (TOFU, AUTH-02) and present the agent-signed
 /// client identity cert (AUTH-04). ALPN `nosh/0`; keep-alive enabled (TRANS-05).
+///
+/// Uses `TofuPolicy::Interactive` by default (SEC-02 production requirement).
+/// For test use, see `build_client_config_with_policy`.
 pub fn build_client_config(
     identity: &ClientIdentity,
     known_hosts: PathBuf,
     host: impl Into<String>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    build_client_config_with_policy(identity, known_hosts, host, TofuPolicy::Interactive)
+}
+
+/// Build a quinn `ClientConfig` with an explicit [`TofuPolicy`].
+///
+/// Use `TofuPolicy::Silent` in integration tests (no stdin blocking).
+/// Use `TofuPolicy::Interactive` in production (SEC-02).
+pub fn build_client_config_with_policy(
+    identity: &ClientIdentity,
+    known_hosts: PathBuf,
+    host: impl Into<String>,
+    policy: TofuPolicy,
 ) -> anyhow::Result<quinn::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = rustls::crypto::CryptoProvider::get_default()
@@ -115,7 +132,7 @@ pub fn build_client_config(
     let signing_key = Arc::new(AgentSigningKey::new(identity.signer.clone()));
     let resolver = Arc::new(NoshClientCertResolver::new(cert, signing_key));
 
-    let verifier = Arc::new(HostKeyVerifier::new(known_hosts, host, provider));
+    let verifier = Arc::new(HostKeyVerifier::with_policy(known_hosts, host, provider, policy));
 
     let mut rustls_cfg = rustls::ClientConfig::builder()
         .dangerous()
@@ -134,14 +151,35 @@ pub fn build_client_config(
 
 /// Build a client `Endpoint` (ephemeral local UDP port) with a nosh client
 /// config (mutual auth) as its default.
+///
+/// Uses `TofuPolicy::Interactive` by default (SEC-02 production requirement).
+/// For test use, see `make_endpoint_with_policy`.
 pub fn make_endpoint(
     identity: &ClientIdentity,
     known_hosts: PathBuf,
     host: impl Into<String>,
 ) -> anyhow::Result<quinn::Endpoint> {
+    make_endpoint_with_policy(identity, known_hosts, host, TofuPolicy::Interactive)
+}
+
+/// Build a client `Endpoint` with an explicit [`TofuPolicy`].
+///
+/// Use `TofuPolicy::Silent` in integration tests (no stdin blocking).
+/// Use `TofuPolicy::Interactive` in production (SEC-02).
+pub fn make_endpoint_with_policy(
+    identity: &ClientIdentity,
+    known_hosts: PathBuf,
+    host: impl Into<String>,
+    policy: TofuPolicy,
+) -> anyhow::Result<quinn::Endpoint> {
     let mut endpoint =
         quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).context("create client endpoint")?;
-    endpoint.set_default_client_config(build_client_config(identity, known_hosts, host)?);
+    endpoint.set_default_client_config(build_client_config_with_policy(
+        identity,
+        known_hosts,
+        host,
+        policy,
+    )?);
     Ok(endpoint)
 }
 
@@ -149,6 +187,9 @@ pub fn make_endpoint(
 /// test harness to inject a qlog stream (D-05) without altering the production
 /// path. The transport config replaces the one that `build_client_config` would
 /// normally produce; all other aspects (mutual auth, ALPN) are unchanged.
+///
+/// Uses `TofuPolicy::Interactive` by default (SEC-02 production requirement).
+/// For test use, see `make_endpoint_with_transport_and_policy`.
 ///
 /// Use `nosh_proto::transport_config(true)` as the base and layer additional
 /// options (e.g. `.qlog_stream(Some(stream))`) before passing in.
@@ -158,6 +199,27 @@ pub fn make_endpoint_with_transport(
     host: impl Into<String>,
     transport: quinn::TransportConfig,
 ) -> anyhow::Result<quinn::Endpoint> {
+    make_endpoint_with_transport_and_policy(
+        identity,
+        known_hosts,
+        host,
+        transport,
+        TofuPolicy::Interactive,
+    )
+}
+
+/// Build a client `Endpoint` with a CALLER-SUPPLIED transport config and an
+/// explicit [`TofuPolicy`].
+///
+/// Use `TofuPolicy::Silent` in integration tests (no stdin blocking).
+/// Use `TofuPolicy::Interactive` in production (SEC-02).
+pub fn make_endpoint_with_transport_and_policy(
+    identity: &ClientIdentity,
+    known_hosts: PathBuf,
+    host: impl Into<String>,
+    transport: quinn::TransportConfig,
+    policy: TofuPolicy,
+) -> anyhow::Result<quinn::Endpoint> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = rustls::crypto::CryptoProvider::get_default()
         .context("no default CryptoProvider installed")?
@@ -166,7 +228,7 @@ pub fn make_endpoint_with_transport(
     let cert = nosh_auth::mint_self_signed_cert(&identity.signer)?;
     let signing_key = Arc::new(AgentSigningKey::new(identity.signer.clone()));
     let resolver = Arc::new(NoshClientCertResolver::new(cert, signing_key));
-    let verifier = Arc::new(HostKeyVerifier::new(known_hosts, host, provider));
+    let verifier = Arc::new(HostKeyVerifier::with_policy(known_hosts, host, provider, policy));
 
     let mut rustls_cfg = rustls::ClientConfig::builder()
         .dangerous()
