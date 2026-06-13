@@ -122,6 +122,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -904,6 +915,7 @@ dependencies = [
  "sha2",
  "ssh-agent-client-rs",
  "ssh-key",
+ "tokio",
  "tracing",
  "x509-parser",
  "zeroize",
@@ -929,6 +941,8 @@ dependencies = [
 name = "nosh-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "bytes",
  "postcard",
  "quinn",
@@ -942,9 +956,12 @@ name = "nosh-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "clap",
  "dirs",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
  "nix 0.29.0",
  "nosh-auth",
  "nosh-proto",
@@ -952,6 +969,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "sha2",
  "ssh-key",
  "tokio",
  "tracing",

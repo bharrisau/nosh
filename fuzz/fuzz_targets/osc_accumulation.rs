@@ -2,6 +2,16 @@
 use libfuzzer_sys::fuzz_target;
 use nosh_server::terminal::{TerminalState, OSC_52_MAX_BYTES, MAX_TITLE_BYTES, OSC_ACCUMULATION_MAX};
 
+// CORRECT INVOCATION (SEC-05 / 27-01):
+// cargo +nightly fuzz run osc_accumulation -- -max_len=2097152 -max_total_time=120
+//
+// NOTE: The LIBFUZZER_MAX_LEN environment variable is SILENTLY IGNORED by cargo-fuzz.
+// You must pass -max_len=2097152 AFTER the -- separator (directly to libFuzzer).
+//
+// This bound exercises OSC_ACCUMULATION_MAX (1 MiB) from 999.7-SECURITY.md:
+// the deterministic in-harness 10 MiB multi-chunk test verifies the prefilter
+// truncates at 1 MiB and resyncs, while libFuzzer mutation explores adjacent paths.
+
 fuzz_target!(|data: &[u8]| {
     // ── Original single-chunk test (unchanged) ────────────────────────────────
     //
