@@ -1209,6 +1209,7 @@ dependencies = [
  "ssh-agent-client-rs",
  "ssh-key",
  "tempfile",
+ "tokio",
  "tracing",
  "x509-parser",
  "zeroize",

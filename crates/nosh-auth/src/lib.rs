@@ -45,4 +45,4 @@ pub use signer::{
     mint_self_signed_cert, AgentSigningKey, FileSigner, InProcessEd25519Signer,
     NoshClientCertResolver, NoshServerCertResolver, RawEd25519Signer,
 };
-pub use verifier::{AuthorizedKeysVerifier, HostKeyVerifier};
+pub use verifier::{AuthorizedKeysVerifier, HostKeyVerifier, TofuPolicy};
