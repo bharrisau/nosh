@@ -21,7 +21,7 @@ Direct WebTransport mode (Mode A — nosh binds its own listener on UDP/443) is 
 ### Security Hardening (SEC)
 
 - [ ] **SEC-01**: A threat-model document (`docs/SECURITY.md`) covers the internet-exposed topology — assets, trust boundaries, attacker capabilities, the proxy trust model, the Mode A vs Mode B distinction, the mandatory-inner-auth rationale, and residual risks
-- [ ] **SEC-02**: On first contact with an unknown server host key, the client shows an interactive, blocking TOFU fingerprint-confirm prompt (SHA-256 hex fingerprint, explicit `yes` required, no PTY output until resolved), replacing the current silent-record behaviour
+- [ ] **SEC-02**: On first contact with an unknown server host key, the client shows an interactive, blocking TOFU fingerprint-confirm dialogue (SHA-256 hex fingerprint, explicit `yes` required, no PTY output until resolved), replacing the current silent-record behaviour
 - [ ] **SEC-04**: The client is hardened against a malicious or compromised server — per-OSC byte-count gate before the VT parser, OSC 52 clipboard-read rejection, DCS/PM/APC no-op, title escape-byte stripping, clipboard selection-field validation, server-issued resize rate-limit, `PtyData` receive cap, and channel-ID range validation
 - [ ] **SEC-05**: The post-auth OSC-accumulation OOM bound (999.7) is adversarially re-verified and regression-gated — the named bound test re-run, the fuzz target re-run at raised `max_len`, and the prefilter confirmed to bound all OSC categories nosh handles (not just OSC 0/2/52); a CI gate prevents regression from M7 changes to the terminal advance path
 
@@ -30,7 +30,7 @@ Direct WebTransport mode (Mode A — nosh binds its own listener on UDP/443) is 
 The milestone is finished with a guided, conversational UAT pass — one item at a time, confirm each before moving on (not a single dumped document).
 
 - [ ] **UAT-01**: A guided interactive walkthrough clears the carried-forward backlog — Phase 19 Windows alt-screen visual re-test (vim/htop/Claude Code, 4 scenarios), 999.3 client rendering-correctness pack, 999.4 `read -s` / predictive-echo fix on the Windows client, and confirmation of green `build-windows` + `cargo audit` CI runs
-- [ ] **UAT-02**: A guided interactive walkthrough validates the new M7 remote-access path end-to-end — Mode A connect over WebTransport, blocking TOFU prompt, interactive shell, scrollback, predictive echo, and a simulated network change triggering reattach
+- [ ] **UAT-02**: A guided interactive walkthrough validates the new M7 remote-access path end-to-end — Mode A connect over WebTransport, blocking TOFU fingerprint dialogue, interactive shell, scrollback, predictive echo, and a simulated network change triggering reattach
 
 ## Future Requirements
 
@@ -60,7 +60,7 @@ Explicitly excluded. Documented to prevent scope creep.
 |---------|--------|
 | L4 UDP passthrough through the proxy | QUIC routes by connection ID, not 5-tuple; breaks migration and the routing model — WebTransport-with-inner-auth is the correct answer |
 | TCP / TLS fallback transport | Cannot carry RFC 9221 datagrams; defeats the predictive-echo latency model |
-| Auto-accept TOFU (silent host-key record) | A MITM on first contact goes unnoticed; must be replaced by the interactive prompt (SEC-02) |
+| Auto-accept TOFU (silent host-key record) | A MITM on first contact goes unnoticed; must be replaced by the interactive fingerprint dialogue (SEC-02) |
 | mTLS at the WebTransport outer layer in proxy mode | The proxy terminates TLS; inner SSH-key auth is the correct end-to-end mechanism |
 | Browser / web client | HTTP/3 framing leaves the door open later, but not this milestone |
 | nginx / HAProxy proxy-fronted mode | Neither proxies WebTransport to a backend today; no upstream delivery timeline |
@@ -71,24 +71,24 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| WT-01 | TBD | Pending |
-| WT-02 | TBD | Pending |
-| WT-03 | TBD | Pending |
-| WT-04 | TBD | Pending |
-| WT-05 | TBD | Pending |
-| WT-06 | TBD | Pending |
-| SEC-01 | TBD | Pending |
-| SEC-02 | TBD | Pending |
-| SEC-04 | TBD | Pending |
-| SEC-05 | TBD | Pending |
-| UAT-01 | TBD | Pending |
-| UAT-02 | TBD | Pending |
+| WT-01 | Phase 23 | Pending |
+| WT-02 | Phase 24 | Pending |
+| WT-03 | Phase 24 | Pending |
+| WT-04 | Phase 25 | Pending |
+| WT-05 | Phase 24 | Pending |
+| WT-06 | Phase 26 | Pending |
+| SEC-01 | Phase 27 | Pending |
+| SEC-02 | Phase 25 | Pending |
+| SEC-04 | Phase 27 | Pending |
+| SEC-05 | Phase 27 | Pending |
+| UAT-01 | Phase 28 | Pending |
+| UAT-02 | Phase 28 | Pending |
 
 **Coverage:**
 - v1.4 requirements: 12 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 12 ⚠️
+- Mapped to phases: 12
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-06-13*
-*Last updated: 2026-06-13 after initial v1.4 definition*
+*Last updated: 2026-06-13 after roadmap creation (Phases 23-28)*
