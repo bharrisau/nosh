@@ -238,7 +238,7 @@ pub fn check_authorized_key(key: &NoshPublicKey, authorized: &[NoshPublicKey]) -
 /// only handles the UI contract.
 ///
 /// ## Behaviour (DO NOT weaken — WR-02 security baseline)
-/// - Prints fingerprint to stderr (diagnostic visibility even on failure).
+/// - Prints fingerprint to stderr **only in interactive mode** (IN-04: avoids spam in automation loops).
 /// - Checks `stdin.is_terminal()` — **fails closed** on non-interactive contexts.
 /// - Accepts **only** the literal string `"yes"` (after trimming whitespace).
 /// - NO silent acceptance, NO fallback to `y`/`Y`/`ok`/`true`.
@@ -250,15 +250,10 @@ pub fn check_authorized_key(key: &NoshPublicKey, authorized: &[NoshPublicKey]) -
 pub fn prompt_host_key_accept(host: &str, fingerprint: &str) -> anyhow::Result<bool> {
     use std::io::{BufRead, IsTerminal, Write};
 
-    let stderr = std::io::stderr();
-    let mut out = stderr.lock();
-
-    // Always print the key fingerprint before the yes/no decision (D-08).
-    writeln!(out, "The authenticity of host '{host}' can't be established.")?;
-    writeln!(out, "ED25519 key fingerprint is {fingerprint}.")?;
-
-    // D-10: non-interactive context fails closed.
+    // D-10: non-interactive context fails closed (IN-04: check TTY before printing).
     if !std::io::stdin().is_terminal() {
+        let stderr = std::io::stderr();
+        let mut out = stderr.lock();
         writeln!(out, "Host key verification failed: stdin is not a TTY.")?;
         writeln!(
             out,
@@ -267,7 +262,12 @@ pub fn prompt_host_key_accept(host: &str, fingerprint: &str) -> anyhow::Result<b
         return Ok(false);
     }
 
-    // Interactive path: prompt and read one line.
+    // Interactive path: print fingerprint, prompt, and read one line.
+    let stderr = std::io::stderr();
+    let mut out = stderr.lock();
+
+    writeln!(out, "The authenticity of host '{host}' can't be established.")?;
+    writeln!(out, "ED25519 key fingerprint is {fingerprint}.")?;
     write!(out, "Are you sure you want to continue connecting (yes/no)? ")?;
     out.flush()?;
     drop(out); // release stderr lock before locking stdin
