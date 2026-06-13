@@ -1288,6 +1288,21 @@ pub(crate) async fn run_session(
                         );
                     }
 
+                    // Phase 25: inner-auth frames are only valid during the
+                    // WebTransport pre-session inner-auth handshake (handled in
+                    // wt_transport::inner_auth). Receiving them in a live session
+                    // is a protocol error — log and close (not ignore, so the
+                    // client knows the session is broken).
+                    Ok(Message::InnerAuthChallenge { .. })
+                    | Ok(Message::InnerAuthResponse { .. })
+                    | Ok(Message::InnerAuthComplete { .. })
+                    | Ok(Message::InnerAuthFail) => {
+                        tracing::warn!(
+                            "inner-auth frame received inside live session (protocol error); closing"
+                        );
+                        break SessionEnd::ClientClosed;
+                    }
+
                     Err(_) => {
                         // Stream/connection closed without a SessionClose → transport loss.
                         // D-02: this is NOT a clean close; orphan the session (Pitfall #7).

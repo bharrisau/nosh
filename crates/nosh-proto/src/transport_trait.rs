@@ -128,6 +128,36 @@ pub trait NoshTransport: Send + Sync + 'static {
         false
     }
 
+    /// Export keying material from the underlying TLS 1.3 session (RFC 9266 /
+    /// RFC 5705 channel binding, D-01).
+    ///
+    /// Used by the inner SSH-key handshake (Phase 25) to bind the inner-auth
+    /// transcript to the outer TLS session so that a trusted proxy cannot
+    /// replay inner-auth messages from a different connection. Both the server
+    /// and the client call this with the same `label` and `context` and derive
+    /// identical 32-byte output because RFC 9266 EKM is session-symmetric.
+    ///
+    /// Only the WebTransport transport implements this by delegating to
+    /// `quic_connection().export_keying_material(output, label, context)`.
+    /// The native Quinn wrapper can also implement it. Test doubles and any
+    /// transport that does not expose RFC 9266 inherit this default `Err` impl
+    /// and must fall back to CSPRNG-nonce channel binding instead.
+    ///
+    /// `output` is populated in-place on success (exactly `output.len()` bytes
+    /// of keying material). `label` and `context` follow RFC 5705: use
+    /// `crate::INNER_AUTH_EKM_LABEL` and `crate::INNER_AUTH_EKM_CONTEXT`
+    /// as the single source of truth so both endpoints derive identical material
+    /// (guards against Pitfall 1 — label divergence between client and server).
+    fn export_keying_material(
+        &self,
+        output: &mut [u8; 32],
+        label: &[u8],
+        context: &[u8],
+    ) -> anyhow::Result<()> {
+        let _ = (output, label, context);
+        anyhow::bail!("export_keying_material not supported by this transport")
+    }
+
     /// Close the connection with an application error code and reason bytes.
     ///
     /// The `code` is a `u32`; Quinn wrappers convert to `quinn::VarInt` via
