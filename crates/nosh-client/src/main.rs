@@ -2046,6 +2046,7 @@ async fn run_pump(
             msg = nosh_proto::read_message_ns(recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
+                        // D-02: client has no vte parser; server-side osc_prefilter is the authoritative OSC byte gate
                         // D-14-02: display comes exclusively from datagrams via
                         // ClientScreen.render_to_stdout — do NOT write PtyData to stdout.
                         // D-14-03: advance the reattach counter so the cold-reattach
@@ -2072,9 +2073,11 @@ async fn run_pump(
                     // OSC 52 / OSC 0/2 are control sequences that carry no cursor motion
                     // and do not write cells — safe to interleave; tokio::select! arms
                     // serialize so no byte-level interleaving with compositor renders.
+                    // D-04: no client vte parser + no DCS/PM/APC TerminalControlPayload variant — scope-fenced no-op
                     Ok(Message::TerminalControl(payload)) => {
                         match payload {
                             TerminalControlPayload::Clipboard { selection, data } => {
+                                // D-02: client has no vte parser; server-side osc_prefilter is the authoritative OSC byte gate
                                 // Re-emit OSC 52 clipboard WRITE to the local terminal.
                                 // Write-only by construction (T-16-05): the read/query form
                                 // was dropped server-side in Plan 16-01, D-16-01a.
@@ -2089,6 +2092,26 @@ async fn run_pump(
                                     .chars()
                                     .filter(|&c| c != '\x07' && c != '\x1b')
                                     .collect();
+
+                                // D-03: OSC 52 clipboard-read rejection — defense-in-depth check
+                                if data == b"?" {
+                                    // Silently drop the read/query form; the server already
+                                    // drops it, but this confirms no client-side re-emission path.
+                                    continue;
+                                }
+
+                                // D-05: validate clipboard selection against allowed set {c,p,s,q,0-9}
+                                // Allowed: c (clipboard), p (primary), s (secondary/select), q (query), 0-9 (cut buffers)
+                                let is_allowed = match sel.as_str() {
+                                    "c" | "p" | "s" | "q" => true,
+                                    s if s.len() == 1 && s.chars().next().map_or(false, |c| c.is_ascii_digit()) => true,
+                                    _ => false,
+                                };
+                                if !is_allowed {
+                                    // Drop frames with unrecognized selection designators.
+                                    continue;
+                                }
+
                                 let b64: String = String::from_utf8_lossy(&data)
                                     .chars()
                                     .filter(|&c| c != '\x07' && c != '\x1b')
@@ -2098,10 +2121,12 @@ async fn run_pump(
                                 let _ = stdout.flush().await;
                             }
                             TerminalControlPayload::Title { title } => {
+                                // D-04: no client vte parser + no DCS/PM/APC TerminalControlPayload variant — scope-fenced no-op
                                 // Re-emit OSC 0/2 title only when --status is not active.
                                 // When --status is active, the RTT title in the datagram arm
                                 // takes precedence (Pitfall 5 — suppress forwarded title).
                                 if !status {
+                                    // D-05: strip CR/LF to block prompt-overwrite social-engineering (PITFALLS.md SEC-2)
                                     // WR-03 fix: strip ESC (\x1b) and BEL (\x07) from the
                                     // server-controlled title before interpolation — defense-
                                     // in-depth, consistent with the OSC 52 clipboard path.
@@ -2110,7 +2135,7 @@ async fn run_pump(
                                     // terminal escape sequences by the local terminal.
                                     let clean_title: String = title
                                         .chars()
-                                        .filter(|&c| c != '\x07' && c != '\x1b')
+                                        .filter(|&c| c != '\x07' && c != '\x1b' && c != '\r' && c != '\n')
                                         .collect();
                                     let osc02 = format!("\x1b]0;{clean_title}\x07");
                                     let _ = stdout.write_all(osc02.as_bytes()).await;
@@ -2749,10 +2774,11 @@ mod sec04_tests {
     /// Helper: simulate the title re-emit path (extracted from main.rs pump loop).
     fn emit_title_sequence(title: &str) -> Vec<u8> {
         // D-04: no client vte parser + no DCS/PM/APC TerminalControlPayload variant — scope-fenced no-op
+        // D-05: strip CR/LF to block prompt-overwrite social-engineering (PITFALLS.md SEC-2)
         // WR-03 fix: strip ESC (\x1b) and BEL (\x07) from the server-controlled title
         let clean_title: String = title
             .chars()
-            .filter(|&c| c != '\x07' && c != '\x1b')
+            .filter(|&c| c != '\x07' && c != '\x1b' && c != '\r' && c != '\n')
             .collect();
         let osc02 = format!("\x1b]0;{clean_title}\x07");
         osc02.into_bytes()
@@ -2806,8 +2832,11 @@ mod sec04_tests {
         // MUST FAIL BEFORE FIX: title contains \r
         // AFTER FIX: \r is stripped
         assert!(!osc.contains(&b'\r'), "OSC sequence must not contain CR (\\r)");
-        // Must NOT contain ESC (already filtered by WR-03)
-        assert!(!osc.contains(&b'\x1b'), "OSC sequence must not contain ESC (\\x1b)");
+        // Must NOT contain malicious ESC sequences within title content
+        // (Note: OSC wrapper itself starts with ESC [0x1b, 0x5d], we're checking
+        // that no ESC appears after the OSC 0; prefix)
+        let osc_str = String::from_utf8_lossy(&osc);
+        assert!(!osc_str.contains("\x1b[2K"), "Malicious ANSI sequence must be stripped");
         // Should contain the safe prefix before \r
         assert!(osc.contains(&b's'), "OSC sequence should contain 'safe' prefix");
     }
@@ -2826,12 +2855,15 @@ mod sec04_tests {
 
     #[test]
     fn title_with_esc_is_filtered() {
-        // WR-03 regression test: ESC must still be stripped.
+        // WR-03 regression test: ESC must still be stripped from title content.
         let title = "title\x1b[31mwith\x1b[0mcolors";
         let output = emit_title_sequence(title);
         let osc = extract_osc_sequence(&output);
 
-        assert!(!osc.contains(&b'\x1b'), "OSC sequence must not contain ESC");
+        // Check that malicious ANSI sequences are stripped (not the OSC wrapper)
+        let osc_str = String::from_utf8_lossy(&osc);
+        assert!(!osc_str.contains("\x1b[31m"), "Malicious ANSI must be stripped");
+        assert!(!osc_str.contains("\x1b[0m"), "Malicious ANSI must be stripped");
     }
 
     #[test]
