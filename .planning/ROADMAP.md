@@ -103,8 +103,8 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 **Plans**: 5 plans
 - [x] 24-01-PLAN.md — Cargo wiring: wtransport 0.7.1 (ring-only) + time pin + webtransport feature on both crates (SC#4)
 - [x] 24-02-PLAN.md — Client session pump made generic over NoshTransport (Phase 23 left the client concrete; prerequisite for WT-03)
-- [ ] 24-03-PLAN.md — Server WT wrapper + accept loop + outer TLS + --mode flag + downgrade protection + test-support auth stub (WT-02, WT-05)
-- [ ] 24-04-PLAN.md — Client WT wrapper + connect_wt + --webtransport flag feeding the generic pump (WT-03, WT-05)
+- [x] 24-03-PLAN.md — Server WT wrapper + accept loop + outer TLS + --mode flag + downgrade protection + test-support auth stub (WT-02, WT-05)
+- [x] 24-04-PLAN.md — Client WT wrapper + connect_wt + --webtransport flag feeding the generic pump (WT-03, WT-05)
 - [ ] 24-05-PLAN.md — End-to-end integration test: live shell + datagram sync over WebTransport + raw-QUIC downgrade rejection (win condition)
 **UI hint**: yes
 
@@ -184,7 +184,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 | 21. Channel Multiplexing Foundation | 4/4 | Shipped | 2026-06-11 |
 | 22. Scrollback Sync | 5/5 | Shipped | 2026-06-12 |
 | 23. Transport Abstraction Seam | 2/2 | Complete    | 2026-06-13 |
-| 24. WebTransport Endpoint + Mode A | 2/5 | In Progress|  |
+| 24. WebTransport Endpoint + Mode A | 4/5 | In Progress|  |
 | 25. Inner SSH-Key Handshake + TOFU Prompt | 0/? | Not started | - |
 | 26. Migration Handover over WebTransport | 0/? | Not started | - |
 | 27. Security Hardening Pass | 0/? | Not started | - |
