@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use nosh_client::client;
 use nosh_proto::datagram::decode_datagram;
+use wtransport::ClientConfig;
 
 mod common;
 
@@ -257,4 +258,265 @@ async fn wt03_raw_quic_downgrade_rejected() {
     }
 
     endpoint.close(0u32.into(), b"done");
+}
+
+// ── SC#2 / MH-2: concurrent same-token reattach over WebTransport ─────────────────
+
+/// SC#2 / MH-2: two clients with the same token resolve to exactly one active session.
+///
+/// This adversarial integration test proves the double-attach guard holds over two
+/// concurrent real WebTransport connections. The test:
+/// 1. Establishes a fresh WT session and captures its token.
+/// 2. Drops the first connection to orphan the slot (so reattach is permitted).
+/// 3. Races two concurrent reattach attempts with the SAME token over SEPARATE WT
+///    connections, each re-running inner auth before sending Reattach.
+/// 4. Asserts exactly one `ReattachOutcome::Ok` and exactly one `ReattachOutcome::Err`.
+///
+/// The adversarial core: if the `state != Orphaned` guard in `SessionRegistry::reattach`
+/// (registry.rs:712-713) were removed, BOTH attempts could succeed → `ok_count == 1`
+/// would fail. The test does NOT assert which connection wins (the race is nondeterministic).
+///
+/// Note: This test does NOT call `client::reattach_collect` (which opens a fresh pre-auth
+/// bi stream). The WT server gates Reattach behind inner auth on the FIRST accepted stream,
+/// so each client must `run_inner_auth_client` first, then `send_reattach` on the returned
+/// authenticated stream.
+#[tokio::test]
+async fn wt06_concurrent_same_token_one_winner() {
+    if !have_sh() {
+        eprintln!("skipping wt06_concurrent_same_token_one_winner: /bin/sh unavailable");
+        return;
+    }
+
+    use nosh_client::wt_transport::connect_wt;
+    use nosh_client::inner_auth::run_inner_auth_client;
+    use nosh_client::client::{self, ReattachOutcome};
+    use nosh_proto::{Message, read_message_ns, write_message_ns};
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Step 1: generate host key (server) and client key.
+    let (host_signer, host_key) = common::generate_ed25519_keypair();
+    let (client_signer, client_key) = common::generate_ed25519_keypair();
+
+    // Step 2: server authorized_keys contains the client key.
+    let authorized = vec![client_key.clone()];
+
+    // Step 3: client known_hosts pre-trusts the server key (skip TOFU prompt).
+    let known_hosts = common::known_hosts_trusting(&dir, &host_key);
+
+    // Step 4: start the REAL-AUTH server (InnerAuthMode::Required).
+    let server = common::spawn_wt_server_real_auth(Some(SH.to_string()), authorized, host_signer)
+        .await
+        .expect("spawn_wt_server_real_auth failed");
+
+    // Step 5: dial the server and establish a fresh session to capture the token.
+    let url = format!("https://127.0.0.1:{}/nosh", server.addr.port());
+    let config = client_config_with_pinning(&server.cert_hash);
+    let transport = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_wt(config, &url),
+    )
+    .await
+    .expect("connect_wt timed out")
+    .expect("connect_wt failed");
+
+    // Run inner auth, then send SessionOpen to capture the token.
+    let (mut send, mut recv) = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_inner_auth_client(&*transport, &known_hosts, common::HOST, client_signer.clone()),
+    )
+    .await
+    .expect("run_inner_auth_client timed out")
+    .expect("run_inner_auth_client failed");
+
+    let session_open = Message::SessionOpen {
+        term: "xterm-256color".to_string(),
+        cols: 80,
+        rows: 24,
+        env: vec![],
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        write_message_ns(&mut *send, &session_open),
+    )
+    .await
+    .expect("write SessionOpen timed out")
+    .expect("write SessionOpen failed");
+
+    // Read the SessionOpened frame to capture the token.
+    let token = match tokio::time::timeout(
+        Duration::from_secs(5),
+        read_message_ns(&mut *recv),
+    )
+    .await
+    {
+        Ok(Ok(Message::SessionOpened { token })) => token,
+        Ok(Ok(other)) => {
+            panic!("unexpected message after SessionOpen: {}", other.variant_name());
+        }
+        Ok(Err(e)) => {
+            panic!("failed to read SessionOpened: {e:#}");
+        }
+        Err(_) => {
+            panic!("read SessionOpened timed out");
+        }
+    };
+
+    // Step 6: DROP the first connection to orphan the slot.
+    // We need to wait a bounded time for the server to transition the slot to Orphaned.
+    // The server's orphan watcher polls every 100ms (idle_timeout=0 so it transitions immediately).
+    drop(send);
+    drop(recv);
+    drop(transport);
+
+    // Wait for the slot to transition to Orphaned (bounded ~300ms).
+    // Comment references server.rs:1500 orphan poll for context.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 7: RACE two concurrent reattach attempts with the SAME token.
+    // Each connection is fresh and re-runs inner auth before sending Reattach.
+    let client_signer_1 = client_signer.clone();
+    let client_signer_2 = client_signer.clone();
+    let url_1 = url.clone();
+    let url_2 = url.clone();
+    let cert_hash_1 = server.cert_hash.clone();
+    let cert_hash_2 = server.cert_hash.clone();
+    let known_hosts_1 = known_hosts.clone();
+    let known_hosts_2 = known_hosts.clone();
+
+    // Launch both reattach attempts concurrently so they genuinely race the registry lock.
+    let (outcome1, outcome2) = tokio::join!(
+        async move {
+            // Connection 1: connect, inner auth, reattach.
+            let config = client_config_with_pinning(&cert_hash_1);
+            let transport = tokio::time::timeout(
+                Duration::from_secs(10),
+                connect_wt(config, &url_1),
+            )
+            .await
+            .expect("connect_wt timed out on attempt 1")
+            .expect("connect_wt failed on attempt 1");
+
+            let (mut send, mut recv) = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_inner_auth_client(&*transport, &known_hosts_1, common::HOST, client_signer_1),
+            )
+            .await
+            .expect("run_inner_auth_client timed out on attempt 1")
+            .expect("run_inner_auth_client failed on attempt 1");
+
+            // Send Reattach on the authenticated stream.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client::send_reattach(&mut *send, token, 0),
+            )
+            .await
+            .expect("send_reattach timed out on attempt 1")
+            .expect("send_reattach failed on attempt 1");
+
+            // Await the reply.
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                client::await_reattach_reply(&mut *recv),
+            )
+            .await
+            .expect("await_reattach_reply timed out on attempt 1")
+            .expect("await_reattach_reply failed on attempt 1");
+
+            // Cleanup streams.
+            drop(send);
+            drop(recv);
+            drop(transport);
+
+            outcome
+        },
+        async move {
+            // Connection 2: connect, inner auth, reattach (SAME token, SAME identity).
+            let config = client_config_with_pinning(&cert_hash_2);
+            let transport = tokio::time::timeout(
+                Duration::from_secs(10),
+                connect_wt(config, &url_2),
+            )
+            .await
+            .expect("connect_wt timed out on attempt 2")
+            .expect("connect_wt failed on attempt 2");
+
+            let (mut send, mut recv) = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_inner_auth_client(&*transport, &known_hosts_2, common::HOST, client_signer_2),
+            )
+            .await
+            .expect("run_inner_auth_client timed out on attempt 2")
+            .expect("run_inner_auth_client failed on attempt 2");
+
+            // Send Reattach on the authenticated stream.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client::send_reattach(&mut *send, token, 0),
+            )
+            .await
+            .expect("send_reattach timed out on attempt 2")
+            .expect("send_reattach failed on attempt 2");
+
+            // Await the reply.
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                client::await_reattach_reply(&mut *recv),
+            )
+            .await
+            .expect("await_reattach_reply timed out on attempt 2")
+            .expect("await_reattach_reply failed on attempt 2");
+
+            // Cleanup streams.
+            drop(send);
+            drop(recv);
+            drop(transport);
+
+            outcome
+        }
+    );
+
+    // Step 8: ASSERT the adversarial core — exactly one winner, one loser.
+    let ok_count = match (&outcome1, &outcome2) {
+        (ReattachOutcome::Ok { .. }, ReattachOutcome::Ok { .. }) => 2,
+        (ReattachOutcome::Ok { .. }, ReattachOutcome::Err) => 1,
+        (ReattachOutcome::Err, ReattachOutcome::Ok { .. }) => 1,
+        (ReattachOutcome::Err, ReattachOutcome::Err) => 0,
+    };
+
+    let err_count = match (&outcome1, &outcome2) {
+        (ReattachOutcome::Err, ReattachOutcome::Err) => 2,
+        (ReattachOutcome::Err, ReattachOutcome::Ok { .. }) => 1,
+        (ReattachOutcome::Ok { .. }, ReattachOutcome::Err) => 1,
+        (ReattachOutcome::Ok { .. }, ReattachOutcome::Ok { .. }) => 0,
+    };
+
+    assert_eq!(
+        ok_count, 1,
+        "MH-2 guard violation: expected exactly one ReattachOutcome::Ok, got {}",
+        ok_count
+    );
+
+    assert_eq!(
+        err_count, 1,
+        "MH-2 guard violation: expected exactly one ReattachOutcome::Err, got {}",
+        err_count
+    );
+
+    // Note: we do NOT assert which connection won — the race is nondeterministic.
+    // This test exercises the same atomic `Orphaned → Reconnecting` guard that the
+    // registry unit tests cover (registry.rs:708-718), now over two concurrent real
+    // WebTransport connections with full inner auth on each path.
+}
+
+// ── Helper: build a WT client config with certificate pinning ───────────────────
+
+/// Build a WT client config that trusts the server's self-signed cert by hash.
+///
+/// This is the test-only path — production clients use `with_native_certs`.
+fn client_config_with_pinning(cert_hash: &wtransport::tls::Sha256Digest) -> ClientConfig {
+    ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes([cert_hash.clone()])
+        .build()
 }
