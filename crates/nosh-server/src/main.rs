@@ -174,15 +174,45 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "webtransport")]
         TransportMode::Webtransport => {
+            use std::sync::Arc;
+            use nosh_auth::{load_host_key, load_authorized_keys, InProcessEd25519Signer};
+            use nosh_server::wt_transport::InnerAuthMode;
+
             let cert = args.cert.context("--cert is required for --mode webtransport")?;
             let key = args.key.context("--key is required for --mode webtransport")?;
+
+            // Load host key and authorized_keys for inner SSH-key mutual auth.
+            // These mirror the same resolution used in the native arm (D-07/D-08).
+            let host_key_path = match args.host_key {
+                Some(p) => p,
+                None => default_host_key()?,
+            };
+            let authorized_keys_path = match args.authorized_keys {
+                Some(p) => p,
+                None => default_authorized_keys()?,
+            };
+            let host_key = load_host_key(&host_key_path)?;
+            let host_signer: Arc<dyn nosh_auth::RawEd25519Signer> =
+                Arc::new(InProcessEd25519Signer::from_ssh_private(&host_key)?);
+            let authorized = Arc::new(load_authorized_keys(&authorized_keys_path)?);
+
             tracing::info!(
                 %addr,
                 cert = %cert.display(),
-                "nosh-server listening (WebTransport/HTTP3, outer TLS from operator cert)"
+                host_key = %host_key_path.display(),
+                authorized_keys = %authorized_keys_path.display(),
+                "nosh-server listening (WebTransport/HTTP3, outer TLS from operator cert, inner SSH-key auth)"
             );
             let endpoint = nosh_server::wt_transport::make_wt_endpoint(addr, &cert, &key)?;
-            nosh_server::wt_transport::run_wt_accept_loop(endpoint, registry, limits, args.shell).await
+            nosh_server::wt_transport::run_wt_accept_loop(
+                endpoint,
+                registry,
+                limits,
+                args.shell,
+                authorized,
+                host_signer,
+                InnerAuthMode::Required,
+            ).await
         }
         #[cfg(not(feature = "webtransport"))]
         TransportMode::Webtransport => {

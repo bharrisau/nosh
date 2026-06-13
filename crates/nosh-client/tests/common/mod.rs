@@ -254,15 +254,20 @@ impl Drop for WtTestServer {
 ///
 /// Uses `Identity::self_signed` (wtransport `self-signed` feature) to generate
 /// a fresh outer TLS cert valid for ≤ 14 days. The server runs
-/// `run_wt_accept_loop` with the test-support auth bypass on a background task.
+/// `run_wt_accept_loop` with an explicit `InnerAuthMode::TestBypass` on a
+/// background task — this bypass is an opt-in for Phase-24 shell-pump tests
+/// (wt01/wt02/wt03) that exercise the datagram pump and raw-QUIC rejection, not
+/// inner auth. Real inner auth is tested via the adversarial tests in Plan 04.
 ///
 /// The returned `WtTestServer` carries the bound `addr` and the cert's
 /// SHA-256 `hash` so the test client can use `with_server_certificate_hashes`.
 ///
-/// Returns `None` if `/bin/sh` is unavailable (caller should skip the test).
+/// Returns `None` if the server could not start (endpoint bind / identity
+/// generation failed). Callers should `expect` for shell-pump tests and check
+/// for downgrade-rejection tests.
 #[cfg(feature = "webtransport")]
 pub async fn spawn_wt_server(shell: Option<String>) -> Option<WtTestServer> {
-    use nosh_server::wt_transport::run_wt_accept_loop;
+    use nosh_server::wt_transport::{run_wt_accept_loop, InnerAuthMode};
     use nosh_server::server::AuthLimits;
     use wtransport::{Identity, ServerConfig, Endpoint};
 
@@ -293,12 +298,23 @@ pub async fn spawn_wt_server(shell: Option<String>) -> Option<WtTestServer> {
     let registry = SessionRegistry::new(5, std::time::Duration::ZERO);
     let registry_for_task = registry.clone();
 
+    // Dummy host signer and empty authorized list — not used because TestBypass
+    // skips inner auth entirely. Provide valid types to satisfy the function signature.
+    let dummy_key = TestKey::generate();
+    let host_signer: std::sync::Arc<dyn nosh_auth::RawEd25519Signer> = dummy_key.signer.clone();
+    let authorized: std::sync::Arc<Vec<NoshPublicKey>> = std::sync::Arc::new(vec![]);
+
     let handle = tokio::spawn(async move {
         let _ = run_wt_accept_loop(
             endpoint,
             registry_for_task,
             AuthLimits::default(),
             shell,
+            authorized,
+            host_signer,
+            // Explicit TestBypass: Phase-24 tests exercise the datagram pump and
+            // raw-QUIC rejection, not inner auth. Plan 04 converts wt01 to real auth.
+            InnerAuthMode::TestBypass,
         )
         .await;
     });

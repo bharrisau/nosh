@@ -136,6 +136,22 @@ impl NoshTransport for WtransportTransport {
         // wtransport::VarInt does NOT impl From<u32>; use the explicit constructor.
         self.0.close(VarInt::from_u32(code), reason)
     }
+
+    // D-01 channel binding: delegate to the underlying quinn::Connection's EKM export.
+    // quinn's export_keying_material takes &mut [u8] (unsized slice); coerce the
+    // fixed-size [u8; 32] via `output as &mut [u8]` — this is always safe and
+    // preserves the 32-byte size requirement by the type system.
+    fn export_keying_material(
+        &self,
+        output: &mut [u8; 32],
+        label: &[u8],
+        context: &[u8],
+    ) -> anyhow::Result<()> {
+        self.0
+            .quic_connection()
+            .export_keying_material(output as &mut [u8], label, context)
+            .map_err(|e| anyhow::anyhow!("export_keying_material failed: {e:?}"))
+    }
 }
 
 // ── WtransportSendStream ───────────────────────────────────────────────────────
@@ -299,7 +315,46 @@ pub fn make_wt_endpoint(
         })
 }
 
-// ── WT accept loop (Task 2) ────────────────────────────────────────────────────
+// ── Inner-auth mode selection ──────────────────────────────────────────────────
+
+/// Controls whether `handle_connection_wt` runs real inner SSH-key mutual auth
+/// or an explicit per-call test bypass.
+///
+/// ## Security-test integrity
+///
+/// The Phase-24 compile-time `cfg!(any(test, feature = "test-support"))` skip
+/// has been REMOVED. Real inner auth (`InnerAuthMode::Required`) is the DEFAULT —
+/// it runs even in test builds. `InnerAuthMode::TestBypass` is an explicit
+/// per-call opt-in used ONLY by Phase-24 shell-pump tests (wt01/wt02/wt03) that
+/// exercise the datagram pump, not auth.
+///
+/// This design ensures that the Phase-25 adversarial tests (Plan 04) can target
+/// the REAL auth gate even when nosh-server is compiled with `test-support`,
+/// defeating vacuous test passes against a bypassed gate (T-25-02-VACUOUS).
+///
+/// Production `main.rs` always passes `InnerAuthMode::Required`.
+/// `InnerAuthMode::TestBypass` MUST NOT appear in `main.rs` or any path that
+/// could be exercised from a deployed server.
+#[derive(Clone, Copy, Debug)]
+pub enum InnerAuthMode {
+    /// Run real inner SSH-key mutual auth (production default).
+    ///
+    /// The server executes `run_inner_auth_server` before accepting any
+    /// `SessionOpen` or `Reattach` frame. Any auth failure closes the connection
+    /// opaquely (D-04 no-oracle).
+    Required,
+    /// Skip inner auth and bind a synthetic all-zero peer identity.
+    ///
+    /// **Explicit per-call opt-in for test code only.** Using this in production
+    /// allows any peer to obtain a shell. There is NO compile-time guard — callers
+    /// are responsible for not passing `TestBypass` in production paths.
+    ///
+    /// Use for Phase-24 tests that exercise the datagram pump, raw-QUIC rejection,
+    /// or other session-level concerns that are orthogonal to auth.
+    TestBypass,
+}
+
+// ── WT accept loop ─────────────────────────────────────────────────────────────
 
 /// Accept WebTransport connections forever, with the same pre-auth DoS caps as
 /// `run_accept_loop` for native QUIC (AUTH-05 / D-13 / T-24-03-D).
@@ -312,11 +367,20 @@ pub fn make_wt_endpoint(
 /// The `registry` reaper is spawned once. Each accepted connection is given a
 /// semaphore permit (pre-auth cap) that is held until the auth phase completes
 /// or the auth timeout expires.
+///
+/// `authorized` and `host_signer` are passed through to `handle_connection_wt`
+/// for the inner SSH-key mutual auth gate (Phase 25). In production, supply real
+/// keys and `InnerAuthMode::Required`. For Phase-24 datagram-pump tests, pass
+/// `InnerAuthMode::TestBypass` so those tests remain green without needing
+/// client-side inner-auth support.
 pub async fn run_wt_accept_loop(
     endpoint: wtransport::Endpoint<Server>,
     registry: Arc<SessionRegistry>,
     limits: AuthLimits,
     shell_override: Option<String>,
+    authorized: Arc<Vec<nosh_auth::NoshPublicKey>>,
+    host_signer: Arc<dyn nosh_auth::RawEd25519Signer>,
+    auth_mode: InnerAuthMode,
 ) -> anyhow::Result<()> {
     // Spawn the background zombie/idle reaper once for this server instance.
     let _reaper = registry.spawn_reaper();
@@ -344,6 +408,8 @@ pub async fn run_wt_accept_loop(
         let auth_timeout = limits.auth_timeout;
         let shell = shell_override.clone();
         let registry = registry.clone();
+        let authorized = authorized.clone();
+        let host_signer = host_signer.clone();
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(auth_timeout, async {
@@ -363,7 +429,7 @@ pub async fn run_wt_accept_loop(
                 // Box immediately — no wtransport-specific extraction needed after this
                 // (unlike the quinn path which calls extract_peer_identity before boxing).
                 let transport: Box<dyn NoshTransport> = Box::new(WtransportTransport(conn));
-                handle_connection_wt(transport, registry, shell).await
+                handle_connection_wt(transport, registry, shell, authorized, host_signer, auth_mode).await
             }).await;
 
             match result {
@@ -377,57 +443,83 @@ pub async fn run_wt_accept_loop(
 
 /// Handle one WebTransport connection after the outer TLS handshake.
 ///
-/// Applies the inner-auth gate first:
-/// - **Release builds** (`--features webtransport` without `test-support`):
-///   reject immediately with `transport.close(1, ...)`. Phase 25 fills in the
-///   real inner SSH-key handshake here.
-/// - **Test-support builds** (`--features "webtransport test-support"` or
-///   `#[cfg(test)]`): bypass inner auth with a synthetic identity so integration
-///   tests can prove the session pump works over WebTransport.
+/// ## Inner-auth gate (Phase 25 / security-test integrity)
 ///
-/// After the inner-auth gate the dispatch is identical to `handle_connection`:
-/// `accept_bi()` → read first frame → `SessionOpen`/`Reattach`/protocol-error.
+/// Real inner auth (`InnerAuthMode::Required`) is the DEFAULT — it runs even in
+/// test builds. There is NO compile-time skip (the Phase-24
+/// `cfg!(any(test, feature = "test-support"))` block has been REMOVED).
+///
+/// `InnerAuthMode::TestBypass` is an explicit per-call opt-in used ONLY by
+/// Phase-24 shell-pump tests (wt01/wt02/wt03) that test the datagram pump and
+/// raw-QUIC rejection, not auth. There is NO compile-time skip — the Plan-04
+/// adversarial tests run with `Required` even though nosh-server is built with
+/// `test-support`. Production `main.rs` always passes `Required`.
+///
+/// ## Dispatch flow (D-05 / MH-1)
+///
+/// The control stream is accepted FIRST (`accept_bi()`). Then the `auth_mode`
+/// gate runs on that stream. Only after the gate returns `Ok(peer_identity)` does
+/// the handler read the first session frame (`SessionOpen` / `Reattach`). No
+/// session frame is ever dispatched before inner auth completes.
 pub(crate) async fn handle_connection_wt(
     conn: Box<dyn NoshTransport>,
     registry: Arc<SessionRegistry>,
     shell_override: Option<String>,
+    authorized: Arc<Vec<nosh_auth::NoshPublicKey>>,
+    host_signer: Arc<dyn nosh_auth::RawEd25519Signer>,
+    auth_mode: InnerAuthMode,
 ) -> anyhow::Result<()> {
     use nosh_proto::{Message, read_message_ns};
     use crate::server::{CLOSE_PROTOCOL, run_session, run_reattach_session, SessionOpenParams};
 
     let peer = conn.remote_address();
 
-    // Inner-auth gate (T-24-03-E: test-support bypass must not reach release builds).
-    #[cfg(any(test, feature = "test-support"))]
-    let skip_inner_auth = true;
-    #[cfg(not(any(test, feature = "test-support")))]
-    let skip_inner_auth = false;
-
-    if !skip_inner_auth {
-        // Phase 25 fills in the real inner SSH-key handshake.
-        // Release builds reject any connection lacking inner auth.
-        tracing::warn!(%peer, "WebTransport inner auth not yet implemented; closing connection");
-        conn.close(1, b"inner-auth-not-implemented");
-        return Ok(());
-    }
-
-    // test-support path: bypass inner auth.
-    // This block is only reachable when skip_inner_auth = true (test/test-support builds).
-    tracing::warn!(%peer, "INNER AUTH BYPASSED — test-support mode; MUST NOT appear in release builds");
-
-    // Derive a synthetic NoshPublicKey for the test identity (all-zero key).
-    // Phase 25 replaces this with the real authenticated key from inner SSH-key auth.
-    let peer_identity = nosh_auth::NoshPublicKey::from_raw([0u8; 32]);
-
-    // Accept the first bidi stream and dispatch on the first frame.
-    let (send, mut recv) = match conn.accept_bi().await {
+    // D-05 / MH-1: accept the control stream FIRST so the same stream is used for
+    // both inner auth and the session open. The server `accept_bi()` here matches
+    // the client `open_bi()` in run_inner_auth_client (Plan 03). No second stream.
+    let (mut send, mut recv) = match conn.accept_bi().await {
         Ok(pair) => pair,
         Err(e) => {
-            let _ = e;
+            tracing::warn!(%peer, "WT accept_bi failed before inner auth: {e:#}");
             return Ok(());
         }
     };
 
+    // Inner-auth gate: run real mutual auth (Required) or bypass for test code (TestBypass).
+    // IMPORTANT: `Required` is the default even in test/test-support builds. There is
+    // NO compile-time skip. `TestBypass` must be an explicit per-call argument.
+    let peer_identity = match auth_mode {
+        InnerAuthMode::Required => {
+            // Real inner SSH-key mutual auth (production and adversarial-test path).
+            match crate::inner_auth::run_inner_auth_server(
+                &*conn,
+                &mut *send,
+                &mut *recv,
+                &authorized,
+                host_signer,
+            )
+            .await
+            {
+                Ok(identity) => identity,
+                Err(e) => {
+                    // D-04: no-oracle close. Log only the error message — never nonce or sig bytes.
+                    tracing::warn!(%peer, "inner auth failed: {e:#}");
+                    conn.close(CLOSE_PROTOCOL, b"inner-auth-failed");
+                    return Ok(());
+                }
+            }
+        }
+        InnerAuthMode::TestBypass => {
+            // Explicit test-only bypass. The synthetic all-zero key is a sentinel.
+            // MUST NOT be reachable from production paths — production main.rs always
+            // passes InnerAuthMode::Required.
+            tracing::warn!(%peer, "INNER AUTH BYPASSED — test-support mode; MUST NOT appear in release builds");
+            nosh_auth::NoshPublicKey::from_raw([0u8; 32])
+        }
+    };
+
+    // After the inner-auth gate, dispatch on the FIRST session frame received on
+    // the SAME control stream (MH-1 / D-05: no session frame before Authenticated).
     match read_message_ns(&mut *recv).await {
         Ok(Message::SessionOpen { term, cols, rows, env }) => {
             run_session(

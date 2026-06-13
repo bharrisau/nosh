@@ -2,6 +2,7 @@
 //! exposed so integration tests can drive an in-process server.
 
 pub mod channel;
+pub mod inner_auth;
 pub mod pty_io;
 pub mod quinn_transport;
 pub mod registry;
