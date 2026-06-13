@@ -99,7 +99,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
   2. Datagram state-sync, predictive echo, and reliable control/scrollback channels all function identically over the WebTransport session as they do over native QUIC
   3. A server started with `--mode webtransport` explicitly rejects a raw QUIC (non-WebTransport) connection attempt (downgrade protection)
   4. `wtransport` is added to the workspace with `default-features = false` and the `ring` provider pinned; `cargo tree -f "{p} {f}" | grep rustls` shows only `ring` — no `aws-lc-rs` conflict
-  5. Datagram MTU sizing uses the WebTransport session's `max_datagram_payload_size()`, not raw `conn.max_datagram_size()`
+  5. Datagram MTU sizing uses the WebTransport session's `wtransport::Connection::max_datagram_size()` (capsule/Quarter-Stream-ID overhead already netted out per D-03), NOT the raw `quic_connection().max_datagram_size()` value — corrected from the originally-drafted `max_datagram_payload_size()`, which does not exist on wtransport 0.7.1
 **Plans**: 5 plans
 - [ ] 24-01-PLAN.md — Cargo wiring: wtransport 0.7.1 (ring-only) + time pin + webtransport feature on both crates (SC#4)
 - [ ] 24-02-PLAN.md — Client session pump made generic over NoshTransport (Phase 23 left the client concrete; prerequisite for WT-03)
