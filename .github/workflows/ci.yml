@@ -60,3 +60,18 @@ jobs:
         name: Audit Rust dependencies
         with:
           ignore: ""  # Add RUSTSEC-YYYY-NNNN here for accepted/false-positive advisories
+
+  osc-bound-regression:
+    name: OSC-OOM regression gate (SEC-05)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # This gate exists so that any future change to TerminalState::advance
+      # re-runs the bound test. The client has no vte parser today (the OSC
+      # bound lives solely server-side in nosh-server). If a client-side vte
+      # parser is ever added (e.g., for inline scrollback rendering), an
+      # equivalent client gate must be added.
+      - name: OSC-OOM regression gate (SEC-05)
+        run: cargo test --locked -p nosh-server oversized_multi_chunk_osc_is_bounded_then_resyncs
