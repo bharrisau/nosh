@@ -1,21 +1,38 @@
 {
   "version": "1.0",
-  "timestamp": "2026-06-13T08:46:23.773Z",
-  "source": "auto-postool",
-  "partial": true,
-  "phase": null,
-  "phase_name": null,
-  "phase_dir": null,
-  "plan": null,
-  "task": null,
-  "total_tasks": null,
-  "status": "auto-checkpoint",
-  "completed_tasks": [],
-  "remaining_tasks": [],
+  "timestamp": "2026-06-13T18:45:53.167Z",
+  "phase": "25",
+  "phase_name": "inner-ssh-key-handshake-tofu-prompt",
+  "phase_dir": ".planning/phases/25-inner-ssh-key-handshake-tofu-prompt",
+  "plan": 4,
+  "task": 0,
+  "total_tasks": 4,
+  "status": "paused",
+  "run": "/gsd:autonomous (ask-don't-auto; parallelise with worktrees). Phases 23+24 COMPLETE. main HEAD c84c0f1 = 25-01 merged.",
+  "completed_tasks": [
+    {"id": 1, "name": "23 Transport Abstraction Seam", "status": "done", "note": "opus-verified 4/4; latency UAT item carried to Phase 28 (23-HUMAN-UAT.md)"},
+    {"id": 2, "name": "24 WebTransport Endpoint + Mode A", "status": "done", "note": "opus-verified 5/5; live shell + datagram + downgrade e2e pass"},
+    {"id": 3, "name": "25-01 wire+crypto foundation", "status": "done", "commit": "c84c0f1", "note": "variants 18-21, fieldless+stability tests, transcript consts, nosh-auth helpers; merged to main"},
+    {"id": 4, "name": "25-02 server inner auth", "status": "done_unmerged", "branch": "worktree-agent-a43f3996f53301241", "worktree": ".claude/worktrees/agent-a43f3996f53301241", "commits": "bd0cb7a/bba1ff2/ccd0cf7", "note": "InnerAuthMode{Required,TestBypass} replaces compile-time bypass; Required default; wt01 real-auth conversion deferred to 25-04"},
+    {"id": 5, "name": "25-03 client inner auth + TOFU", "status": "done_unmerged", "branch": "worktree-agent-a22723b4a47a86af1", "worktree": ".claude/worktrees/agent-a22723b4a47a86af1", "commits": "06f4515/9b3fe97/60dd1fc", "note": "run_inner_auth_client EKM-bound; spawn_blocking sign; TofuPolicy::Interactive default; native pre-connect TOFU; no-TTY fail-closed; 114 nosh-client + 25 nosh-auth lib tests pass"}
+  ],
+  "remaining_tasks": [
+    {"id": 6, "name": "Merge both wave-2 worktrees to main", "status": "not_started", "detail": "git merge worktree-agent-a43f3996f53301241 --no-ff; git merge worktree-agent-a22723b4a47a86af1 --no-ff; restore .planning/STATE.md+ROADMAP.md from main after each; git worktree remove --force + git branch -D both"},
+    {"id": 7, "name": "Post-merge build+test gate", "status": "not_started", "detail": "cargo build --workspace; cargo test --workspace; cargo test -p nosh-server --features test-support --lib inner_auth; cargo test -p nosh-client --features webtransport --lib; then roadmap.update-plan-progress 25 25-02/25-03 complete"},
+    {"id": 8, "name": "25-04 adversarial integration tests (Wave 3, main tree)", "status": "not_started", "detail": "MUST use InnerAuthMode::Required real-auth harness spawn_wt_server_real_auth (NOT bypass); convert wt01 to real auth; tests: tampered-EKM->auth fail (WT-3), pre-auth SessionOpen->reject (MH-1), no-TTY->fail-closed (D-10), happy-path mutual-auth shell-INDEPENDENT"},
+    {"id": 9, "name": "code-review -> code-fixer -> opus verifier -> phase.complete 25", "status": "not_started", "detail": "reviewer=sonnet, verifier=opus per profile; verifier must confirm Vec<u8> signature fields are length-validated at use, channel-binding defeats relayed handshake, fieldless InnerAuthFail, MH-1 gating"},
+    {"id": 10, "name": "Phases 26, 27, 28 then milestone lifecycle (audit->complete->cleanup)", "status": "not_started", "detail": "26 migration handover; 27 security hardening (incl. 999.7 re-verify); 28 interactive UAT (clears carried 23-HUMAN-UAT.md latency item + M7 Mode-A e2e)"}
+  ],
   "blockers": [],
-  "human_actions_pending": [],
-  "decisions": [],
+  "human_actions_pending": [
+    {"action": "Phase 28 will require live interactive UAT by a human operator", "context": "carried-forward backlog UAT + new M7 Mode-A path + the 23 latency-budget item", "blocking": false}
+  ],
+  "decisions": [
+    {"decision": "Replace Phase-24 compile-time auth bypass (cfg(any(test,test-support))) with runtime InnerAuthMode{Required,TestBypass}", "rationale": "cfg(test) was always-on in test builds -> adversarial tests would pass vacuously against the bypass; Required-as-default makes real auth run even in tests (plan-checker WARNING-1 fix, revision 742be5f)", "phase": "25"},
+    {"decision": "Run wave-2 server (25-02) and client (25-03) as parallel worktree agents", "rationale": "disjoint crates (nosh-server vs nosh-client/src+nosh-auth) -> no merge conflict; honours user parallelise request", "phase": "25"},
+    {"decision": "Native-QUIC TOFU is a PRE-CONNECT known_hosts check, not a block inside the rustls verifier (D-09)", "rationale": "keeps interactive I/O off the TLS handshake thread", "phase": "25"}
+  ],
   "uncommitted_files": [],
-  "next_action": null,
-  "context_notes": ""
+  "next_action": "Merge worktree-agent-a43f3996f53301241 then worktree-agent-a22723b4a47a86af1 into main (restore STATE.md/ROADMAP.md from main after each), remove worktrees, run post-merge gate, then dispatch 25-04 on main tree.",
+  "context_notes": "Autonomous run, 2.5/6 phases done. Worktree-merge contract (learned this run): Agent(isolation=worktree) returns worktreePath+worktreeBranch and does NOT auto-merge; orchestrator merges via git merge --no-ff. Both wave-2 worktrees are committed & safe. Models: planner/verifier=opus, researcher/checker/executor/reviewer=sonnet (balanced profile). Full narrative resume state also in user memory m4-pending-work-and-backlog.md."
 }
