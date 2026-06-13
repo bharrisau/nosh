@@ -231,13 +231,59 @@ pub fn rebind_client(endpoint: &quinn::Endpoint) -> std::io::Result<std::net::So
 }
 
 /// A temp known_hosts path (empty → TOFU on first contact).
-pub fn empty_known_hosts(dir: &Path) -> PathBuf {
-    dir.join("known_hosts")
+#[cfg(feature = "webtransport")]
+pub fn empty_known_hosts(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let kh_path = dir.path().join("known_hosts");
+    std::fs::File::create(&kh_path).expect("create empty known_hosts");
+    kh_path
 }
 
 /// True if `/bin/sh` is available (session-usability checks need a shell).
 pub fn have_sh() -> bool {
     std::path::Path::new("/bin/sh").exists()
+}
+
+/// Generate a fresh Ed25519 keypair for tests.
+///
+/// Returns `(Arc<dyn RawEd25519Signer>, NoshPublicKey)` where the signer
+/// is a throwaway in-process key usable as a client or host signer, and the
+/// public key is the corresponding `NoshPublicKey` for authorized_keys /
+/// known_hosts wiring.
+#[cfg(feature = "webtransport")]
+pub fn generate_ed25519_keypair() -> (
+    std::sync::Arc<dyn nosh_auth::RawEd25519Signer>,
+    NoshPublicKey,
+) {
+    let seed = {
+        let mut s = [0u8; 32];
+        getrandom::getrandom(&mut s).expect("getrandom failed");
+        s
+    };
+    let dalek = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let inproc = nosh_auth::InProcessEd25519Signer::new(dalek);
+    let public = NoshPublicKey::from_raw(inproc.public_key32());
+    (std::sync::Arc::new(inproc), public)
+}
+
+/// Create a temp known_hosts file pre-trusting a given server key.
+///
+/// This helper writes a temporary `known_hosts` file containing ONE entry:
+/// the `HOST` constant with the provided `server_key`. Tests use this to
+/// skip the TOFU prompt for happy-path inner-auth tests (the adversarial
+/// TOFU test exercises the prompt path explicitly).
+///
+/// Returns the path to the temp file (caller must hold the TempDir for the
+/// file's lifetime).
+#[cfg(feature = "webtransport")]
+pub fn known_hosts_trusting(
+    dir: &tempfile::TempDir,
+    server_key: &NoshPublicKey,
+) -> std::path::PathBuf {
+    let kh_path = dir.path().join("known_hosts");
+    let openssh_line = server_key.to_openssh_line().expect("encode OpenSSH key");
+    let line = format!("{HOST} {openssh_line}\n");
+    std::fs::write(&kh_path, line).expect("write known_hosts");
+    kh_path
 }
 
 // ── WebTransport test harness (webtransport feature only) ─────────────────────
@@ -329,6 +375,80 @@ pub async fn spawn_wt_server(shell: Option<String>) -> Option<WtTestServer> {
             // Explicit TestBypass: Phase-24 tests exercise the datagram pump and
             // raw-QUIC rejection, not inner auth. Plan 04 converts wt01 to real auth.
             InnerAuthMode::TestBypass,
+        )
+        .await;
+    });
+
+    Some(WtTestServer { addr, cert_hash, registry, handle })
+}
+
+/// Spawn a real-inner-auth WebTransport server (InnerAuthMode::Required).
+///
+/// This is the security-test-integrity harness: passing InnerAuthMode::Required
+/// ensures the server runs the REAL `run_inner_auth_server` gate even though
+/// nosh-server is compiled with the test-support feature. NO compile-time bypass
+/// exists — Plan 02 removed the `cfg!(any(test, feature = "test-support"))` skip.
+///
+/// The adversarial tests in Plan 04 use this harness exclusively. Every test
+/// that targets the real gate MUST use this function (NOT `spawn_wt_server`).
+/// If a test used the TestBypass harness, the test would pass vacuously and
+/// defeat the security property (T-25-04-VACUOUS).
+///
+/// # Arguments
+///
+/// - `shell`: optional login shell override (e.g. `/bin/sh`)
+/// - `authorized`: list of authorized client keys (non-empty for real auth)
+/// - `host_signer`: the server's Ed25519 signing key (used in the challenge)
+///
+/// The caller is responsible for providing valid keys. The harness does NOT
+/// generate throwaway keys — it threads whatever the test provides into the
+/// real auth gate.
+#[cfg(feature = "webtransport")]
+pub async fn spawn_wt_server_real_auth(
+    shell: Option<String>,
+    authorized: Vec<NoshPublicKey>,
+    host_signer: std::sync::Arc<dyn nosh_auth::RawEd25519Signer>,
+) -> Option<WtTestServer> {
+    use nosh_server::wt_transport::{run_wt_accept_loop, InnerAuthMode};
+    use nosh_server::server::AuthLimits;
+    use wtransport::{Identity, ServerConfig, Endpoint};
+
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    // Generate a self-signed TLS identity for the outer layer (identical to bypass mode).
+    let identity = Identity::self_signed(&["localhost", "127.0.0.1"])
+        .expect("self-signed identity generation must not fail");
+
+    let cert_hash = identity
+        .certificate_chain()
+        .as_slice()
+        .first()
+        .expect("self-signed identity has exactly one cert")
+        .hash();
+
+    let server_config = ServerConfig::builder()
+        .with_bind_address(bind)
+        .with_identity(identity)
+        .build();
+
+    let endpoint = Endpoint::server(server_config).expect("bind WT test endpoint");
+    let addr = endpoint.local_addr().expect("WT endpoint local_addr");
+
+    let registry = SessionRegistry::new(5, std::time::Duration::ZERO);
+    let registry_for_task = registry.clone();
+
+    let handle = tokio::spawn(async move {
+        let _ = run_wt_accept_loop(
+            endpoint,
+            registry_for_task,
+            AuthLimits::default(),
+            shell,
+            std::sync::Arc::new(authorized),
+            host_signer,
+            // REQUIRED MODE: this runs the real inner-auth gate. Because Plan 02
+            // removed the compile-time bypass, there is NO cfg gate — the gate is
+            // reached purely by passing InnerAuthMode::Required.
+            InnerAuthMode::Required,
         )
         .await;
     });
