@@ -145,8 +145,13 @@ pub trait NoshSendStream: Send + 'static {
     /// **Callers on trait objects MUST `.await` this.**
     async fn finish(&mut self) -> anyhow::Result<()>;
 
-    /// Wait until the peer acknowledges the stream has stopped (half-close
-    /// confirmation). Typically called after `finish()`.
+    /// Resolves when either:
+    /// - the peer acknowledges receipt of all stream data after a `finish()` (clean drain), OR
+    /// - the peer sends a STOP_SENDING frame (aborting the stream, `Some(error_code)`)
+    ///
+    /// The returned `anyhow::Result<()>` discards the stop code; callers that need to
+    /// distinguish abort from clean drain must use the underlying transport's native API.
+    /// Typically called with a timeout after `finish()` as a best-effort drain wait.
     async fn stopped(&mut self) -> anyhow::Result<()>;
 
     /// Reset the stream with an application error code (abort send side).
