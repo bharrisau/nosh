@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
-status: executing
-stopped_at: Completed 23-01-PLAN.md (transport trait definitions + codec helpers)
-last_updated: "2026-06-13T05:04:34.768Z"
+status: ready_to_plan
+stopped_at: Phase 23 complete (2/2) — ready to discuss Phase 24
+last_updated: 2026-06-13T05:22:36.371Z
 last_activity: 2026-06-13 -- Phase 23 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 2
-  completed_plans: 2
+  completed_plans: 13
   percent: 17
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-13)
 
 **Core value:** A single QUIC connection on UDP/443 can carry a live interactive shell, authenticated entirely from the user's existing SSH-key identity — and that session survives network changes without re-authenticating.
-**Current focus:** Phase 23 — transport-abstraction-seam
+**Current focus:** Phase 24 — webtransport endpoint mode a
 
 ## Current Position
 
-Phase: 23 (transport-abstraction-seam) — EXECUTING
-Plan: 2 of 2
-Status: Executing Phase 23
-Last activity: 2026-06-13 -- Phase 23 execution started
+Phase: 24
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-06-13
 
 ```
 Progress: [██████████] 100%
@@ -53,6 +53,7 @@ Progress: [██████████] 100%
 | 26. Migration Handover over WebTransport | 0/? | - | - |
 | 27. Security Hardening Pass | 0/? | - | - |
 | 28. Interactive UAT Clearing | 0/? | - | - |
+| 23 | 2 | - | - |
 
 **Recent Trend:**
 

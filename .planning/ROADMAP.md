@@ -178,7 +178,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 | 20. Repaint Pacing | 2/2 | Shipped | 2026-06-11 |
 | 21. Channel Multiplexing Foundation | 4/4 | Shipped | 2026-06-11 |
 | 22. Scrollback Sync | 5/5 | Shipped | 2026-06-12 |
-| 23. Transport Abstraction Seam | 2/2 | Complete   | 2026-06-13 |
+| 23. Transport Abstraction Seam | 2/2 | Complete    | 2026-06-13 |
 | 24. WebTransport Endpoint + Mode A | 0/? | Not started | - |
 | 25. Inner SSH-Key Handshake + TOFU Prompt | 0/? | Not started | - |
 | 26. Migration Handover over WebTransport | 0/? | Not started | - |
