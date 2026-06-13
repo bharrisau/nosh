@@ -398,6 +398,120 @@ mod tests {
         }
     }
 
+    // ── Phase 25 helper tests (check_authorized_key + verify_ed25519_spki) ──────
+
+    /// Phase 25 / D-07: `check_authorized_key` returns true iff key is present
+    /// in the authorized slice (membership check reusable by inner-auth server).
+    #[test]
+    fn check_authorized_key_present_and_absent() {
+        let k1 = NoshPublicKey::from_raw([1u8; 32]);
+        let k2 = NoshPublicKey::from_raw([2u8; 32]);
+        let k3 = NoshPublicKey::from_raw([3u8; 32]);
+        let authorized = vec![k1.clone(), k2.clone()];
+
+        // Present: both authorized keys are found.
+        assert!(
+            check_authorized_key(&k1, &authorized),
+            "k1 must be found in authorized list"
+        );
+        assert!(
+            check_authorized_key(&k2, &authorized),
+            "k2 must be found in authorized list"
+        );
+        // Absent: k3 is not in the list.
+        assert!(
+            !check_authorized_key(&k3, &authorized),
+            "k3 must not be found in authorized list"
+        );
+        // Edge: empty authorized list — nothing is authorized.
+        assert!(
+            !check_authorized_key(&k1, &[]),
+            "nothing is authorized in an empty list"
+        );
+    }
+
+    /// Phase 25 / D-01: `verify_ed25519_spki` returns true for a valid signature
+    /// by the matching key over the given message.
+    #[test]
+    fn verify_ed25519_spki_valid_signature() {
+        use crate::signer::{InProcessEd25519Signer, RawEd25519Signer};
+
+        let signer = InProcessEd25519Signer::generate();
+        let spki = ed25519_spki_der(&signer.public_key32());
+        let msg = b"nosh-inner-auth test message";
+        let sig = signer.sign(msg).expect("sign must succeed");
+
+        assert!(
+            verify_ed25519_spki(&spki, msg, &sig),
+            "valid signature must verify as true"
+        );
+    }
+
+    /// Phase 25 / D-04: `verify_ed25519_spki` returns false for a malformed SPKI.
+    #[test]
+    fn verify_ed25519_spki_rejects_malformed_spki() {
+        use crate::signer::{InProcessEd25519Signer, RawEd25519Signer};
+
+        let signer = InProcessEd25519Signer::generate();
+        let msg = b"some message";
+        let sig = signer.sign(msg).expect("sign must succeed");
+
+        // Wrong length: 43 bytes (should be 44).
+        assert!(
+            !verify_ed25519_spki(&[0u8; 43], msg, &sig),
+            "43-byte SPKI must be rejected"
+        );
+        // Empty SPKI.
+        assert!(
+            !verify_ed25519_spki(&[], msg, &sig),
+            "empty SPKI must be rejected"
+        );
+        // Correct length but wrong prefix.
+        let mut bad_spki = ed25519_spki_der(&signer.public_key32());
+        bad_spki[0] ^= 0xff;
+        assert!(
+            !verify_ed25519_spki(&bad_spki, msg, &sig),
+            "wrong-prefix SPKI must be rejected"
+        );
+    }
+
+    /// Phase 25 / D-04: `verify_ed25519_spki` returns false when the signature
+    /// was made by a different key.
+    #[test]
+    fn verify_ed25519_spki_rejects_wrong_key() {
+        use crate::signer::{InProcessEd25519Signer, RawEd25519Signer};
+
+        let signer_a = InProcessEd25519Signer::generate();
+        let signer_b = InProcessEd25519Signer::generate();
+        let spki_a = ed25519_spki_der(&signer_a.public_key32());
+        let msg = b"test message for wrong-key check";
+        // Sign with signer_b but verify against signer_a's SPKI.
+        let sig_b = signer_b.sign(msg).expect("sign must succeed");
+
+        assert!(
+            !verify_ed25519_spki(&spki_a, msg, &sig_b),
+            "signature by wrong key must verify as false"
+        );
+    }
+
+    /// Phase 25 / D-04: `verify_ed25519_spki` returns false when the message
+    /// has been tampered with after signing.
+    #[test]
+    fn verify_ed25519_spki_rejects_tampered_message() {
+        use crate::signer::{InProcessEd25519Signer, RawEd25519Signer};
+
+        let signer = InProcessEd25519Signer::generate();
+        let spki = ed25519_spki_der(&signer.public_key32());
+        let original_msg = b"original message";
+        let tampered_msg = b"tampered message!";
+        let sig = signer.sign(original_msg).expect("sign must succeed");
+
+        assert!(
+            !verify_ed25519_spki(&spki, tampered_msg, &sig),
+            "signature over original message must not verify tampered message"
+        );
+    }
+
     #[test]
     fn known_hosts_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
