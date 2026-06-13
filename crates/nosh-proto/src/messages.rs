@@ -358,6 +358,11 @@ pub enum Message {
         server_spki: Vec<u8>,
         /// RFC 9266 EKM material (32 bytes) from
         /// `NoshTransport::export_keying_material(INNER_AUTH_EKM_LABEL, INNER_AUTH_EKM_CONTEXT)`.
+        ///
+        /// NOTE: This field (and server_nonce/client_nonce) sit at serde's 32-element
+        /// array limit. serde only derives Serialize/Deserialize for arrays <= 32 elements.
+        /// If increasing these sizes in the future, the derive macro will fail — switch to
+        /// Vec<u8> or use a custom serde implementation (IN-03).
         ekm: [u8; 32],
     },
 
