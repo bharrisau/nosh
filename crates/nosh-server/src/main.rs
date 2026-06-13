@@ -1,4 +1,19 @@
 //! `nosh-server` binary — a QUIC server enforcing SSH-key mutual auth (Phase 2/5).
+//!
+//! Phase 24 adds `--mode native|webtransport`:
+//! - `native` (default): raw QUIC with SPKI-pinned SSH-key mutual auth (unchanged).
+//! - `webtransport`: WebTransport over HTTP/3, outer TLS from operator cert/key PEM
+//!   files, inner SSH-key auth in Phase 25 (WT-02, WT-05, D-07).
+//!
+//! # Port 443 privilege note
+//!
+//! Binding UDP/443 requires root or `setcap CAP_NET_BIND_SERVICE`:
+//!
+//! ```text
+//! sudo setcap 'cap_net_bind_service=+ep' $(which nosh-server)
+//! ```
+//!
+//! Use `--port 4433` for development and CI (unprivileged).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -9,10 +24,30 @@ use clap::Parser;
 use nosh_server::registry::SessionRegistry;
 use nosh_server::server::{self, AuthLimits};
 
-/// nosh server: accepts an SSH-key-mutually-authenticated QUIC connection and
-/// runs a real PTY login-shell session. Unknown client keys are rejected inside
-/// the TLS handshake. Sessions survive a transport-level disconnect (orphaned,
-/// PTY kept alive) and are bounded per identity by `--max-sessions-per-identity`.
+/// Transport mode selection (D-07: one transport per process).
+///
+/// `native` keeps the existing raw-QUIC SPKI-pinned model unchanged (D-06).
+/// `webtransport` binds a WebTransport over HTTP/3 listener; the outer TLS cert
+/// must be a CA-signed certificate supplied via `--cert`/`--key`.
+///
+/// WT-05 structural guarantee: starting with `--mode webtransport` never creates
+/// a quinn endpoint — a raw-QUIC client cannot become a session.
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum TransportMode {
+    /// Raw QUIC with SSH-key mutual auth (self-signed SPKI pinning). Default.
+    Native,
+    /// WebTransport over HTTP/3 with outer CA-cert TLS. Requires `--cert`/`--key`.
+    /// Binding port 443 requires root or setcap CAP_NET_BIND_SERVICE.
+    Webtransport,
+}
+
+/// nosh server: accepts SSH-key-mutually-authenticated connections and runs a
+/// real PTY login-shell session. Unknown client keys are rejected in auth.
+/// Sessions survive a transport-level disconnect (orphaned, PTY kept alive)
+/// and are bounded per identity by `--max-sessions-per-identity`.
+///
+/// Mode selection: `--mode native` (default) uses raw QUIC (unchanged).
+/// `--mode webtransport` uses WebTransport over HTTP/3 with `--cert`/`--key`.
 #[derive(Parser, Debug)]
 #[command(name = "nosh-server", about, version)]
 struct Args {
@@ -20,9 +55,27 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     addr: IpAddr,
 
-    /// Bind port. Default 4433 (unprivileged); UDP/443 is the production target.
+    /// Bind port. Default 4433 (unprivileged dev/CI). UDP/443 is the production
+    /// target; binding 443 requires root or `setcap CAP_NET_BIND_SERVICE`.
     #[arg(long, default_value_t = 4433)]
     port: u16,
+
+    /// Transport mode. `native` uses raw QUIC (default, existing behaviour).
+    /// `webtransport` runs WebTransport over HTTP/3 using `--cert`/`--key`.
+    /// WT-05: the selected transport is exclusive per process; a `webtransport`
+    /// server never creates a quinn endpoint (no raw-QUIC sessions possible).
+    #[arg(long, default_value = "native")]
+    mode: TransportMode,
+
+    /// PEM certificate file for WebTransport outer TLS (`--mode webtransport`).
+    /// Must be a CA-signed certificate (D-04). Not used in native mode.
+    #[arg(long)]
+    cert: Option<PathBuf>,
+
+    /// PEM private key file for WebTransport outer TLS (`--mode webtransport`).
+    /// Not used in native mode.
+    #[arg(long)]
+    key: Option<PathBuf>,
 
     /// Ed25519 host private key file (daemon model — read directly). Default
     /// `~/.config/nosh/host_ed25519` (overridable, D-06/D-08).
@@ -79,21 +132,6 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let addr = SocketAddr::new(args.addr, args.port);
-    let host_key = match args.host_key {
-        Some(p) => p,
-        None => default_host_key()?,
-    };
-    let authorized_keys = match args.authorized_keys {
-        Some(p) => p,
-        None => default_authorized_keys()?,
-    };
-
-    tracing::info!(
-        %addr,
-        host_key = %host_key.display(),
-        authorized_keys = %authorized_keys.display(),
-        "nosh-server listening (ALPN nosh/0, SSH-key mutual auth)"
-    );
 
     let limits = AuthLimits {
         max_concurrent: args.max_concurrent_handshakes,
@@ -112,8 +150,48 @@ async fn main() -> anyhow::Result<()> {
         "session persistence config"
     );
 
-    let endpoint = server::make_endpoint(addr, &host_key, &authorized_keys)?;
-    server::run_accept_loop(endpoint, registry, limits, args.shell).await
+    // D-07: one transport per process. The two arms are mutually exclusive.
+    // A `webtransport` process never creates a quinn endpoint (WT-05).
+    match args.mode {
+        TransportMode::Native => {
+            // Resolve host-key and authorized-keys paths only in native mode.
+            let host_key = match args.host_key {
+                Some(p) => p,
+                None => default_host_key()?,
+            };
+            let authorized_keys = match args.authorized_keys {
+                Some(p) => p,
+                None => default_authorized_keys()?,
+            };
+            tracing::info!(
+                %addr,
+                host_key = %host_key.display(),
+                authorized_keys = %authorized_keys.display(),
+                "nosh-server listening (ALPN nosh/0, SSH-key mutual auth, native QUIC)"
+            );
+            let endpoint = server::make_endpoint(addr, &host_key, &authorized_keys)?;
+            server::run_accept_loop(endpoint, registry, limits, args.shell).await
+        }
+        #[cfg(feature = "webtransport")]
+        TransportMode::Webtransport => {
+            let cert = args.cert.context("--cert is required for --mode webtransport")?;
+            let key = args.key.context("--key is required for --mode webtransport")?;
+            tracing::info!(
+                %addr,
+                cert = %cert.display(),
+                "nosh-server listening (WebTransport/HTTP3, outer TLS from operator cert)"
+            );
+            let endpoint = nosh_server::wt_transport::make_wt_endpoint(addr, &cert, &key)?;
+            nosh_server::wt_transport::run_wt_accept_loop(endpoint, registry, limits, args.shell).await
+        }
+        #[cfg(not(feature = "webtransport"))]
+        TransportMode::Webtransport => {
+            anyhow::bail!(
+                "this binary was built without the `webtransport` feature; \
+                rebuild with `--features webtransport` to enable WebTransport mode"
+            )
+        }
+    }
 }
 
 #[cfg(test)]
