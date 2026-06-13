@@ -346,14 +346,19 @@ pub async fn run_wt_accept_loop(
         let registry = registry.clone();
 
         tokio::spawn(async move {
-            // Hold the permit for the duration of the auth phase (D-13 parity).
-            let _permit = permit;
             let result = tokio::time::timeout(auth_timeout, async {
                 // Three-step accept: IncomingSession → SessionRequest → Connection.
                 let session_request = incoming.await
                     .context("WebTransport IncomingSession resolve")?;
                 let conn: Connection = session_request.accept().await
                     .context("WebTransport session accept")?;
+
+                // Auth phase complete — release the pre-auth slot so the semaphore
+                // only caps half-open handshakes, not active sessions. This mirrors
+                // run_accept_loop (server.rs) which drops the permit immediately after
+                // the TLS handshake resolves and before handle_connection is called
+                // (D-13 parity).
+                drop(permit);
 
                 // Box immediately — no wtransport-specific extraction needed after this
                 // (unlike the quinn path which calls extract_peer_identity before boxing).
