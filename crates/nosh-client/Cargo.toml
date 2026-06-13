@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "nosh-client"
 path = "src/main.rs"
 
+[features]
+# Gates the WebTransport client connection path (wtransport 0.7.1) behind an
+# opt-in Cargo feature. Off by default — native QUIC mode is unchanged.
+# Enable with --features nosh-client/webtransport.
+webtransport = ["dep:wtransport"]
+
 [dependencies]
 nosh-proto = { path = "../nosh-proto" }
 nosh-auth = { path = "../nosh-auth" }
@@ -33,6 +39,8 @@ ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "s
 crossterm = { version = "0.29", features = ["events", "osc52"] }
 dirs = "5"
 unicode-width = "0.2"
+# Optional wtransport dep — only compiled when webtransport feature is enabled.
+wtransport = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # ssh-agent-client-rs uses Unix domain sockets — not available on Windows.
