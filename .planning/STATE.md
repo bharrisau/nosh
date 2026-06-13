@@ -4,12 +4,12 @@ milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
 status: Roadmap created; ready for Phase 23
 stopped_at: Phases 23-28 context gathered (batched discussion)
-last_updated: "2026-06-13T03:36:58.453Z"
+last_updated: "2026-06-13T04:29:37.752Z"
 last_activity: 2026-06-13 — v1.4 roadmap written (Phases 23-28)
 progress:
   total_phases: 6
   completed_phases: 0
-  total_plans: 0
+  total_plans: 2
   completed_plans: 0
   percent: 0
 ---
