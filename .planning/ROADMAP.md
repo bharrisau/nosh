@@ -70,7 +70,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 - [x] **Phase 24: WebTransport Endpoint + Mode A** — `wtransport` 0.7.1 integrated; server binds UDP/443 as a WebTransport-over-HTTP/3 listener; client connects; full shell session (datagrams, streams, channels) over the WebTransport pump; downgrade protection (completed 2026-06-13)
 - [x] **Phase 25: Inner SSH-Key Handshake + TOFU Prompt** — four-step mutual challenge-response (discriminants 18-21) with RFC 9266 tls-exporter channel binding; interactive blocking TOFU fingerprint prompt on first contact; inner auth gated before any `SessionOpen` or `Reattach` (completed 2026-06-13)
 - [x] **Phase 26: Migration Handover over WebTransport** — client detects WebTransport session loss, reconnects, re-runs inner auth, resumes via 1-RTT cold reattach with byte-exact replay; concurrent same-token reattach resolved atomically (completed 2026-06-13)
-- [ ] **Phase 27: Security Hardening Pass** — OSC OOM adversarial re-verification (999.7) + regression CI gate; SEC-04 client trust-boundary hardening (per-OSC byte gate, clipboard-read rejection, escape stripping, resize rate-limit, recv cap, channel-ID validation); SEC-01 threat-model document (`docs/SECURITY.md`)
+- [x] **Phase 27: Security Hardening Pass** — OSC OOM adversarial re-verification (999.7) + regression CI gate; SEC-04 client trust-boundary hardening (per-OSC byte gate, clipboard-read rejection, escape stripping, resize rate-limit, recv cap, channel-ID validation); SEC-01 threat-model document (`docs/SECURITY.md`) (completed 2026-06-13)
 - [ ] **Phase 28: Interactive UAT Clearing** — human-driven, one item at a time: carried-forward backlog (Windows alt-screen, 999.3, 999.4, CI gates) then new M7 path end-to-end
 
 ## Phase Details
@@ -172,9 +172,10 @@ Plans:
   4. `docs/SECURITY.md` exists and covers: assets and trust boundaries, attacker capabilities in internet-exposed deployment, the proxy trust model, the Mode A vs Mode B distinction, the mandatory-inner-auth rationale, and residual risks
 
 **Plans**: 3 plans
-- [ ] 27-01-PLAN.md — SEC-05: re-verify the OSC-OOM bound + add the required CI regression gate
-- [ ] 27-02-PLAN.md — SEC-04: client trust-boundary hardening (title \r\n, clipboard whitelist, channel-ID/PtyData caps, OSC 8 scheme whitelist)
-- [ ] 27-03-PLAN.md — SEC-01: author docs/SECURITY.md STRIDE threat model (waved after SEC-04 code)
+
+- [x] 27-01-PLAN.md — SEC-05: re-verify the OSC-OOM bound + add the required CI regression gate
+- [x] 27-02-PLAN.md — SEC-04: client trust-boundary hardening (title \r\n, clipboard whitelist, channel-ID/PtyData caps, OSC 8 scheme whitelist)
+- [x] 27-03-PLAN.md — SEC-01: author docs/SECURITY.md STRIDE threat model (waved after SEC-04 code)
 
 ### Phase 28: Interactive UAT Clearing
 
@@ -221,5 +222,5 @@ Plans:
 | 24. WebTransport Endpoint + Mode A | 5/5 | Complete    | 2026-06-13 |
 | 25. Inner SSH-Key Handshake + TOFU Prompt | 4/4 | Complete    | 2026-06-13 |
 | 26. Migration Handover over WebTransport | 2/2 | Complete    | 2026-06-13 |
-| 27. Security Hardening Pass | 0/? | Not started | - |
+| 27. Security Hardening Pass | 3/3 | Complete    | 2026-06-13 |
 | 28. Interactive UAT Clearing | 0/? | Not started | - |
