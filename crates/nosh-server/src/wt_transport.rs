@@ -288,7 +288,7 @@ pub fn make_wt_endpoint(
     wtransport::Endpoint::server(wt_config)
         .with_context(|| {
             let port = addr.port();
-            if port <= 1024 {
+            if port < 1024 {
                 format!(
                     "bind WebTransport endpoint to {addr}: port {port} requires root or \
                     `setcap CAP_NET_BIND_SERVICE`. Use --port 4433 for dev/CI."
