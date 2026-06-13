@@ -300,6 +300,13 @@ mod tests {
                 channel_id: 2, from_line: 0, total_available: 0,
                 epoch_at_snapshot: 0, lines: vec![] }),
             (17, Message::ScrollbackCredit { channel_id: 2, bytes: 0 }),
+            // Phase 25: Inner SSH-key handshake — discriminants 18–21 (append-only after ScrollbackCredit):
+            (18, Message::InnerAuthChallenge {
+                server_nonce: [0u8; 32], server_spki: vec![], ekm: [0u8; 32] }),
+            (19, Message::InnerAuthResponse {
+                client_nonce: [0u8; 32], client_spki: vec![], client_sig: vec![0u8; 64] }),
+            (20, Message::InnerAuthComplete { server_sig: vec![0u8; 64] }),
+            (21, Message::InnerAuthFail),
         ];
         for (expected_disc, msg) in cases {
             let encoded = to_allocvec(msg).expect("encode");
@@ -309,6 +316,24 @@ mod tests {
                 msg.variant_name(), expected_disc, encoded[0]
             );
         }
+    }
+
+    /// Phase 25 / D-04: `InnerAuthFail` must encode to exactly 1 byte (discriminant
+    /// only — fieldless). Adding any field would create a key-existence or
+    /// signature-validity oracle, violating the no-oracle invariant.
+    ///
+    /// This test guards the invariant mechanically: if someone adds a field to
+    /// `InnerAuthFail`, the encoded length increases and this test fails before merge.
+    #[test]
+    fn inner_auth_fail_is_fieldless() {
+        let fail = Message::InnerAuthFail;
+        let encoded = postcard::to_allocvec(&fail).expect("encode InnerAuthFail");
+        assert_eq!(
+            encoded.len(),
+            1,
+            "InnerAuthFail must encode as exactly 1 byte (discriminant only); \
+             a field would create a key-existence or signature-validity oracle (D-04)"
+        );
     }
 
     /// WR-P-02 / Phase 22: every `ChannelType` variant must encode with its EXACT

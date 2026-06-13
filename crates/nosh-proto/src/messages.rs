@@ -335,6 +335,78 @@ pub enum Message {
         /// Number of additional bytes the send side may transmit.
         bytes: u64,
     },
+
+    // ── Phase 25: Inner SSH-key handshake — WebTransport only ────────────────
+    //
+    // Appended AFTER `ScrollbackCredit` (discriminant 17). Inserting or
+    // reordering is NOT backward-compatible. The discriminant-stability test
+    // in codec.rs (message_discriminant_order_is_stable) enforces this invariant.
+    // APPEND-ONLY from here. (D-03 / WF-1)
+
+    /// Server → client: inner-auth challenge (discriminant 18). D-03.
+    ///
+    /// Initiates the inner SSH-key handshake over the WebTransport control stream.
+    /// The `ekm` field carries the RFC 9266 channel-binding material derived via
+    /// `NoshTransport::export_keying_material` (D-01). Both sides derive it from
+    /// the same TLS session so the client can verify the server is the genuine
+    /// endpoint (not a replayed transcript).
+    InnerAuthChallenge {
+        /// 32-byte CSPRNG server nonce. MUST NOT be logged — D-07.
+        server_nonce: [u8; 32],
+        /// The server's Ed25519 SPKI DER (44 bytes for Ed25519, variable for
+        /// future key types). The client checks this against `known_hosts`.
+        server_spki: Vec<u8>,
+        /// RFC 9266 EKM material (32 bytes) from
+        /// `NoshTransport::export_keying_material(INNER_AUTH_EKM_LABEL, INNER_AUTH_EKM_CONTEXT)`.
+        ekm: [u8; 32],
+    },
+
+    /// Client → server: inner-auth response (discriminant 19). D-03.
+    ///
+    /// The `client_sig` field is the Ed25519 signature over the client-side
+    /// transcript hash (see `INNER_AUTH_LABEL_CLIENT`). MUST NOT be logged
+    /// in any arm body (D-07 no-token-logging discipline).
+    ///
+    /// `client_sig` is `Vec<u8>` rather than `[u8; 64]` because serde's
+    /// `Deserialize` derive only covers fixed-size arrays up to 32 elements.
+    /// Callers MUST validate `client_sig.len() == 64` before using the value.
+    InnerAuthResponse {
+        /// 32-byte CSPRNG client nonce. MUST NOT be logged — D-07.
+        client_nonce: [u8; 32],
+        /// The client's Ed25519 SPKI DER. The server checks this against `authorized_keys`.
+        client_spki: Vec<u8>,
+        /// 64-byte Ed25519 signature over the client transcript hash. MUST NOT be logged — D-07.
+        /// Length MUST be validated as exactly 64 bytes by the receiver.
+        client_sig: Vec<u8>,
+    },
+
+    /// Server → client: mutual auth complete (discriminant 20). D-03.
+    ///
+    /// The `server_sig` field is the Ed25519 signature over the server-side
+    /// transcript hash (see `INNER_AUTH_LABEL_SERVER`). MUST NOT be logged
+    /// in any arm body (D-07 no-token-logging discipline).
+    ///
+    /// `server_sig` is `Vec<u8>` rather than `[u8; 64]` because serde's
+    /// `Deserialize` derive only covers fixed-size arrays up to 32 elements.
+    /// Callers MUST validate `server_sig.len() == 64` before using the value.
+    InnerAuthComplete {
+        /// 64-byte Ed25519 signature over the server transcript hash. MUST NOT be logged — D-07.
+        /// Length MUST be validated as exactly 64 bytes by the receiver.
+        server_sig: Vec<u8>,
+    },
+
+    /// Either direction: inner auth failed. FIELDLESS (discriminant 21). D-04.
+    ///
+    /// FIELDLESS and UNIFORM — there is deliberately no reason code or
+    /// distinguishing field (D-04). Wrong key, expired token, unexpected frame,
+    /// signature failure: ALL map to this identical variant. This is the
+    /// no-oracle invariant: an attacker cannot distinguish "key not in
+    /// authorized_keys" from "signature invalid" from "protocol error".
+    ///
+    /// INVARIANT: this variant MUST remain fieldless forever. Adding a reason
+    /// field would create a key-existence oracle. The server logs the reason
+    /// privately (to a local log) and NEVER sends it on the wire.
+    InnerAuthFail,
 }
 
 /// Payload for a [`Message::TerminalControl`] frame.
@@ -419,6 +491,11 @@ impl Message {
             Message::ScrollbackRequest { .. } => "ScrollbackRequest",
             Message::ScrollbackPage { .. } => "ScrollbackPage",
             Message::ScrollbackCredit { .. } => "ScrollbackCredit",
+            // Phase 25 inner-auth variants (D-07: no sig/nonce bytes in arm bodies):
+            Message::InnerAuthChallenge { .. } => "InnerAuthChallenge",
+            Message::InnerAuthResponse { .. } => "InnerAuthResponse",
+            Message::InnerAuthComplete { .. } => "InnerAuthComplete",
+            Message::InnerAuthFail => "InnerAuthFail",
         }
     }
 }
