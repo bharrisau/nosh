@@ -85,7 +85,9 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
   2. `run_session`, `run_reattach_session`, `send_burst`, `run_channel_task`, and `run_scrollback_sender_task` are all generic over `NoshTransport` rather than `quinn::Connection`
   3. The Quinn concrete wrapper (`QuinnConnection` implementing `NoshTransport`) is a pure pass-through with no added logic
   4. `ChannelEvent::Stream` uses boxed trait streams (`Box<dyn NoshSendStream>`, `Box<dyn NoshRecvStream>`) so channel code is also transport-agnostic
-**Plans**: TBD
+**Plans**: 2 plans
+- [ ] 23-01-PLAN.md — nosh-proto transport traits (NoshTransport/NoshSendStream/NoshRecvStream) + write_message_ns/read_message_ns helpers
+- [ ] 23-02-PLAN.md — Quinn pass-through wrappers + server session pump made generic over the traits (boxed ChannelEvent::Stream); zero test changes
 
 ### Phase 24: WebTransport Endpoint + Mode A
 **Goal**: A nosh server can listen on UDP/443 as a WebTransport-over-HTTP/3 endpoint and carry a fully interactive shell session over it
@@ -176,7 +178,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 | 20. Repaint Pacing | 2/2 | Shipped | 2026-06-11 |
 | 21. Channel Multiplexing Foundation | 4/4 | Shipped | 2026-06-11 |
 | 22. Scrollback Sync | 5/5 | Shipped | 2026-06-12 |
-| 23. Transport Abstraction Seam | 0/? | Not started | - |
+| 23. Transport Abstraction Seam | 0/2 | Planned | - |
 | 24. WebTransport Endpoint + Mode A | 0/? | Not started | - |
 | 25. Inner SSH-Key Handshake + TOFU Prompt | 0/? | Not started | - |
 | 26. Migration Handover over WebTransport | 0/? | Not started | - |
