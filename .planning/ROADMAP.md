@@ -171,7 +171,10 @@ Plans:
   3. The client enforces a server-issued resize rate-limit, a `PtyData` receive cap, and channel-ID range validation
   4. `docs/SECURITY.md` exists and covers: assets and trust boundaries, attacker capabilities in internet-exposed deployment, the proxy trust model, the Mode A vs Mode B distinction, the mandatory-inner-auth rationale, and residual risks
 
-**Plans**: TBD
+**Plans**: 3 plans
+- [ ] 27-01-PLAN.md — SEC-05: re-verify the OSC-OOM bound + add the required CI regression gate
+- [ ] 27-02-PLAN.md — SEC-04: client trust-boundary hardening (title \r\n, clipboard whitelist, channel-ID/PtyData caps, OSC 8 scheme whitelist)
+- [ ] 27-03-PLAN.md — SEC-01: author docs/SECURITY.md STRIDE threat model (waved after SEC-04 code)
 
 ### Phase 28: Interactive UAT Clearing
 
