@@ -31,8 +31,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt as _; // needed: quinn SendStream flush/write_all
-#[allow(unused_imports)]
-use tokio::io::AsyncReadExt as _; // needed: quinn RecvStream read_exact (async_trait scope)
 use nosh_proto::transport_trait::{
     NoshTransport, NoshSendStream, NoshRecvStream, SendDatagramError,
 };
@@ -134,8 +132,9 @@ pub struct QuinnRecvStream(pub quinn::RecvStream);
 #[async_trait]
 impl NoshRecvStream for QuinnRecvStream {
     async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
-        // AsyncReadExt::read_exact — imported at module level as `AsyncReadExt as _`
-        Ok(self.0.read_exact(buf).await.map(|_| ())?)
+        // Calls quinn::RecvStream::read_exact (inherent method, not AsyncReadExt).
+        // Returns Result<(), ReadExactError>; the ? converts ReadExactError -> anyhow::Error.
+        Ok(self.0.read_exact(buf).await?)
     }
 
     async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<Option<usize>> {
