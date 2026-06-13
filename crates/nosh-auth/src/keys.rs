@@ -201,13 +201,20 @@ pub fn record_known_host(path: &Path, host: &str, key: &NoshPublicKey) -> anyhow
         }
     }
     let line = format!("{host} {}\n", key.to_openssh_line()?);
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
         .with_context(|| format!("open known_hosts {} for append", path.display()))?;
     f.write_all(line.as_bytes())
         .with_context(|| format!("append to known_hosts {}", path.display()))?;
+    f.flush().context("flush known_hosts")?;
+    f.sync_all().context("sync known_hosts")?;
     Ok(())
 }
 
