@@ -281,8 +281,7 @@ pub fn nosh_key_from_spki(spki: &[u8]) -> Option<NoshPublicKey> {
     if spki.len() != ED25519_SPKI_LEN {
         return None;
     }
-    let expected_prefix = ed25519_spki_der(&[0u8; 32]);
-    if spki[..12] != expected_prefix[..12] {
+    if spki[..12] != ED25519_SPKI_PREFIX {
         return None;
     }
     let mut key32 = [0u8; 32];
