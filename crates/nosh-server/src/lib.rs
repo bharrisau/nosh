@@ -9,4 +9,7 @@ pub mod server;
 pub mod session;
 pub mod terminal;
 
+#[cfg(feature = "webtransport")]
+pub mod wt_transport;
+
 pub use server::{build_server_config, make_endpoint, run_accept_loop};
