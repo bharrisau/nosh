@@ -66,7 +66,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 
 ### v1.4 M7 Remote Access over HTTP/3 + Security Hardening (Phases 23-28)
 
-- [ ] **Phase 23: Transport Abstraction Seam** — `NoshTransport`/`NoshSendStream`/`NoshRecvStream` traits; Quinn concrete wrappers; session pump made generic; all existing tests green with zero behavioural change
+- [x] **Phase 23: Transport Abstraction Seam** — `NoshTransport`/`NoshSendStream`/`NoshRecvStream` traits; Quinn concrete wrappers; session pump made generic; all existing tests green with zero behavioural change (completed 2026-06-13)
 - [ ] **Phase 24: WebTransport Endpoint + Mode A** — `wtransport` 0.7.1 integrated; server binds UDP/443 as a WebTransport-over-HTTP/3 listener; client connects; full shell session (datagrams, streams, channels) over the WebTransport pump; downgrade protection
 - [ ] **Phase 25: Inner SSH-Key Handshake + TOFU Prompt** — four-step mutual challenge-response (discriminants 18-21) with RFC 9266 tls-exporter channel binding; interactive blocking TOFU fingerprint prompt on first contact; inner auth gated before any `SessionOpen` or `Reattach`
 - [ ] **Phase 26: Migration Handover over WebTransport** — client detects WebTransport session loss, reconnects, re-runs inner auth, resumes via 1-RTT cold reattach with byte-exact replay; concurrent same-token reattach resolved atomically
@@ -87,7 +87,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
   4. `ChannelEvent::Stream` uses boxed trait streams (`Box<dyn NoshSendStream>`, `Box<dyn NoshRecvStream>`) so channel code is also transport-agnostic
 **Plans**: 2 plans
 - [x] 23-01-PLAN.md — nosh-proto transport traits (NoshTransport/NoshSendStream/NoshRecvStream) + write_message_ns/read_message_ns helpers
-- [ ] 23-02-PLAN.md — Quinn pass-through wrappers + server session pump made generic over the traits (boxed ChannelEvent::Stream); zero test changes
+- [x] 23-02-PLAN.md — Quinn pass-through wrappers + server session pump made generic over the traits (boxed ChannelEvent::Stream); zero test changes
 
 ### Phase 24: WebTransport Endpoint + Mode A
 **Goal**: A nosh server can listen on UDP/443 as a WebTransport-over-HTTP/3 endpoint and carry a fully interactive shell session over it
@@ -178,7 +178,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 | 20. Repaint Pacing | 2/2 | Shipped | 2026-06-11 |
 | 21. Channel Multiplexing Foundation | 4/4 | Shipped | 2026-06-11 |
 | 22. Scrollback Sync | 5/5 | Shipped | 2026-06-12 |
-| 23. Transport Abstraction Seam | 1/2 | In Progress|  |
+| 23. Transport Abstraction Seam | 2/2 | Complete   | 2026-06-13 |
 | 24. WebTransport Endpoint + Mode A | 0/? | Not started | - |
 | 25. Inner SSH-Key Handshake + TOFU Prompt | 0/? | Not started | - |
 | 26. Migration Handover over WebTransport | 0/? | Not started | - |
