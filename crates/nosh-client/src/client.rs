@@ -81,6 +81,12 @@ impl ClientIdentity {
             signer: Arc::new(signer),
         })
     }
+
+    /// Return a clone of the inner signer so the WebTransport inner-auth path
+    /// can sign the EKM-bound transcript (Phase 25, D-07).
+    pub fn signer(&self) -> Arc<dyn RawEd25519Signer> {
+        Arc::clone(&self.signer)
+    }
 }
 
 #[cfg(unix)]

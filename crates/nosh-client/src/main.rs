@@ -1373,9 +1373,64 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
+            // ── Inner SSH-key auth on the control stream (Phase 25, D-02) ─────
+            // run_inner_auth_client opens the ONE control stream (the server
+            // accept_bi-es this same stream), performs mutual auth, and returns
+            // the authenticated pair. A host-key mismatch or TOFU decline is a
+            // FATAL error — do not reconnect (same treatment as native-QUIC
+            // host-key mismatch, BUG-A). A transport error is transient — backoff.
+            let (ctrl_send, ctrl_recv) = match nosh_client::inner_auth::run_inner_auth_client(
+                &*conn,
+                &known_hosts,
+                &args.host,
+                identity.signer(),
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Determine if the error is fatal (host-key mismatch or TOFU decline).
+                    // Use the same is_fatal_connect_error classifier; additionally check
+                    // for inner-auth-specific fatal markers.
+                    let fatal = is_fatal_connect_error(&e) || {
+                        let msg = format!("{e:#}").to_ascii_lowercase();
+                        msg.contains("host key mismatch")
+                            || msg.contains("inner auth: host key")
+                            || msg.contains("inner auth: ekm mismatch")
+                            || msg.contains("not accepted")
+                    };
+                    if fatal {
+                        tracing::error!("fatal inner auth error (not retrying): {e:#}");
+                        eprintln!("\r\nnosh: connection aborted — {e:#}\r");
+                        eprintln!(
+                            "\r\nnosh: this is a permanent failure (host-key mismatch, \
+                             TOFU declined, or EKM binding failure); not reconnecting.\r"
+                        );
+                        conn.close(1, b"inner-auth-failed");
+                        exit_code = 1;
+                        break;
+                    }
+                    tracing::warn!("webtransport inner auth failed (transient): {e}");
+                    eprintln!("\r\nnosh: reconnecting…\r");
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = quit_during_backoff(&mut stdin_quit) => {
+                            eprintln!("\r\nnosh: quit\r");
+                            break;
+                        }
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                    continue;
+                }
+            };
+
+            // Inner auth succeeded — ctrl_send/ctrl_recv are the authenticated
+            // control stream. Use them for session dispatch (no second open_bi).
             let pump_outcome = if let Some(tok) = token {
-                let reattach_result = reattach_session(
+                let reattach_result = reattach_session_on_stream(
                     &*conn,
+                    ctrl_send,
+                    ctrl_recv,
                     tok,
                     highest_applied,
                     &mut highest_applied,
@@ -1387,8 +1442,10 @@ async fn main() -> anyhow::Result<()> {
                 .await;
                 reattach_result.unwrap_or(PumpOutcome::TransportDrop)
             } else {
-                let fresh_result = fresh_session(
+                let fresh_result = fresh_session_on_stream(
                     &*conn,
+                    ctrl_send,
+                    ctrl_recv,
                     term.clone(),
                     cols,
                     rows,
@@ -1622,6 +1679,122 @@ async fn reattach_session(
             *highest_applied = replaying_from_seq;
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
             run_pump(conn, cols, rows, &mut *send, &mut *recv, highest_applied, resize, *highest_applied, predict_mode, status).await
+        }
+    }
+}
+
+/// Run a fresh session over a PRE-AUTHENTICATED control stream (WebTransport path).
+///
+/// The `ctrl_send`/`ctrl_recv` pair is the authenticated stream returned by
+/// `run_inner_auth_client`. Sends `SessionOpen` on it, reads `SessionOpened`,
+/// then runs the pump. Does NOT call `conn.open_bi()` — the server has already
+/// accepted exactly one stream (the inner-auth control stream) and expects all
+/// session messages on that same stream (D-05 state machine).
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "webtransport")]
+async fn fresh_session_on_stream(
+    conn: &dyn NoshTransport,
+    mut ctrl_send: Box<dyn NoshSendStream>,
+    mut ctrl_recv: Box<dyn NoshRecvStream>,
+    term: String,
+    cols: u16,
+    rows: u16,
+    highest_applied: &mut u64,
+    resize: &mut platform::ResizeWatcher,
+    token_out: &mut Option<[u8; 16]>,
+    predict_mode: PredictDisplayMode,
+    status: bool,
+) -> anyhow::Result<PumpOutcome> {
+    // Send SessionOpen on the authenticated stream.
+    nosh_proto::write_message_ns(
+        &mut *ctrl_send,
+        &nosh_proto::Message::SessionOpen {
+            term,
+            cols,
+            rows,
+            env: client::collect_client_env(),
+        },
+    )
+    .await
+    .context("send SessionOpen on authenticated WT stream")?;
+
+    // Read SessionOpened to get the token.
+    let tok = match nosh_proto::read_message_ns(&mut *ctrl_recv).await {
+        Ok(nosh_proto::Message::SessionOpened { token }) => token,
+        Ok(other) => anyhow::bail!(
+            "expected SessionOpened, got {}",
+            other.variant_name()
+        ),
+        Err(e) => anyhow::bail!("failed to read SessionOpened: {e}"),
+    };
+    *token_out = Some(tok);
+    *highest_applied = 0;
+
+    run_pump(
+        conn,
+        cols,
+        rows,
+        &mut *ctrl_send,
+        &mut *ctrl_recv,
+        highest_applied,
+        resize,
+        0,
+        predict_mode,
+        status,
+    )
+    .await
+}
+
+/// Run a reattach session over a PRE-AUTHENTICATED control stream (WebTransport path).
+///
+/// Sends `Reattach` on the authenticated stream, reads the reply, then runs the pump.
+/// Does NOT call `conn.open_bi()` — same rationale as `fresh_session_on_stream`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "webtransport")]
+async fn reattach_session_on_stream(
+    conn: &dyn NoshTransport,
+    mut ctrl_send: Box<dyn NoshSendStream>,
+    mut ctrl_recv: Box<dyn NoshRecvStream>,
+    token: [u8; 16],
+    last_acked_seq: u64,
+    highest_applied: &mut u64,
+    resize: &mut platform::ResizeWatcher,
+    token_out: &mut Option<[u8; 16]>,
+    predict_mode: PredictDisplayMode,
+    status: bool,
+) -> anyhow::Result<PumpOutcome> {
+    client::send_reattach(&mut *ctrl_send, token, last_acked_seq).await?;
+
+    match client::await_reattach_reply(&mut *ctrl_recv).await? {
+        ReattachOutcome::Err => {
+            *token_out = None;
+            eprintln!("\r\nnosh: session ended\r");
+            Ok(PumpOutcome::CleanExit(1))
+        }
+        ReattachOutcome::Ok {
+            new_token,
+            replaying_from_seq,
+            truncated,
+        } => {
+            *token_out = Some(new_token);
+            if truncated {
+                eprintln!("\r\nnosh: output truncated\r");
+            }
+            *highest_applied = replaying_from_seq;
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            run_pump(
+                conn,
+                cols,
+                rows,
+                &mut *ctrl_send,
+                &mut *ctrl_recv,
+                highest_applied,
+                resize,
+                *highest_applied,
+                predict_mode,
+                status,
+            )
+            .await
         }
     }
 }
