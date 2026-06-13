@@ -29,7 +29,10 @@ pub mod verifier;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use keys::{load_authorized_keys, load_host_key, nosh_key_from_spki, NoshPublicKey, ED25519_SPKI_LEN};
+pub use keys::{
+    check_authorized_key, load_authorized_keys, load_host_key, nosh_key_from_spki,
+    verify_ed25519_spki, NoshPublicKey, ED25519_SPKI_LEN,
+};
 
 // AgentSigner is only available on Unix (ssh-agent uses Unix domain sockets).
 // The dep (ssh-agent-client-rs) is under [target.'cfg(unix)'.dependencies].

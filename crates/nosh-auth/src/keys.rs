@@ -211,6 +211,56 @@ pub fn record_known_host(path: &Path, host: &str, key: &NoshPublicKey) -> anyhow
     Ok(())
 }
 
+/// Check whether `key` appears in the `authorized` slice.
+///
+/// Pure function reusable by both the TLS verifier and the inner SSH-key
+/// handshake (Phase 25, D-07). The inner-auth server calls this after parsing
+/// `client_spki` from the `InnerAuthResponse` to gate session access (D-05
+/// state machine gate). The same logic is inlined in
+/// [`AuthorizedKeysVerifier::verify_client_cert`] — this helper avoids the
+/// duplication.
+pub fn check_authorized_key(key: &NoshPublicKey, authorized: &[NoshPublicKey]) -> bool {
+    authorized.contains(key)
+}
+
+/// Verify a raw 64-byte Ed25519 signature over `msg` using the key represented
+/// by the 44-byte `spki` (SubjectPublicKeyInfo DER).
+///
+/// Returns `true` iff the SPKI is valid, parses to an Ed25519 key, and the
+/// signature is a genuine Ed25519 signature over `msg` by that key.
+/// Returns `false` for any of:
+/// - Malformed SPKI (wrong length, wrong OID prefix).
+/// - Signature that was made with a different key.
+/// - Tampered message (signature valid for original bytes, not these).
+///
+/// This helper encapsulates `ed25519-dalek` so that consuming crates
+/// (`nosh-server`, `nosh-client`) need no direct `ed25519-dalek` dependency
+/// (D-07 / Phase 25 Open Question 3). The `sig` parameter accepts a `&[u8; 64]`
+/// to make the 64-byte requirement explicit at compile time for callers that
+/// hold a fixed-size array; callers with a `Vec<u8>` must validate the length
+/// before calling (e.g. `sig.try_into().ok()` or a length check).
+pub fn verify_ed25519_spki(spki: &[u8], msg: &[u8], sig: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    // Parse the SPKI via the existing validated extractor.
+    let key = match nosh_key_from_spki(spki) {
+        Some(k) => k,
+        None => return false,
+    };
+
+    // Build a VerifyingKey from the raw 32-byte key material.
+    let vk = match VerifyingKey::from_bytes(key.key32()) {
+        Ok(vk) => vk,
+        Err(_) => return false,
+    };
+
+    // Build a Signature from the 64-byte raw bytes.
+    let signature = Signature::from_bytes(sig);
+
+    // Verify: returns true only on a genuine signature.
+    vk.verify(msg, &signature).is_ok()
+}
+
 /// Parse a `NoshPublicKey` from a 44-byte Ed25519 `SubjectPublicKeyInfo` DER.
 ///
 /// Returns `None` for any non-Ed25519 or malformed SPKI — the caller must
