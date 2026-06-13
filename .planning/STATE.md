@@ -4,12 +4,12 @@ milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
 status: executing
 stopped_at: Phase 25 wave-2 (25-02 server + 25-03 client) merged to main; quick-fix 260614-47b restored the integration-test gate to green. HEAD = 54a1d4b.
-last_updated: "2026-06-13T19:47:43.966Z"
-last_activity: 2026-06-13
+last_updated: "2026-06-13T20:12:23.367Z"
+last_activity: 2026-06-13 -- Phase 26 planning complete
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 11
+  total_plans: 13
   completed_plans: 11
   percent: 50
 ---
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 Phase: 26
 Plan: Not started
 Status: Executing Phase 25 — wave-2 merged, post-merge gate green
-Last activity: 2026-06-13
+Last activity: 2026-06-13 -- Phase 26 planning complete
 
 ```
 Progress: [██████████] 100%
