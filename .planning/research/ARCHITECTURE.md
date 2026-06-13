@@ -1,280 +1,520 @@
-# Architecture: nosh v1.3 (M5) Integration
+# Architecture: nosh v1.4 (M7) WebTransport + Security Hardening Integration
 
-**Domain:** Integration research for channel multiplexing, scrollback, alt-screen, and repaint pacing into an existing QUIC remote shell
-**Researched:** 2026-06-07
-**Confidence:** HIGH — based on reading actual source files, not assumptions
+**Domain:** Integration research for WebTransport reverse-proxy mode and inner SSH-key auth into an existing QUIC remote shell
+**Researched:** 2026-06-13
+**Confidence:** HIGH — based on reading actual source files and verified wtransport 0.7.x API documentation
 
 ---
 
 ## Summary
 
-v1.3 adds four features to a working system. The integration difficulty varies greatly: repaint pacing and alt-screen are well-contained server-side changes; scrollback is a new feature built on top of the existing mux layer; channel multiplexing is the only greenfield foundational piece and its transport decision has meaningful knock-on effects.
+v1.4 adds WebTransport-over-HTTP/3 reverse-proxy support, an inner application-level SSH-key handshake, migration handover behind a QUIC-terminating proxy, and deferred security hardening items. The existing architecture is sound and the new features slot in at a well-defined seam.
 
-The existing architecture has one load-bearing invariant that governs nearly every decision below: **the single reliable bidirectional QUIC stream carries all sequenced output** (`PtyData` frames in `SequencedOutputBuffer`) and these are replayed verbatim on cold reattach. Any new reliable channel that also needs replay must either be folded into this buffer or have its own replay mechanism. Datagrams (`StateDiff`) are ephemeral and carry no replay obligation.
+The critical finding is that **no transport trait currently exists in the codebase** — all transport-facing code uses `quinn::Connection`, `quinn::SendStream`, `quinn::RecvStream`, and `quinn::Incoming` by concrete type. Introducing a transport abstraction trait is the first load-bearing step: it lets `run_session`, `run_reattach_session`, `send_burst`, the channel task API (`ChannelEvent`), and the client session pump run identically over either transport mode without duplication.
 
----
-
-## Integration Map
-
-| Feature | Files Touched | New vs Modified | Primary Concern |
-|---------|--------------|-----------------|-----------------|
-| Channel mux — proto | `crates/nosh-proto/src/messages.rs` | Modified (new variants appended) | Discriminant ordering invariant |
-| Channel mux — server | `crates/nosh-server/src/server.rs` | Modified (new `select!` arms, new stream accept loop) | Interaction with `run_session` / `run_reattach_session` pump |
-| Channel mux — client | `crates/nosh-client/src/client.rs` | Modified (open control channel, accept mux channels) | Reattach path must re-open channels |
-| Scrollback transport | `crates/nosh-proto/src/messages.rs` | Modified (new variants: `ScrollbackRequest`, `ScrollbackPage`) | Discriminant ordering |
-| Scrollback server | `crates/nosh-server/src/terminal.rs` | Modified (`scrollback` field already exists; add page-query method) | `alt_screen` gate; buffer ownership during reattach |
-| Scrollback server | `crates/nosh-server/src/server.rs` | Modified (handle scrollback request messages in pump) | Routing through mux layer |
-| Scrollback client | `crates/nosh-client/src/client.rs` | Modified (scrollback UI + paging request) | New display mode distinct from confirmed grid |
-| Alt-screen buffer | `crates/nosh-server/src/terminal.rs` | Modified (`TerminalState`: new `alt_grid`, `saved_cursor`; real `?1049h`/`?1049l` handler) | `build_state_diff` must read correct active grid; epoch reset on switch |
-| Alt-screen client | `crates/nosh-client/src/screen.rs` | Possibly modified (full clear on alt-screen enter/exit, emit_connect_clear pattern) | Physical grid reset on buffer switch |
-| Repaint pacing | `crates/nosh-server/src/server.rs` | Modified (burst loop in `diff_interval` arm) | Both documented traps; must not touch `build_state_diff` internals |
-| Repaint pacing | `crates/nosh-proto/src/datagram.rs` | No change (encode/decode path is unchanged) | None |
+The second critical finding: `wtransport` 0.7.x exposes `with_custom_tls(TlsServerConfig / TlsClientConfig)` on its builder, which means **nosh's existing `rustls::ServerConfig` and `rustls::ClientConfig` constructions from `nosh-auth` can be reused verbatim** for the outer TLS layer. The outer TLS cert is still the host key / client key self-signed cert — but now the QUIC-terminating proxy will terminate it, so the outer TLS auth provides transport security only. The inner SSH-key handshake (a new application-level protocol on the first control stream) is what provides real mutual authentication end-to-end.
 
 ---
 
-## Decision: Channel Transport — New Quinn Streams vs In-Stream Framing
+## Existing Architecture (Seams to Reuse)
 
-**Recommendation: new quinn streams, opened after an OPEN/ACCEPT/REJECT handshake on a reserved control stream (channel id 0).**
-
-### Rationale
-
-Quinn already gives logical multiplexing: `conn.open_bi()` / `conn.accept_bi()` open independent reliable streams. Each stream has its own flow-control window, its own head-of-line blocking domain, and QUIC-level framing. Using a separate stream for scrollback means a scrollback page transfer cannot delay keystrokes (they are on the primary stream) and vice versa.
-
-The alternative — application-level framing inside the existing single stream — would require multiplexing logic on top of quinn's reliable ordering. Today the single stream carries `PtyData`/`Resize`/`Ack`/`TerminalControl` frames interleaved. Adding a scrollback channel to that same stream means a scrollback page response can sit in front of a `PtyData` keystroke response in the reliable send queue, reintroducing HOL blocking at the application level even though QUIC avoids it at the transport level. Worse, the existing `SequencedOutputBuffer` replay mechanism on reattach only replays `PtyData` chunks (seq-numbered). Interleaving scrollback frames inside the same stream would require the replay logic to understand and skip non-`PtyData` frames, or every frame type becomes part of the replay transcript. That is architecturally messy and fragile.
-
-### The Control Channel Pattern (borrowed from quicshell)
-
-Reserve stream pair 0 as the control channel. Before either side opens a secondary stream, it sends `ChannelOpen { channel_type: ScrollbackSync, channel_id: u32 }` on the control stream and waits for `ChannelAccept { channel_id }` or `ChannelReject { channel_id, reason: String }`. This prevents either side from silently opening streams the peer does not understand. The control channel is always the first stream opened by the client after auth (the current bidi stream), so backwards compatibility is automatic: the server side continues reading `SessionOpen` or `Reattach` as the first frame on stream 0; the protocol version signals whether additional streams are expected. For v1.3, no negotiation is needed — both sides know M5 is in play.
-
-### Reattach and Migration Impact
-
-Cold reattach (`run_reattach_session`) replays buffered `PtyData` from `SequencedOutputBuffer` on the primary stream. Secondary streams (scrollback) are stateless request/response — there is nothing to replay. The client simply re-opens the scrollback channel after reattach completes (`ResumeComplete` gate). This is clean: new streams can be opened on the re-used QUIC connection at any time, and migration preserves all open streams at the transport layer automatically (QUIC connection migration carries all streams). Secondary streams do not need their own reattach token or replay buffer.
-
-### Flow Control
-
-Each quinn stream has QUIC-level flow control independently. Scrollback pages (potentially large) consume only the scrollback stream's flow-control window, not the primary stream's. The primary stream's send-side backpressure is unaffected. Per-channel application-level flow control (as mentioned in the M5 brief) can be added on top: a `ScrollbackCredit { bytes }` message lets the server pace page sends without saturating the stream's QUIC window. For v1.3, QUIC's built-in stream flow control is sufficient; per-channel app-level windows are an M5+ extension.
-
----
-
-## Scrollback Architecture
-
-### Storage
-
-`TerminalState.scrollback` (a `VecDeque<Vec<Cell>>`, capped at `SCROLLBACK_LINE_CAP = 10_000` lines) already exists and is populated by `scroll_up()` whenever the viewport scrolls. No new storage field is needed.
-
-**Critical gate:** Scrollback is only meaningful on the primary screen. When `echo_state.alt_screen == true`, scrollback accumulation is suppressed (alt-screen applications like vim do not scroll the primary scrollback). The `scroll_up()` method must check `self.echo_state.alt_screen` and skip the `scrollback.push_back` when true. This is a one-line guard.
-
-### Wire Protocol
-
-Two new `Message` variants appended after the current last variant (`TerminalControl`, discriminant 10):
+### Workspace layout
 
 ```
-ScrollbackRequest { from_line: u64, max_lines: u16 }   // client → server
-ScrollbackPage    { from_line: u64, lines: Vec<Vec<DiffRun>> }  // server → client
+crates/
+  nosh-proto/          (wire types, codec, datagram, ALPN)
+    src/messages.rs    (Message enum — append-only, postcard-stable discriminants)
+    src/datagram.rs    (StateDiff, encode_datagram, decode_epoch_ack)
+    src/codec.rs       (length-delimited postcard framing)
+    src/transport.rs   (quinn TransportConfig builder — shared by both ends)
+  nosh-auth/           (SSH-key verifiers, signer, SPKI pinning, cert mint)
+    src/verifier.rs    (HostKeyVerifier, AuthorizedKeysVerifier — custom rustls traits)
+    src/signer.rs      (RawEd25519Signer, AgentSigner, AgentSigningKey)
+    src/keys.rs        (NoshPublicKey, SPKI extraction, known_hosts, authorized_keys)
+  nosh-server/
+    src/server.rs      (build_server_config, run_accept_loop, handle_connection,
+                        run_session, run_reattach_session, build_state_diff, send_burst)
+    src/channel.rs     (ChannelEvent, run_channel_task, run_scrollback_sender_task)
+    src/registry.rs    (SequencedOutputBuffer, SessionRegistry, SessionSlot)
+    src/session.rs     (Session, env sanitization, PTY spawn)
+    src/terminal.rs    (TerminalState, scrollback, alt-screen model)
+  nosh-client/
+    src/client.rs      (build_client_config, connect, ClientIdentity)
+    src/channel.rs     (client-side channel open/accept logic)
+    src/screen.rs      (ClientScreen, apply, emit_diff)
+    src/predictor.rs   (PredictionOverlay, epoch tracking)
 ```
 
-`from_line` is a 0-based line index into the server's scrollback buffer (line 0 = oldest retained). `max_lines` caps the page size. The server sends as many lines as it has from `from_line` onward, up to `max_lines`. Empty response signals end-of-history.
+### What every session currently uses (concrete types, no trait)
 
-These travel on the dedicated scrollback reliable stream (not the primary stream), so they never enter `SequencedOutputBuffer` and never participate in reattach replay.
+```
+quinn::Connection     → send_datagram, datagram_send_buffer_space, accept_bi, open_bi,
+                        max_datagram_size, remote_address, close, handshake_data
+quinn::SendStream     → write_message (via nosh_proto::codec::write_message)
+quinn::RecvStream     → read_message (via nosh_proto::codec::read_message)
+quinn::Incoming       → incoming.await (resolves the TLS handshake)
+channel::ChannelEvent → Stream(quinn::SendStream, quinn::RecvStream)
+```
 
-### Relationship to `SequencedOutputBuffer`
+`ChannelEvent::Stream` carries concrete quinn stream types. `run_channel_task` and `run_scrollback_sender_task` also use quinn stream types directly. This is the entire surface area that must be abstracted.
 
-Scrollback is entirely decoupled from `SequencedOutputBuffer`. The output buffer tracks raw PTY bytes for replay; the scrollback is a decoded cell grid derived from those bytes by `TerminalState`. The two are consistent by construction (both fed from `push_output_and_parse`). On cold reattach, replaying `PtyData` chunks re-drives `TerminalState.advance()`, rebuilding the scrollback model — the scrollback channel simply queries whatever the model holds after replay completes.
+### The reattach machinery (unchanged by this milestone)
 
-### Client Rendering
+`SequencedOutputBuffer` in `registry.rs` is a sequenced ring buffer of raw PTY bytes. On cold reattach, `run_reattach_session` replays buffered chunks from the buffer over the primary stream. The buffer is keyed by SSH identity (`NoshPublicKey`) and session ID. This is fully transport-agnostic: it does not care whether the underlying connection is native QUIC or WebTransport, as long as it has a reliable bidi stream to write on.
 
-Scrollback is a separate display mode from the live grid. When the user scrolls up, the client suspends datagram rendering to the terminal (or renders into a scrollback-viewport mode), sends `ScrollbackRequest` on the scrollback stream, and renders received `ScrollbackPage` content above the confirmed grid. On any new keystroke or scroll-down, the client returns to live rendering and resumes datagram application. The `ClientScreen.confirmed` grid and `PredictionOverlay` are untouched during scrollback viewing.
+### The channel mux layer (the migration-handover hook)
+
+After cold reattach completes (server sends `ResumeComplete`, replays PTY data, client acknowledges the sequence catch-up), the client re-opens secondary channels (`ChannelOpen` on the control stream, then a new QUIC bidi stream prefixed with a channel-id varint). This re-open path is the **migration-handover hook** for the proxy topology: after a new WebTransport session is established and the inner re-auth completes, the client re-opens channels exactly as it does after a cold reattach. No new protocol is needed.
 
 ---
 
-## Alternate-Screen Buffer in the Terminal Model
+## New Components and Where They Slot In
 
-### Where the Real Buffer Pair Lives
+### 1. Transport abstraction trait (NEW — nosh-proto or nosh-server)
 
-`TerminalState` in `crates/nosh-server/src/terminal.rs` currently has a single `grid: Vec<Vec<Cell>>` for the viewport. The `echo_state.alt_screen` flag is set by `?1049h`/`?1049l` but the grid is unchanged (line 504, `self.echo_state.alt_screen = enable`).
-
-The fix adds two new fields to `TerminalState`:
+There is no transport trait today. Introducing one is the prerequisite for everything else. The trait must expose the operations that `run_session`, `run_reattach_session`, `build_state_diff`, `send_burst`, and the channel layer actually use.
 
 ```rust
-alt_grid: Vec<Vec<Cell>>,       // the alternate-screen grid
-saved_cursor: CursorPos,        // cursor saved on ?1049h entry (Xterm behavior)
-```
+// Proposed location: crates/nosh-proto/src/transport_trait.rs
+// (re-exported from nosh-proto since both server and client need it)
 
-`grid` remains the **active viewport** — `viewport_rows()`, `compute_diff_runs`, and `build_state_diff` all read `grid` without change. Buffer switching swaps the contents:
+pub trait NoshTransport: Send + Sync + 'static {
+    /// Send an unreliable datagram. Non-blocking (mirrors quinn::Connection::send_datagram).
+    fn send_datagram(&self, data: bytes::Bytes) -> Result<(), SendDatagramError>;
+    /// How many bytes are available in the datagram send buffer.
+    fn datagram_send_buffer_space(&self) -> usize;
+    /// Maximum datagram payload size on the current path.
+    fn max_datagram_size(&self) -> usize;
+    /// Accept the next inbound bidirectional stream.
+    async fn accept_bi(&self) -> Result<(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>), TransportError>;
+    /// Open a new outbound bidirectional stream.
+    async fn open_bi(&self) -> Result<(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>), TransportError>;
+    /// Peer socket address (for logging / rate limiting).
+    fn remote_address(&self) -> std::net::SocketAddr;
+    /// Close the connection with an error code and reason bytes.
+    fn close(&self, code: u32, reason: &[u8]);
+    /// Wait until the connection is fully closed.
+    async fn closed(&self) -> TransportError;
+}
 
-- `?1049h` (enter alt): save `cursor` → `saved_cursor`; swap `grid` ↔ `alt_grid`; clear the new active grid (the alt buffer starts blank per xterm semantics); set `echo_state.alt_screen = true`.
-- `?1049l` (leave alt): swap `grid` ↔ `alt_grid`; restore `cursor ← saved_cursor`; set `echo_state.alt_screen = false`.
+pub trait NoshSendStream: Send + 'static {
+    async fn write_all(&mut self, data: &[u8]) -> anyhow::Result<()>;
+    async fn finish(&mut self) -> anyhow::Result<()>;
+}
 
-The `alt_grid` is the same `Vec<Vec<Cell>>` shape as `grid`, initialized identically in `TerminalState::new()`.
-
-### Resize Interaction
-
-`resize()` must resize **both** `grid` and `alt_grid`. Currently it only touches `grid`. The alt buffer must track the same dimensions or a switch after a resize will restore a stale-sized grid.
-
-### Interaction with `build_state_diff` and Epoch Reset
-
-`build_state_diff` snapshots `slot.with_terminal_state(|ts| ts.viewport_rows()...)`. Because `viewport_rows()` always reads `self.grid` (the active buffer), switching between primary and alt automatically delivers the correct content — no changes to `build_state_diff` are needed.
-
-However, the client's confirmed grid must be completely reset on a buffer switch, because the client's `confirmed` grid holds the previous buffer's content. The mechanism: increment `current_epoch` on the tick immediately after a buffer switch and include a `StateDiff` with full-screen content (empty `last_acked_snapshot` baseline is sufficient — the first diff after reattach already does this). To signal a buffer switch to the client without a new message type, the server can rely on the diff converging: the full `alt_grid` content arrives within a few datagram ticks after the switch, and `ClientScreen.apply()` merges it correctly.
-
-For the predictor: a buffer switch is semantically equivalent to Enter/Ctrl-C — it resets the echo epoch. The server's `build_state_diff` will see a totally different grid, the client's `confirmed` will converge to it, and the predictor's pending queue will mismatch and reset via `cull()`. No explicit epoch-reset signal is needed; the state-diff self-correction handles it.
-
-**One exception:** the `PredictionOverlay` must detect when `confirmed` changes dramatically (large mismatch on `cull()`) and call `reset()` quickly. This already happens — `cull()` calls `reset()` on any mismatch. The predictor will naturally suppress echoes until the alt-grid state stabilises.
-
-### Client Physical Grid Reset
-
-When the client receives a diff whose content differs significantly from `physical` (e.g. vim startup clearing the screen), `emit_diff` will emit the minimum needed ANSI to catch up. For a buffer switch, this typically means a full-screen repaint within one or two datagram ticks. The `emit_connect_clear` mechanism (writing `\x1b[2J\x1b[H`) is the sanctioned way to get a known-clean terminal state; that can be called at alt-screen-exit if the client detects a full-screen transition. However this requires the client to know a buffer switch occurred, which today it does not. A simpler approach: the diff convergence within 1-2 RTTs is acceptable for M5; explicit alt-screen notification can be a follow-on if the repaint seam is visible.
-
----
-
-## Repaint Pacing — Designing Out the Two Known Traps
-
-### Background
-
-Currently `server.rs` emits at most one `StateDiff` datagram per 16 ms tick in the `diff_interval` arm. A full 80×24 screen (~13 MTUs) takes ~200 ms × RTT to converge. The fix is to burst multiple datagrams per tick until the pending-deferred queue drains or the QUIC send buffer is exhausted.
-
-The 999.4 revert proved two failure modes that must be designed in, not discovered at runtime.
-
-### Trap 1: Infinite Spin from Recomputing `fresh_runs`
-
-**Root cause (confirmed by reading `build_state_diff`):** `fresh_runs` is computed by `compute_diff_runs(&cells, last_acked_snapshot)` inside `build_state_diff`. During a burst loop, `last_acked_snapshot` does NOT advance (epoch acks are processed in the separate `datagram` arm of the outer `select!`, which does not run while the `diff_interval` arm is executing synchronously). Each burst iteration therefore recomputes an identical `fresh_runs` from the same baseline, repopulates `pending_deferred`, and the loop never drains.
-
-**Architecture that avoids it:** Do not call `build_state_diff` more than once per tick for the same screen state. Instead, restructure the burst as a drain loop *inside* the `diff_interval` arm that only calls `encode_datagram` repeatedly on the already-computed `all_runs` from the single `build_state_diff` call:
-
-```
-diff_interval arm:
-  1. Call build_state_diff ONCE → get (first_payload, deferred, epoch, sent_cells).
-  2. Send first_payload.
-  3. While deferred is non-empty AND datagram_send_buffer_space() > cap:
-       a. Call encode_datagram(&StateDiff { epoch, runs: deferred, ... }, cap)
-          → (next_payload, next_deferred)
-       b. Send next_payload.
-       c. deferred = next_deferred.
-  4. pending_deferred = deferred (carry remainder to next tick).
-```
-
-`fresh_runs` is computed exactly once per tick regardless of burst depth. The burst drains `deferred` only — it does not re-diff against `last_acked_snapshot`. This is correct: `deferred` already contains the runs that did not fit, sorted cursor-first by the prior `encode_datagram` call. Re-sorting is not needed because deferred runs are already in priority order.
-
-**Epoch on burst datagrams:** All burst datagrams within a single tick share the SAME epoch — the one incremented at the top of `build_state_diff` on that tick. The client's `apply()` uses monotonic epoch (`diff.epoch <= last_applied_epoch` discards older diffs). With all burst datagrams sharing the same epoch, only the first one per tick advances `last_applied_epoch`; subsequent ones in the burst are still applied because `apply()` checks `<=` (strictly less than or equal), not `<`. Wait — actually `apply()` at line 213 reads `if diff.epoch <= self.last_applied_epoch { return; }` which means equal epoch is DISCARDED. This means burst datagrams sharing an epoch would be silently dropped after the first one.
-
-The correct fix: encode each burst datagram with a **distinct epoch** — epoch, epoch+1, epoch+2, ... within the burst — but all computed from the same `cells` snapshot (no re-diff). Increment `current_epoch` once per burst datagram, not once per tick. BUT this re-introduces the noecho-epoch trap (Trap 2 below). The resolution is in Trap 2.
-
-Alternatively: do not reuse `build_state_diff` for burst datagrams at all. After the first `build_state_diff` call gives `(payload, deferred, epoch, sent_cells)`, the burst sends the deferred chunks using `encode_datagram` directly with `epoch + burst_index`. The burst loop only calls `encode_datagram`, not `build_state_diff`.
-
-### Trap 2: Noecho-Epoch Security Interaction
-
-**Root cause:** The 999.4 implementation incremented `current_epoch` once per burst datagram. The client's `cull()` in `PredictionOverlay` uses `confirmed_epoch` (advanced by the predictor when a non-trivial correct prediction lands). The predictor's `cull()` is driven by `screen.last_applied_epoch()`. If burst datagrams each carry a different epoch, the client applies them in order and `last_applied_epoch` advances rapidly. During a `read -s` window, `confirmed_epoch` should NOT advance (the server doesn't echo typed chars, so the predictor's `cull()` finds mismatches and stays reset). But `last_applied_epoch` advancing from the rapidly arriving burst datagrams means the predictor sees `epoch > epoch_required` for predictions it made at the old epoch — and `cull()` evaluates them as IncorrectOrExpired (the server confirmed a different cell content). This causes `confirmed_epoch` to advance via `CorrectNoCredit` paths even during noecho, breaking `noecho_read_dash_s_zero_predicted_chars`.
-
-**Architecture that avoids it — ONE epoch per tick:**
-
-All burst datagrams within a single tick share the SAME epoch value. This requires changing the client's `apply()` monotonic guard from `<=` to `<`:
-
-```rust
-// In ClientScreen::apply():
-if diff.epoch < self.last_applied_epoch {  // changed from <=
-    return;
+pub trait NoshRecvStream: Send + 'static {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()>;
+    async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<usize>;
 }
 ```
 
-With `<` instead of `<=`, burst datagrams sharing an epoch are all applied (each arriving burst datagram applies its `runs` patch to the confirmed grid). The `last_applied_epoch` is set to the shared epoch once (after the first burst datagram applies), and subsequent same-epoch datagrams still pass the guard and apply their runs. The `physical` grid is updated incrementally by `render_to_stdout` calls interleaved with burst arrivals (since datagrams are processed in the `read_datagram` arm of the client's `select!` loop, not synchronously with server sends).
+`quinn::Connection` implements `NoshTransport`. `wtransport::Connection` implements `NoshTransport` (using its `send_datagram`, `receive_datagram`, `accept_bi`, `open_bi` methods — the API is a near-1:1 match). `quinn::SendStream`/`RecvStream` and `wtransport::SendStream`/`RecvStream` both implement `NoshSendStream`/`NoshRecvStream` via thin wrappers.
 
-This preserves the noecho invariant: during a `read -s` window, the epoch increments once per tick (not per burst datagram), and the predictor's `confirmed_epoch` path through `cull()` is unchanged — it still evaluates char predictions against the confirmed grid content, and if server echoes nothing, `confirmed_epoch` stays frozen.
+`nosh_proto::codec::write_message` and `read_message` are already generic over `AsyncWrite` and `AsyncRead` respectively — they need to accept `Box<dyn NoshSendStream>` / `Box<dyn NoshRecvStream>` wrappers, or the trait can simply expose `write_message`/`read_message` at the stream level directly.
 
-**Mandatory test:** `noecho_read_dash_s_zero_predicted_chars` in `crates/nosh-client/tests/predict.rs` must pass without modification. The `<` guard change in `apply()` must be tested for correctness: same-epoch burst datagrams must all apply their runs.
+`ChannelEvent::Stream` must be updated from `(quinn::SendStream, quinn::RecvStream)` to `(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>)` — or defined as generic `<S: NoshSendStream, R: NoshRecvStream>`. Both `run_channel_task` and `run_scrollback_sender_task` then become generic over the stream types.
 
-### Budget Gate: `datagram_send_buffer_space()`
+**What does NOT change:** The codec (postcard-framed `Message` enum), the datagram wire format (`StateDiff`, `encode_datagram`, `decode_datagram`), `SequencedOutputBuffer`, `SessionRegistry`, `TerminalState`, `PredictionOverlay`, or any terminal/session logic. The transport trait wraps the connection and stream I/O layer only.
 
-`quinn::Connection::datagram_send_buffer_space()` (confirmed public on quinn 0.11.9) returns the number of bytes available in the datagram send buffer (1 MiB default). The burst loop checks this before each additional burst datagram:
+**Placement decision:** Put the trait in `nosh-proto` so both `nosh-server` and `nosh-client` can depend on it without a circular dependency. A new file `crates/nosh-proto/src/transport_trait.rs`, re-exported from `nosh-proto::lib.rs`.
 
-```rust
-while !deferred.is_empty() {
-    let space = conn.datagram_send_buffer_space();
-    if space < cap {
-        break; // no room for another MTU-sized datagram
-    }
-    let (next_payload, next_deferred) = encode_datagram(&burst_diff, cap)?;
-    conn.send_datagram(next_payload)?;
-    deferred = next_deferred;
-}
+### 2. WebTransport transport implementations (NEW — nosh-server and nosh-client)
+
+Two new `impl NoshTransport` blocks:
+
+- **Server side:** `WtransportServerConnection(wtransport::Connection)` wrapping `wtransport::connection::Connection`. Lives in a new file `crates/nosh-server/src/wt_transport.rs` (or `crates/nosh-server/src/transport/mod.rs` alongside a `quinn_transport.rs`).
+- **Client side:** `WtransportClientConnection(wtransport::Connection)` in a new file `crates/nosh-client/src/wt_transport.rs`.
+
+`wtransport`'s `Connection` API (verified from docs.rs 0.7.1):
+- `send_datagram<D: AsRef<[u8]>>(&self, payload: D) -> Result<(), SendDatagramError>` — matches quinn exactly
+- `receive_datagram(&self) -> Result<Datagram, ConnectionError>` — matches quinn's read_datagram direction
+- `open_bi(&self) -> Result<OpeningBiStream, ConnectionError>` — note: requires a second `.await` on `OpeningBiStream`
+- `accept_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError>` — direct tuple
+
+The double-await on `open_bi` is the only API difference from quinn. The `NoshTransport::open_bi` implementation for the wtransport backend simply does both awaits internally before returning the stream pair.
+
+**No new crate is needed.** `wtransport` is added as a workspace dependency and used in `nosh-server` and `nosh-client` behind a `feature = "webtransport"` Cargo feature flag (server and client both). Native QUIC mode remains the default; the feature activates the wtransport code paths.
+
+### 3. WebTransport accept loop (MODIFIED — nosh-server/src/server.rs)
+
+`run_accept_loop` currently takes a `quinn::Endpoint`. For WebTransport mode, a parallel function `run_wt_accept_loop` takes a `wtransport::Endpoint<Server>`. Both feed into `handle_connection`, which is refactored to take `Box<dyn NoshTransport>` instead of `quinn::Connection`.
+
+`build_server_config` in `server.rs` is UNCHANGED — it produces a `quinn::ServerConfig`. For WebTransport mode, a new function `build_wt_server_config` in `wt_transport.rs` calls `wtransport::ServerConfig::builder().with_bind_address(addr).with_custom_tls(rustls_cfg).build()`, passing the SAME `rustls::ServerConfig` that `build_server_config` constructs (reusing `nosh_auth::AuthorizedKeysVerifier` and `nosh_auth::NoshServerCertResolver`). The outer TLS mutual auth thus works identically for both modes — but in WebTransport mode the outer auth is terminated at the proxy, making the inner handshake (below) mandatory.
+
+### 4. Inner SSH-key handshake (NEW — nosh-proto + nosh-server + nosh-client)
+
+This is the most significant design element of v1.4.
+
+**Why it is needed:** Behind an HTTP/3 reverse proxy, the proxy terminates QUIC and TLS. The outer TLS handshake (which currently carries the mutual SSH-key auth) ends at the proxy. The nosh server sees a WebTransport session that the proxy has already authenticated with the server's TLS cert — but the server has no way to verify the client's SSH key, and the client has no way to verify the server's host key, because both verifications happened in the TLS layer the proxy terminated.
+
+**Design — application-level challenge-response on the control stream:**
+
+The inner handshake runs immediately after the WebTransport session is established, before any `SessionOpen` or `Reattach` frame is processed. It is an application-level mutual challenge-response using SSH key signing:
+
+```
+Step 1 — Server challenges client:
+  Server generates 32 random challenge bytes (CSPRNG).
+  Server sends: InnerAuthChallenge { server_nonce: [u8; 32], server_spki: Vec<u8> }
+  (server_spki is the server's SSH public key in SPKI/DER form — the client
+   uses this to verify the host key against known_hosts / TOFU)
+
+Step 2 — Client verifies server and responds:
+  Client extracts the server's public key from server_spki.
+  Client checks server_spki against known_hosts (same HostKeyVerifier logic,
+  called directly rather than via rustls — this is the inner TOFU / key-pin check).
+  Client generates 32 random challenge bytes (CSPRNG).
+  Client signs: SHA-256("nosh-inner-v1" || server_nonce || client_nonce || server_spki)
+    using its SSH key (via RawEd25519Signer — agent or file).
+  Client sends: InnerAuthResponse {
+    client_nonce: [u8; 32],
+    client_spki: Vec<u8>,
+    client_sig: [u8; 64],
+  }
+
+Step 3 — Server verifies client and completes:
+  Server verifies client_sig over (server_nonce, client_nonce, server_spki) using
+  the public key extracted from client_spki.
+  Server checks client_spki against authorized_keys (same AuthorizedKeysVerifier
+  logic, called directly on the NoshPublicKey).
+  Server generates its own signature over:
+    SHA-256("nosh-inner-v1-server" || server_nonce || client_nonce || client_spki)
+  Server sends: InnerAuthComplete { server_sig: [u8; 64] }
+
+Step 4 — Client verifies server signature:
+  Client verifies server_sig using server_spki. If this succeeds, mutual auth
+  is complete and the session proceeds.
 ```
 
-This is the correct bound. QUIC datagrams are not flow-controlled by the peer (no ack-gating), so `datagram_send_buffer_space()` reflects local send-buffer availability only. The 1 MiB buffer holds ~700 MTU-sized datagrams; for a full 80×24 screen (~13 MTUs) the burst will drain in a single tick with room to spare. Congestion control still applies at the QUIC layer — quinn will pace datagram sends into the network automatically.
+The signature covers both nonces to prevent replay across sessions (the server nonce is CSPRNG-fresh per connection; the client nonce prevents the server from replaying a previous client response). The message tag `"nosh-inner-v1"` prevents cross-protocol confusion attacks.
 
-**Fixed-count fallback:** If `datagram_send_buffer_space()` is ever unavailable (e.g. future quinn API change), a fixed burst cap of 16 datagrams per tick (16 × 1200 bytes = ~19 KB) is a safe fallback that covers full-screen repaints without risking unbounded loops.
+This handshake reuses:
+- `nosh_auth::RawEd25519Signer` / `AgentSigner` — unchanged; client just calls `signer.sign(challenge_bytes)` instead of routing through rustls `CertificateVerify`
+- `nosh_auth::keys::lookup_known_host` / `record_known_host` — unchanged; client calls them directly for server TOFU
+- `nosh_auth::keys::extract_spki_from_bytes` (or a new peer of `extract_spki_from_cert`) — small addition to `nosh-auth/src/keys.rs`
+- `nosh_auth::AuthorizedKeysVerifier`'s authorized-key lookup logic — extracted to a standalone `check_authorized(spki, authorized)` function in `keys.rs` that both the TLS verifier and the inner handshake can call
+
+**New `Message` variants (append-only, after current last discriminant 17):**
+
+```rust
+// Append after ScrollbackCredit (discriminant 17):
+InnerAuthChallenge { server_nonce: [u8; 32], server_spki: Vec<u8> },      // 18
+InnerAuthResponse  { client_nonce: [u8; 32], client_spki: Vec<u8>,
+                     client_sig: [u8; 64] },                              // 19
+InnerAuthComplete  { server_sig: [u8; 64] },                              // 20
+InnerAuthFail,     // FIELDLESS — no-oracle invariant; same reason as ReattachErr  // 21
+```
+
+`InnerAuthFail` is fieldless like `ReattachErr`: it reveals nothing about why the handshake failed (wrong key vs unknown key vs bad signature all map to the same response). Callers log only the identity fingerprint.
+
+**New module: `nosh-server/src/inner_auth.rs` and `nosh-client/src/inner_auth.rs`**
+
+Server side: `run_inner_auth_server(transport: &dyn NoshTransport, control_send: &mut dyn NoshSendStream, control_recv: &mut dyn NoshRecvStream, authorized: &[NoshPublicKey], host_signer: &dyn RawEd25519Signer) -> Result<NoshPublicKey, InnerAuthError>`
+
+Client side: `run_inner_auth_client(transport: &dyn NoshTransport, control_send: &mut dyn NoshSendStream, control_recv: &mut dyn NoshRecvStream, identity: &ClientIdentity, known_hosts: &Path, host: &str) -> Result<(), InnerAuthError>`
+
+In native QUIC mode, `handle_connection` skips `run_inner_auth_*` entirely — the TLS handshake already did mutual auth and `extract_peer_identity` reads the identity from the cert. In WebTransport mode, `handle_connection_wt` calls `run_inner_auth_server` immediately after the session is established, before reading `SessionOpen` or `Reattach`. The returned `NoshPublicKey` feeds into the same `registry` and `run_session` path.
+
+### 5. Migration handover (REUSE — no new protocol)
+
+In native QUIC mode, roaming is handled by `server_config.migration(true)` — the QUIC connection ID continues across IP changes with no application-layer involvement.
+
+In WebTransport mode, the proxy terminates QUIC, so transport-layer migration is unavailable. The client detects connection loss (write error on any stream, or datagram timeout) and initiates a **new WebTransport session**. This maps cleanly to the existing 1-RTT cold-reattach path:
+
+```
+1. Client detects WebTransport session loss.
+2. Client opens new WebTransport session to the same URL.
+3. Inner SSH-key handshake runs (steps 1–4 above). This re-authenticates both sides.
+4. Client sends Reattach { token, last_acked_seq } on the new control stream.
+5. Server looks up the session in SessionRegistry by the verified identity.
+6. Server sends ReattachOk { new_token, replaying_from_seq, truncated }.
+7. Server replays from SequencedOutputBuffer (PTY output the client missed).
+8. Client sends ResumeComplete (or its equivalent Ack chain).
+9. Client re-opens secondary channels (Scrollback, etc.) via ChannelOpen.
+```
+
+Steps 4–9 are UNCHANGED from the native-QUIC cold-reattach path. `run_reattach_session` already handles all of this. The only change is that step 3 (inner auth) is inserted before step 4, and the outer function signature accepts `Box<dyn NoshTransport>` instead of `quinn::Connection`.
+
+The reattach token (`[u8; 16]`, bound to the SSH identity) is the same token used in native QUIC mode. There is no separate WebTransport reattach token. Inner auth serves as the equivalent of the TLS re-run in native QUIC cold reattach (both prove identity before the session registry lookup).
+
+**Datagram behaviour in WebTransport mode:** WebTransport datagrams are unreliable and unordered — semantically identical to QUIC RFC 9221 datagrams. `send_datagram` / `receive_datagram` on a `wtransport::Connection` map 1:1 to quinn's API. `send_burst` and `build_state_diff` are unchanged; they call `NoshTransport::send_datagram` which dispatches to whichever backend is active.
+
+### 6. Security hardening items (MODIFIED — multiple crates)
+
+**SEC-01 (threat-model doc):** Documentation only. New file `docs/SECURITY.md` expanding `docs/999.1-SECURITY.md` and `docs/999.7-SECURITY.md` to cover the WebTransport topology threat surface (proxy-terminates-outer-TLS, inner-auth-mandatory, proxy trust model, IP metadata leakage).
+
+**SEC-02 (interactive TOFU prompt):** MODIFIED in `nosh-client/src/client.rs` and the new `inner_auth.rs`. Currently `HostKeyVerifier::verify_server_cert` writes to `known_hosts` silently on TOFU (the existing code at `verifier.rs` line 82–84). For WebTransport mode the TOFU check happens inside `run_inner_auth_client`, which runs at the application level — it is straightforward to prompt the user (print fingerprint to stderr, read `yes/no` from stdin) before calling `record_known_host`. For native QUIC mode, the TOFU prompt must be injected into `HostKeyVerifier`, which is trickier because it runs inside the TLS handshake thread. The cleanest approach: add a `ToFuPolicy` enum (`Silent` / `Interactive`) to `HostKeyVerifier::new`; `Interactive` prints to stderr and reads from a channel, blocking until the user answers. The blocking call inside the TLS verifier is acceptable (the connection is waiting for auth anyway).
+
+**SEC-04 / 999.2 (client trust-boundary hardening):** MODIFIED in `nosh-client/src`. Harden the client against a malicious server sending oversized or malformed messages. Already partially addressed by `MAX_RUNS` in datagram decoding and the OSC OOM bound (SEC-03, v1.3). The remaining items: cap `PtyData` payload size on receive, validate `ChannelAccept`/`ChannelReject` channel IDs are within expected range, reject unexpected `ChannelOpen` from server when client has not requested a server-initiated channel.
+
+**999.7 (OSC OOM bound re-check):** Investigation in `nosh-server/src/terminal.rs`. The Phase-16 mitigation reasoning was found incorrect; the actual fix must be verified by reading the current `osc_dispatch` accumulation path.
 
 ---
 
-## Suggested Build Order
+## Component Responsibility Map
 
-The four features have the following dependency graph:
-
-- **Alt-screen buffer** (`terminal.rs` change) must precede repaint pacing, because accurate diff output for full-screen TUIs requires a correct buffer model. If repaint pacing ships first on a broken alt-screen model, you accelerate delivery of garbled content.
-- **Repaint pacing** depends on alt-screen being correct (the burst is most valuable for full-screen TUI transitions), and it depends on the `apply()` monotonic guard change in `screen.rs`. No dependency on scrollback or channel mux.
-- **Channel mux** is a foundation for scrollback (scrollback channel rides the mux stream). Channel mux does NOT depend on alt-screen or repaint pacing.
-- **Scrollback** depends on channel mux (uses the new stream type) and on the alt-screen scrollback suppression gate (otherwise scrollback fills with vim's alt-screen output).
-
-**Recommended phase order:**
-
-### Phase A: Alternate-Screen Buffer (`terminal.rs` + `server.rs` epoch handling)
-
-Scope: Add `alt_grid: Vec<Vec<Cell>>` and `saved_cursor: CursorPos` to `TerminalState`. Replace the `?1049h`/`?1049l` no-op with real swap/clear/restore logic. Update `resize()` to size both grids. Add `alt_screen` suppression gate to `scroll_up()`. No changes to the wire protocol or client.
-
-Why first: this is a pure server-side, in-process terminal model change. It has tests (`decset_alt_screen_toggled_by_1049` already exists; add `alt_screen_grid_is_separate_from_primary`). No network or client changes. Completing it before repaint pacing means the burst delivers correct content.
-
-**Invariants:** `viewport_rows()` always reads `self.grid` (the active buffer) — unchanged. `build_state_diff` unchanged. `SequencedOutputBuffer` unchanged. `PtyData` on the wire carries raw bytes (including the `?1049h` sequence) for replay — the terminal model re-derives the correct state on reattach by re-driving `advance()`.
-
-### Phase B: Repaint Pacing (burst datagrams per tick)
-
-Scope: Restructure the `diff_interval` arm in both `run_session` and `run_reattach_session` in `server.rs`. Change `apply()` monotonic guard in `screen.rs` from `<=` to `<`. Add burst drain loop using `datagram_send_buffer_space()`. One epoch per tick shared across all burst datagrams.
-
-Why second: alt-screen is fixed, so burst delivery is useful. The `apply()` guard change is low-risk. The two known traps are designed out architecturally, not discovered at runtime.
-
-**Mandatory gates before merge:** `noecho_read_dash_s_zero_predicted_chars` passes; add `burst_drains_when_grid_differs_from_acked_baseline` (was reverted in 999.4 — re-add it, fails before fix, passes after); confirm `auth.rs` integration tests pass.
-
-### Phase C: Channel Multiplexing Foundation
-
-Scope: Add `ChannelOpen`, `ChannelAccept`, `ChannelReject` variants to `Message` (appended after `TerminalControl`, discriminant 11+). Add secondary stream accept loop on the server; add control-channel open logic on the client. No scrollback-specific logic yet — just the mux plumbing. Scrollback stream type is declared but not yet used.
-
-Why third: scrollback needs this foundation. Mux does not depend on alt-screen or burst pacing. Building mux before scrollback lets the mux layer be tested with a simple echo channel before adding scrollback complexity.
-
-**Reattach impact:** Secondary streams are re-opened by the client after `ResumeComplete` is received. The primary stream reattach protocol (`Reattach`/`ReattachOk`/replay) is unchanged. `SequencedOutputBuffer` is unchanged.
-
-**Migration impact:** QUIC connection migration carries all open streams automatically at the transport layer. No application-layer handling needed for secondary streams during migration.
-
-### Phase D: Scrollback Sync
-
-Scope: Add `ScrollbackRequest` and `ScrollbackPage` variants to `Message` (appended, discriminant 14+). Add `alt_screen` gate to `scroll_up()` in `terminal.rs` (if not done in Phase A). Add scrollback page-query handler to `server.rs` (reads `TerminalState.scrollback`, encodes as `Vec<Vec<DiffRun>>`). Add scrollback client UI and rendering path.
-
-Why last: depends on mux (Phase C) and alt-screen suppression gate (Phase A). The `TerminalState.scrollback` field and cap already exist; this phase adds the query API and wire encoding. Client rendering is a new display mode (separate from `ClientScreen.confirmed`); the confirmed grid and predictor are untouched.
+| Component | Status | Crate | What Changes |
+|-----------|--------|-------|--------------|
+| `NoshTransport` trait | NEW | `nosh-proto` | New file `transport_trait.rs`; `NoshSendStream`, `NoshRecvStream` |
+| `QuinnTransport` wrapper | NEW | `nosh-server`, `nosh-client` | Thin `impl NoshTransport for quinn::Connection` wrappers |
+| `WtransportServerConnection` | NEW | `nosh-server` | `impl NoshTransport for wtransport::Connection` |
+| `WtransportClientConnection` | NEW | `nosh-client` | `impl NoshTransport for wtransport::Connection` |
+| `build_wt_server_config` | NEW | `nosh-server` | Calls existing `rustls::ServerConfig` path, wraps for wtransport |
+| `build_wt_client_config` | NEW | `nosh-client` | Calls existing `rustls::ClientConfig` path, wraps for wtransport |
+| `run_wt_accept_loop` | NEW | `nosh-server` | Parallel to `run_accept_loop`; accepts `wtransport::Incoming` |
+| `inner_auth.rs` (server) | NEW | `nosh-server` | Challenge-response handshake; reuses `RawEd25519Signer` |
+| `inner_auth.rs` (client) | NEW | `nosh-client` | Client side of above; reuses `AgentSigner`, known_hosts logic |
+| `Message` enum | MODIFIED | `nosh-proto` | Append `InnerAuthChallenge/Response/Complete/Fail` (discriminants 18–21) |
+| `ChannelEvent` enum | MODIFIED | `nosh-server` | `Stream` variant changes to boxed trait streams |
+| `handle_connection` | MODIFIED | `nosh-server` | Accepts `Box<dyn NoshTransport>`; routes to inner auth or not |
+| `run_session` | MODIFIED | `nosh-server` | Generic over `NoshTransport` instead of `quinn::Connection` |
+| `run_reattach_session` | MODIFIED | `nosh-server` | Same generics change |
+| `run_channel_task` | MODIFIED | `nosh-server` | Stream types become boxed trait streams |
+| `build_server_config` | UNCHANGED | `nosh-server` | Still returns `quinn::ServerConfig` for native mode |
+| `AuthorizedKeysVerifier` | MODIFIED (minor) | `nosh-auth` | Extract `check_authorized_key(spki, &[NoshPublicKey]) -> bool` |
+| `HostKeyVerifier` | MODIFIED | `nosh-auth` | Add `ToFuPolicy` for interactive prompt (SEC-02) |
+| `keys.rs` | MODIFIED (minor) | `nosh-auth` | Add `extract_spki_from_bytes` for inner auth use |
+| `SequencedOutputBuffer` | UNCHANGED | `nosh-server` | No change |
+| `SessionRegistry` / `SessionSlot` | UNCHANGED | `nosh-server` | No change |
+| `TerminalState` | UNCHANGED | `nosh-server` | No change (999.7 is an investigation, not a design change) |
+| `build_state_diff` / `send_burst` | UNCHANGED | `nosh-server` | Call `NoshTransport::send_datagram` via the trait |
+| `ClientScreen`, `PredictionOverlay` | UNCHANGED | `nosh-client` | No change |
+| `ClientIdentity` | UNCHANGED | `nosh-client` | Reused as-is by inner auth |
+| `nosh-proto/src/transport.rs` | UNCHANGED | `nosh-proto` | Still produces `quinn::TransportConfig`; only used in native mode |
 
 ---
 
-## Invariants That Must Not Break
+## Data Flow Diagrams
 
-| Invariant | Where Enforced | Risk in v1.3 |
+### Native QUIC mode (existing — unchanged)
+
+```
+Client                                  Server
+  |                                       |
+  |--- QUIC+TLS handshake (UDP/443) ----->|
+  |    (mutual SSH-key auth inside TLS)   |
+  |                                       |
+  |--- [bidi stream 0] SessionOpen ------>|
+  |<-- SessionOpened { token } -----------|
+  |                                       |
+  |<-- [datagrams] StateDiff -------------|  (terminal state, lossy)
+  |--- [datagrams] EpochAck ------------->|
+  |--- [stream 0] PtyData (keystrokes) -->|
+  |<-- [stream 0] PtyData (output) -------|
+  |                                       |
+  |--- [stream 0] ChannelOpen(Scrollback)->|
+  |<-- ChannelAccept ----------------------|
+  |--- [stream N] channel-id varint ------>|  (new bidi stream)
+  |<--> [stream N] scrollback pages ------>|
+```
+
+### WebTransport mode (new — behind HTTP/3 proxy)
+
+```
+Client              HTTP/3 Proxy              Server
+  |                      |                      |
+  |-- QUIC+TLS (443) --->|                      |
+  |   (proxy cert only)  |                      |
+  |                      |-- HTTP/3 upstream -->|
+  |                      |   (WebTransport)     |
+  |<===== WebTransport tunnel (HTTP/3 CONNECT) =================>|
+  |                                                              |
+  |  [inner handshake — on bidi stream 0, before SessionOpen]   |
+  |<-- InnerAuthChallenge { server_nonce, server_spki } ---------|
+  |    (client checks server_spki against known_hosts)           |
+  |--- InnerAuthResponse { client_nonce, client_spki, sig } ---->|
+  |    (server checks sig, checks client_spki vs authorized_keys)|
+  |<-- InnerAuthComplete { server_sig } -------------------------|
+  |    (client verifies server_sig)                              |
+  |                                                              |
+  |--- SessionOpen (or Reattach) -------------------------------->|
+  |<-- SessionOpened / ReattachOk -------------------------------|
+  |                                                              |
+  |<-- [datagrams via WebTransport] StateDiff -------------------|
+  |--- [bidi stream] PtyData / ChannelOpen etc. --------------->|
+```
+
+### Migration handover in WebTransport mode
+
+```
+Client                                             Server
+  |                                                  |
+  | [WebTransport session A — established, running]  |
+  |  ... network change (IP change, NAT timeout) ... |
+  |  [Session A transport lost]                      |
+  |                                                  |
+  |--- new WebTransport session B (UDP/443) -------->|
+  |<-> inner SSH-key handshake (steps 1–4) ----------|
+  |    [identity verified — same NoshPublicKey]      |
+  |                                                  |
+  |--- Reattach { token, last_acked_seq } ---------->|
+  |    [registry lookup by identity]                 |
+  |<-- ReattachOk { new_token, replaying_from_seq } -|
+  |<-- PtyData (replay from SequencedOutputBuffer) --|
+  |                                                  |
+  |--- ChannelOpen(Scrollback) -------------------->|  (re-open channels)
+  |<-- ChannelAccept --------------------------------|
+  |<-- [datagrams] StateDiff resumes ---------------|
+```
+
+---
+
+## Architecture Patterns
+
+### Pattern 1: Thin trait wrapper, not redesign
+
+The `NoshTransport` trait wraps the existing quinn and wtransport APIs at the exact points they are used: `send_datagram`, `datagram_send_buffer_space`, `max_datagram_size`, `accept_bi`, `open_bi`, `remote_address`, `close`. It does not attempt to abstract QUIC semantics (connection IDs, 0-RTT, migration) because WebTransport mode replaces those with the inner-auth + cold-reattach path. The trait is narrow by design.
+
+Trade-off: `Box<dyn NoshTransport>` incurs a vtable dispatch on every datagram send and stream open. For datagrams this is negligible (one dispatch per tick, not per byte). For stream I/O the codec path is already async I/O bound. The ergonomic benefit (zero code duplication across 400+ lines of session pump) far outweighs this.
+
+### Pattern 2: Inner auth reuses existing crypto, not a new dependency
+
+The inner handshake signs raw bytes with `RawEd25519Signer::sign`. The signer is already the abstraction that works for both `AgentSigner` (Unix, hardware keys) and `FileSigner` (Windows, on-disk key). No new crypto crate is needed. The challenge byte framing uses `SHA-256` via the ring provider already in the dependency tree (accessed via `ring::digest::digest`).
+
+Trade-off: the inner handshake does not support ECDSA or RSA in this milestone (Ed25519 only, same as the existing TLS path). This is a known limitation documented in the security model.
+
+### Pattern 3: WebTransport mode is a feature flag, not a separate binary
+
+Both `nosh-server` and `nosh-client` expose `--webtransport` flags and `--wt-url` (client) / `--wt-bind` (server) arguments when the `webtransport` Cargo feature is active. The `main.rs` for each binary dispatches to either the native QUIC accept loop or the WebTransport accept loop based on the flag. The session pump, channel logic, and terminal model are completely shared.
+
+---
+
+## Anti-Patterns to Avoid
+
+### Anti-Pattern 1: Skipping the inner auth in WebTransport mode
+
+**What happens:** Relying on the proxy to perform client authentication (e.g. mTLS at the proxy layer). The server then has no way to verify which SSH key the client holds, breaking the `authorized_keys` gate and the identity-scoped session registry.
+
+**Why wrong:** The threat model requires end-to-end SSH-key mutual auth. The proxy terminates the outer TLS — it does not and cannot verify the nosh `authorized_keys` on behalf of the server. Without inner auth, any client that can reach the WebTransport endpoint is authenticated.
+
+**Instead:** Always run `run_inner_auth_server` on every new WebTransport session before processing any `SessionOpen` or `Reattach` frame.
+
+### Anti-Pattern 2: Making the inner handshake fieldful on failure
+
+**What happens:** `InnerAuthFail` carries a reason code (`UnknownKey`, `BadSignature`, `Expired`, etc.).
+
+**Why wrong:** This creates a session-existence oracle and a key-enumeration oracle — an attacker can determine whether a given public key is in `authorized_keys` by attempting the handshake and reading the failure code. This is the same reason `ReattachErr` is fieldless.
+
+**Instead:** `InnerAuthFail` must remain fieldless and opaque. Log the reason server-side only, never in the wire message.
+
+### Anti-Pattern 3: Routing datagrams over streams in WebTransport mode
+
+**What happens:** Because WebTransport datagrams have no delivery guarantee, a developer might be tempted to send `StateDiff` over a reliable stream instead, to avoid loss.
+
+**Why wrong:** This defeats the entire point of the datagram channel — latest-state-wins, loss-tolerant. Reliable delivery of every diff introduces head-of-line blocking for the terminal state stream and makes the client's confirmed grid lag behind the server's output under loss. The datagram loss tolerance is the feature, not a bug to work around.
+
+**Instead:** Send `StateDiff` as WebTransport datagrams exactly as in native QUIC mode. Accept that some diffs are lost; the epoch-ack + `last_acked_snapshot` model self-corrects. If the path truly cannot support datagrams, that is a configuration error (proxy blocking datagrams), not an application concern.
+
+### Anti-Pattern 4: Putting `wtransport` behind the transport trait incorrectly by calling `build_state_diff` inside the trait
+
+**What happens:** Trying to make the transport trait do more than I/O — passing session state or terminal state through it.
+
+**Why wrong:** The existing `build_state_diff` and `send_burst` are pure functions that take a `SessionSlot` reference and a connection reference. They must stay pure. The trait is only the I/O boundary.
+
+**Instead:** The trait exposes only the connection-level I/O operations. Session state, terminal state, and buffer management stay in `nosh-server`'s existing modules.
+
+---
+
+## Dependency-Ordered Build Sequence
+
+The four main work areas have the following dependencies:
+
+```
+Transport trait (nosh-proto + Quinn wrappers)
+    ↓
+WebTransport session accept + outer TLS wiring
+    ↓
+Inner SSH-key handshake (nosh-auth refactor + new inner_auth modules)
+    ↓
+Migration handover (run_reattach_session on NoshTransport + re-open channels)
+    ↓
+Security hardening pass (SEC-01 doc, SEC-02 TOFU prompt, SEC-04 client hardening, 999.7)
+    ↓
+Interactive UAT (carried-forward backlog + new M7 end-to-end path)
+```
+
+### Phase A — Transport abstraction seam
+
+**Goal:** Introduce `NoshTransport` / `NoshSendStream` / `NoshRecvStream` traits and the quinn wrapper impls. Refactor `run_session`, `run_reattach_session`, `handle_connection`, `run_channel_task`, `run_scrollback_sender_task` to use the trait. All existing tests must still pass unchanged (the quinn wrapper is a pass-through).
+
+**Files new:** `crates/nosh-proto/src/transport_trait.rs`, `crates/nosh-server/src/quinn_transport.rs` (or inline in `server.rs`), `crates/nosh-client/src/quinn_transport.rs`
+
+**Files modified:** `nosh-proto/src/lib.rs` (re-export), `nosh-server/src/server.rs` (signatures), `nosh-server/src/channel.rs` (ChannelEvent::Stream types), `nosh-client/src/client.rs` (connect returns `Box<dyn NoshTransport>`)
+
+**Gate:** All existing integration tests pass. `cargo test --workspace` green. No functional change.
+
+### Phase B — WebTransport endpoint + outer TLS wiring
+
+**Goal:** Add `wtransport` to workspace dependencies (feature-gated). Implement `WtransportServerConnection` and `WtransportClientConnection` as `impl NoshTransport`. Add `build_wt_server_config`, `run_wt_accept_loop`, `build_wt_client_config`, and `connect_wt`. Wire `--webtransport` CLI flag in both binaries.
+
+**Files new:** `crates/nosh-server/src/wt_transport.rs`, `crates/nosh-client/src/wt_transport.rs`
+
+**Files modified:** `Cargo.toml` (workspace dep: `wtransport = { version = "0.7", optional = true }`), `crates/nosh-server/src/server.rs` (new accept loop), `crates/nosh-server/src/main.rs` (CLI flag), `crates/nosh-client/src/main.rs` (CLI flag)
+
+**Gate:** A WebTransport session can be established client→server. The inner session pump runs over WebTransport streams. No inner auth yet — the test uses a stub `skip_inner_auth` mode gated to `#[cfg(test)]` only. The `--webtransport` flag without inner auth should REJECT connections (non-test builds must not have the stub path).
+
+### Phase C — Inner SSH-key handshake
+
+**Goal:** Implement `InnerAuthChallenge / Response / Complete / Fail` message variants (appended after discriminant 17). Implement `run_inner_auth_server` and `run_inner_auth_client`. Refactor `nosh-auth/src/keys.rs` to expose `check_authorized_key` and `extract_spki_from_bytes`. Wire inner auth into `handle_connection_wt` (server) and the WebTransport connect path (client).
+
+**Files new:** `crates/nosh-server/src/inner_auth.rs`, `crates/nosh-client/src/inner_auth.rs`
+
+**Files modified:** `nosh-proto/src/messages.rs` (4 new variants, append-only), `nosh-auth/src/keys.rs` (extract helpers), `nosh-server/src/server.rs` (call inner auth in WT path), `nosh-client/src/client.rs` (call inner auth in WT path)
+
+**Gate:** End-to-end WebTransport session with full inner SSH-key mutual auth. Unauthorised client (key not in `authorized_keys`) is rejected with `InnerAuthFail`. Wrong server key (known_hosts mismatch) closes the client connection with an error. Test for: (1) successful inner auth with valid keys, (2) rejection with unknown client key, (3) rejection with mismatched server key, (4) `InnerAuthFail` is fieldless in all failure paths.
+
+### Phase D — Migration handover (cold reattach over WebTransport)
+
+**Goal:** Prove that `run_reattach_session` works over `Box<dyn NoshTransport>` (Phase A already did the refactor). The new work is: the client detects WebTransport session loss, re-connects, re-runs inner auth, then sends `Reattach`. Test for: byte-exact replay from `SequencedOutputBuffer`, token rotation, channel re-open after reattach.
+
+**Files modified:** `nosh-client/src/client.rs` (detect loss, reconnect loop, inner auth then reattach), `nosh-server/src/server.rs` (no change — `run_reattach_session` already handles this)
+
+**Gate:** A WebTransport session that is forcibly closed (simulate network change by closing the wtransport connection) causes the client to reconnect, re-auth, and resume with byte-exact replay. The `ReattachOk.replaying_from_seq` matches the client's `last_acked_seq`. Channels re-opened after `ResumeComplete`.
+
+### Phase E — Security hardening + documentation
+
+**Goal:** SEC-01 threat-model doc. SEC-02 interactive TOFU prompt. SEC-04 client hardening (PtyData cap, channel ID validation). 999.7 OSC OOM investigation + fix if the bound is absent.
+
+**Files new:** `docs/SECURITY.md` (or extend `docs/999.1-SECURITY.md`)
+
+**Files modified:** `nosh-auth/src/verifier.rs` (ToFuPolicy), `nosh-auth/src/keys.rs` (ToFuPolicy threading), `nosh-client/src/inner_auth.rs` (TOFU prompt in WT path), `nosh-client/src/client.rs` (TOFU prompt in native path), `nosh-server/src/terminal.rs` (OSC OOM fix if needed), `nosh-client/src/client.rs` (PtyData recv cap, channel ID guard)
+
+**Gate:** (1) Fresh `known_hosts` (first contact) triggers an interactive fingerprint prompt on both native and WT modes. (2) A server sending a 100 MB `PtyData` frame is rejected by the client before allocation. (3) `InnerAuthFail` and `ReattachErr` have no fields after any code change. (4) OSC OOM: either confirm the existing bound is correct or add a test that caps accumulation before vte.
+
+### Phase F — Interactive UAT
+
+**Goal:** A guided step-by-step validation session: carried-forward backlog (Phase 19 Windows alt-screen re-test, 999.3 rendering pack, 999.4 Windows predictive-echo, green Windows CI) and the new M7 remote-access path (WebTransport end-to-end with a real HTTP/3 reverse proxy, TOFU prompt on first contact, roaming via cold reattach behind proxy).
+
+**No new code.** This phase is a human-driven interactive test, not automated. Each item is confirmed one at a time.
+
+---
+
+## Critical Invariants That Must Not Break
+
+| Invariant | Where enforced | Risk in v1.4 |
 |-----------|---------------|-------------|
-| Discriminant ordering in `Message` — NEVER reorder or insert, only append | `nosh-proto/src/messages.rs`, test `variant_name_never_leaks_token_bytes` | Every phase adds new variants; must append only |
-| `PtyData` advances `highest_applied` in `SequencedOutputBuffer` | `crates/nosh-server/src/registry.rs`, `push_output_and_parse` | No phase touches `SequencedOutputBuffer` directly |
-| Keystrokes travel only on the reliable stream, never datagrams | `server.rs` `msg` arm: `PtyData { data }` → `in_tx.send` | Mux phase must not accidentally route keystrokes to secondary streams |
-| Noecho suppression: `confirmed_epoch` must not advance during `read -s` | `predictor.rs` `cull()` state machine; `noecho_read_dash_s_zero_predicted_chars` test | Repaint pacing `apply()` guard change (`<=` → `<`) must not break this |
-| One epoch per tick (shared across burst datagrams) | New invariant introduced in Phase B | Every burst datagram in a single tick must carry the same epoch value |
-| `build_state_diff` called at most once per tick | New invariant introduced in Phase B burst redesign | The burst loop must call only `encode_datagram`, never `build_state_diff`, after the first call |
-| `datagram_send_buffer_space()` is the burst budget gate | Phase B | Do not use a fixed byte count that ignores actual buffer state |
-| `SSH_AUTH_SOCK` never forwarded via environment | `session.rs` env sanitization | No new channel type should forward the agent socket path |
-| Scrollback suppressed in alt-screen | Phase A / Phase D | `scroll_up()` must gate on `echo_state.alt_screen`; otherwise vim output contaminates primary scrollback |
-| `ReattachErr` must remain fieldless (no-oracle invariant) | `messages.rs` comment, `Message::ReattachErr` variant | Channel mux must not add a reason field to `ReattachErr` |
-| Pre-auth connection cap | `server.rs` `AuthLimits` semaphore | Secondary stream accept must not bypass the cap |
-| `alt_grid` sized same as `grid` after every resize | Phase A `resize()` | Both grids must track the same `(cols, rows)` at all times |
+| `Message` discriminant ordering — append-only | `nosh-proto/src/messages.rs`, codec test | Phase C adds 4 variants; must append after discriminant 17 (ScrollbackCredit) |
+| `ReattachErr` is fieldless (no-oracle) | `messages.rs` comment + test | `InnerAuthFail` must also be fieldless — enforce the same invariant by test |
+| Env sanitization on every shell/exec open | `session.rs` env whitelist | No change to session.rs in v1.4; invariant preserved |
+| `SSH_AUTH_SOCK` never forwarded via env | `session.rs` ENV_DENY_DOC | No change; invariant preserved |
+| Inner auth mandatory in WebTransport mode | `server.rs` wt connection handler | A `#[cfg(not(test))]` guard must prevent the `skip_inner_auth` stub from reaching production builds |
+| `InnerAuthFail` is fieldless in all failure paths | New test in `inner_auth.rs` | Server-side logging of failure reason is fine; wire message must always be the fieldless variant |
+| Token bytes never logged | `messages.rs` `variant_name()`, callers | InnerAuth variants carry signatures (not tokens), but the no-logging discipline extends to `client_sig` and `server_sig` — log fingerprints, not raw bytes |
+| Pre-auth DoS cap applies to WebTransport mode too | `run_wt_accept_loop` | Must replicate the `Semaphore`-based pre-auth cap from `run_accept_loop`; WebTransport sessions do not skip it |
+| `SequencedOutputBuffer` not replayed on scrollback channel | `registry.rs` — scrollback uses separate query, not the buffer | No change; invariant preserved |
+| One epoch per tick (burst datagrams share an epoch) | `server.rs send_burst` | The NoshTransport trait wraps `send_datagram` — the burst loop logic and epoch management are unchanged |
 
 ---
 
 ## Sources
 
-- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-proto/src/messages.rs` — discriminant ordering, current 10 variants, append-only invariant documented at lines 56–62
-- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-proto/src/datagram.rs` — `encode_datagram`, `decode_datagram`, `StateDiff`, `ClientEpoch` wire types
-- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-server/src/server.rs` — `build_state_diff` (lines 294–360), one-datagram-per-tick `diff_interval` arm (lines 676–713), epoch-ack arm (lines 717–745), `SequencedOutputBuffer` integration, `run_session` / `run_reattach_session` full pump loops
-- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-server/src/terminal.rs` — `TerminalState` struct (lines 161–185), `alt_screen` no-op at lines 503–505, `scrollback` field (line 170, `VecDeque<Vec<Cell>>`), `scroll_up()` (lines 291–302), `SCROLLBACK_LINE_CAP = 10_000`
-- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-client/src/screen.rs` — `ClientScreen.apply()` monotonic guard at line 213 (`diff.epoch <= self.last_applied_epoch`), `emit_diff`, `render_with_predictor`, `emit_connect_clear`
-- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-client/src/predictor.rs` — `PredictionOverlay`, `cull()` mismatch/reset path, `confirmed_epoch` advancement logic, `noecho_read_dash_s_zero_predicted_chars` test reference
-- `/home/bharris/github.com/bharrisau/nosh/.planning/ROADMAP.md` — Phase 999.5 (alt-screen investigation, line 102–118), Phase 999.6 (burst pacing with both trap descriptions, lines 111–118), Phase 999.4 (revert lessons, lines 98–99)
-- `/home/bharris/github.com/bharrisau/nosh/.planning/PROJECT.md` — v1.3 M5 scope and context
+- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-proto/src/messages.rs` — current 18 Message variants (SessionOpen through ScrollbackCredit, discriminants 0–17), ChannelType enum, append-only invariant
+- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-server/src/server.rs` — `build_server_config`, `handle_connection`, `run_session`, `run_reattach_session`, `send_burst`, `build_state_diff`; all use `quinn::Connection` by concrete type (no trait exists)
+- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-server/src/channel.rs` — `ChannelEvent::Stream(quinn::SendStream, quinn::RecvStream)` — the surface area that must be abstractd
+- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-client/src/client.rs` — `build_client_config`, `make_endpoint`, `connect`; quinn concrete types throughout
+- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-auth/src/verifier.rs` — `HostKeyVerifier`, `AuthorizedKeysVerifier`; the logic to extract into `check_authorized_key`
+- `/home/bharris/github.com/bharrisau/nosh/crates/nosh-server/src/registry.rs` — `SequencedOutputBuffer`, `SessionRegistry`; transport-agnostic, no change needed
+- `/home/bharris/github.com/bharrisau/nosh/.planning/PROJECT.md` — v1.4 scope: WT-*, SEC-01/02, SEC-04, 999.7, interactive UAT
+- `/home/bharris/github.com/bharrisau/nosh/.planning/MILESTONES.md` — v1.3 delivered: channel mux (Phase 21), scrollback (Phase 22), ChannelEvent seam
+- https://docs.rs/wtransport/latest/wtransport/connection/struct.Connection.html — `send_datagram`, `receive_datagram`, `open_bi` (double-await), `accept_bi` API confirmed; version 0.7.1
+- https://github.com/BiagioFesta/wtransport — `with_custom_tls(TlsServerConfig/TlsClientConfig)` confirmed on ServerConfig and ClientConfig builders; reuses existing rustls configs
+- https://docs.rs/wtransport/latest/wtransport/endpoint/struct.Endpoint.html — `Endpoint::server()`, `Endpoint::client()`, `accept()`, `connect()` API

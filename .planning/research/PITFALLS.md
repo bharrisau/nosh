@@ -1,378 +1,471 @@
-# Domain Pitfalls: nosh v1.3 (M5) Feature Additions
+# Domain Pitfalls: nosh v1.4 (M7) WebTransport + Inner Auth + Security Hardening
 
-**Domain:** Adding channel multiplexing, scrollback sync, alt-screen buffer, and burst repaint-pacing to a working QUIC mobility shell with predictive echo and session persistence.
-**Researched:** 2026-06-07
-**Sources:** `.planning/ROADMAP.md` (999.4, 999.5, 999.6, 999.7 entries), `crates/nosh-server/src/server.rs`, `crates/nosh-server/src/terminal.rs`, `crates/nosh-client/src/predictor.rs`, `crates/nosh-proto/src/messages.rs`.
+**Domain:** Adding WebTransport-over-HTTP/3 reverse-proxy mode, inner SSH-key mutual auth, migration handover behind a QUIC-terminating proxy, and a security hardening pass to a working QUIC mobility shell with session persistence, predictive echo, channel multiplexing, and scrollback sync.
+**Researched:** 2026-06-13
+**Confidence:** HIGH — grounded in the actual codebase (messages.rs, verifier.rs, server.rs, terminal.rs), first-party security reviews (999.1-SECURITY.md, 999.7-SECURITY.md), and the design brief. WebTransport crate compatibility verified against docs.rs/crate/wtransport/latest.
 
 ---
 
 ## Summary
 
-Four of these features have already produced documented production failures in this specific codebase. The 999.4 burst-pacing revert was caused by two bugs introduced simultaneously: an infinite-spin from recomputing `fresh_runs` against a non-advancing `last_acked_snapshot` during burst drain, and a noecho-epoch security regression where per-datagram epoch increments advanced the client's `confirmed_epoch` during a `read -s` window. The alt-screen is currently a no-op flag (`echo_state.alt_screen = enable` only) with no saved buffer, no clear-on-enter, and no primary-buffer restore. A half-correct implementation is provably worse than the current no-op. The scrollback buffer already exists in `TerminalState` (`scrollback: VecDeque<Vec<Cell>>`, capped at `SCROLLBACK_LINE_CAP = 10_000`), but there is no sync protocol to deliver it to clients. Channel multiplexing is net-new; the current system uses exactly one bidi stream per connection with a flat `Message` enum encoded by `postcard` with discriminant-ordered variants that must never be reordered.
+Five of the pitfalls below are security-critical or silent-corruption class. The inner-handshake channel-binding gap is the most dangerous: skip it and a trusted proxy becomes a MITM with no protocol-visible signal. The wire-format discriminant-stability pitfall is the second: the `Message` enum already has 18 append-only variants (discriminants 0–17) and adding any new variant for the inner-handshake protocol in a non-tail position silently corrupts every existing live connection. The live 999.7 OSC-OOM bug (Phase-16 mitigation reasoning was found incorrect) is an availability DoS that hits multi-user deployments hardest and must be addressed before the server is internet-exposed. The wtransport/quinn crypto-provider conflict is the most likely build-time blocker on day one. The TOFU prompt is the most likely UX footgun: a blocking yes/no prompt that the user cannot paste a fingerprint into trains the wrong habit.
 
-The pitfalls below are grounded in the actual invariants, bugs, and reverts documented in the ROADMAP 999.x entries and the source files read above. Generic Rust advice is not included.
-
----
-
-## Channel Multiplexing
-
-### Pitfall M-1: postcard discriminant shift silently corrupts the wire protocol across versions
-
-**What goes wrong:** A new `Message` variant or a new `ChannelOpen`/`ChannelAccept`/`ChannelReject` control message is inserted anywhere except at the end of the `Message` enum (`crates/nosh-proto/src/messages.rs`). `postcard` encodes enums by their discriminant index (position in source order). Inserting a variant before an existing one shifts all following discriminants. Old clients decode the new discriminant as the wrong variant — silently, with no wire error. The current enum already has two explicit "append after X to preserve discriminant order" comments (lines 56–62, 154–160) documenting prior near-misses.
-
-**Warning sign:** A new `Message` variant appears anywhere other than after the last existing variant (`TerminalControl`, discriminant 9). A PR that adds `ChannelOpen` between `PtyData` (1) and `Resize` (2) will compile and pass unit tests but corrupt all existing deployed connections.
-
-**Prevention:** Add a `#[test] fn message_discriminant_order_is_stable()` test that encodes each variant by index (`postcard::to_stdvec(&msg).unwrap()[0]`) and asserts it matches the expected discriminant value hardcoded in the test. This will fail immediately if anyone reorders. Add a `// APPEND-ONLY — do NOT insert or reorder` comment directly on the enum declaration as well as on each block of new variants. For channel multiplexing, consider whether the channel framing belongs in a separate `ChannelMessage` enum on a separate QUIC stream type rather than polluting `Message` with many new variants.
-
-**Owning phase:** The phase that defines the channel-multiplexing wire protocol (first mux phase). Test must be written before any new variants land.
+The pitfalls are ordered: security-critical first, then silent-corruption, then build/integration failures, then operational.
 
 ---
 
-### Pitfall M-2: flow-control deadlock between the control channel and data channels
+## Critical Pitfalls
 
-**What goes wrong:** Channel multiplexing requires a control channel (channel id 0) to issue OPEN/ACCEPT/REJECT before any data stream is bound. If the implementation multiplexes all channels over a single QUIC bidi stream (re-using the existing one), or if the control channel back-pressure blocks while a data channel is waiting for a CREDIT frame that can only arrive on the control channel, you get a classic head-of-line deadlock: the control channel cannot progress because the read loop is blocked draining the (now-HOL-blocked) data channel.
+### Pitfall WT-1: wtransport pulls a different rustls crypto feature, panicking at runtime
 
-**Warning sign:** Hanging integration test — `tokio::select!` blocks forever; one arm is stuck on `recv.read_buf` for channel data while the other arm needs a `ChannelAccept` that is behind the blocked read.
+**What goes wrong:**
 
-**Prevention:** Each logical channel must map to a distinct QUIC stream (or the control channel must be a separate QUIC bidi stream from the shell I/O stream). QUIC streams are independent; they do not head-of-line block each other at the QUIC layer (only at the stream-level flow-control window). Write an integration test that opens N data channels, floods channel 1 to its flow-control limit, and verifies the control channel still processes messages in under 50 ms.
+The nosh workspace pins `quinn = "0.11.9"` with `features = ["runtime-tokio", "rustls-ring"]` — the `rustls-ring` feature selects `ring` as the rustls crypto provider. `wtransport 0.7.1` depends on `quinn = "^0.11.6"` with default features disabled, and `rustls = "^0.23.23"` also with default features disabled — it does not pin a crypto provider. If either wtransport or any of its transitive dependencies activates `rustls-aws-lc-rs` as a feature, Cargo will enable both `ring` and `aws-lc-rs` backends simultaneously. Rustls panics at runtime when two `CryptoProvider`s are both registered: `install_default()` returns `Err` if called a second time, and code that calls `CryptoProvider::get_default().unwrap()` panics. This does not produce a compile error; the panic surfaces during the first TLS handshake attempt.
 
-**Owning phase:** Mux protocol design phase. The stream/channel topology must be decided before any implementation work.
+**Why it happens:**
 
----
+Cargo feature unification: features from all crates that depend on a package are merged. If any path in the dependency graph activates `rustls`'s `aws-lc-rs` feature (which is the new default in some rustls configurations), it is silently additive to the existing `ring` activation.
 
-### Pitfall M-3: simultaneous OPEN race — both peers assign the same channel id
+**How to avoid:**
 
-**What goes wrong:** If both client and server can initiate channels and they both pick channel ids from a single shared counter, both sides can simultaneously send `ChannelOpen{id: 5}`. The receiver sees a `ChannelOpen` for an id it just sent, and neither side has a resolution rule. The connection hangs or both sides reject each other.
+When adding `wtransport` to the workspace, add it with `default-features = false` and explicitly specify the same crypto provider as the rest of the workspace. In `Cargo.toml`:
 
-**Warning sign:** Intermittent test failure in concurrent-channel tests; the race only triggers when both sides open at nearly the same time.
+```toml
+wtransport = { version = "0.7", default-features = false, features = ["runtime-tokio", "ring"] }
+```
 
-**Prevention:** Use the SSH multiplexing convention: client-initiated channels use even ids, server-initiated channels use odd ids (or any partition that guarantees non-overlap). Each side maintains its own counter in its own namespace. Write a test that fires client-open and server-open simultaneously for the same notional resource and verifies the session survives.
+If `wtransport` does not expose a `ring` feature gate of its own (verify this at add-time), add a direct `rustls = { version = "0.23", features = ["ring"], default-features = false }` workspace dependency that forces feature unification toward `ring`. Run `cargo tree -f "{p} {f}" | grep rustls` to confirm only `ring` appears, not `aws-lc-rs`.
 
-**Owning phase:** Mux protocol design phase.
+**Warning signs:**
 
----
+Thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value: AlreadyInstalled' during the first connection attempt, or any `CryptoProvider::install_default()` returning `Err`. A `cargo tree --features` that shows `rustls` with both `aws-lc-rs` and `ring` in its feature set.
 
-### Pitfall M-4: accept-before-open and rejected-channel resource leak
-
-**What goes wrong:** A `ChannelAccept{id}` or `ChannelReject{id}` arrives before the corresponding `ChannelOpen{id}` has been processed (reordering within a reliable stream is impossible, but the responder could send an accept for an id the requester already closed client-side). If the state machine does not handle this gracefully, it either panics or leaves a half-open channel entry that is never cleaned up, leaking memory.
-
-**Warning sign:** `channel_map.len()` grows monotonically in a long-running test that opens and closes many channels; or a `unwrap()` on a `HashMap::get` for an id that was already removed.
-
-**Prevention:** The channel state machine must handle `Accept`/`Reject` for unknown ids as no-ops (or a logged warning), not as panics. Rejected channels must be removed from the pending-open map immediately on receipt of `ChannelReject`, not only when the caller calls `close()`. Write a test that sends a `ChannelReject` for a channel the initiator already closed, and asserts no panic and no entry in the channel map.
-
-**Owning phase:** Mux protocol implementation phase.
+**Phase to address:** The phase that adds `wtransport` to the workspace (first WebTransport phase, before any networking code is written). Resolve the dependency conflict before writing any code.
 
 ---
 
-### Pitfall M-5: channel state must be re-established after cold reattach — not replayed
+### Pitfall WT-2: WebTransport datagram size is smaller than raw QUIC — the state-diff encoder assumes raw MTU
 
-**What goes wrong:** The existing cold-reattach protocol (Phase 6 / `run_reattach_session`) replays `PtyData` frames byte-exactly from `last_acked_seq` on one reliable stream. Channels are logical constructs on top of streams. After reattach, the replayed byte stream does not replay `ChannelOpen`/`ChannelAccept` frames — those are gone. If the client tries to restore channels from the replay, it will misparse `PtyData` frames as channel frames or open duplicate channels. If it does not, the server-side channel state is orphaned.
+**What goes wrong:**
 
-**Warning sign:** After a reattach, scrollback sync or agent-forward channels never respond; or the client and server have mismatched channel-id maps.
+The nosh datagram encoder (`encode_datagram` in `nosh-proto/src/datagram.rs`) uses `conn.max_datagram_size()` from the raw quinn `Connection` to cap `StateDiff` payload sizes. Over raw QUIC on UDP/443, this returns approximately 1200–1350 bytes depending on path MTU. Over WebTransport, the same QUIC path has additional overhead from:
 
-**Prevention:** On cold reattach, all channel state is reset. The client must re-open any persistent channels (e.g. scrollback sync) after `ReattachOk` is received, not during replay. The server must close all orphaned channel state when the session transitions to `Reconnecting`. Document this explicitly in the protocol spec: channels are ephemeral per-connection, not persistent across reattach. Write a test: open a scrollback channel, trigger orphan/reattach, verify the channel is re-opened and delivers scrollback from the correct offset.
+- The HTTP/3 QUIC stream framing (QUIC STREAM frame header: variable-length)
+- The HTTP/3 DATA frame header (type + length varint)
+- The WebTransport DATAGRAM capsule header (Quarter Stream ID varint, up to 8 bytes)
 
-**Owning phase:** Scrollback sync phase (first channel consumer).
+Per RFC 9297, an HTTP Datagram over QUIC carries a Quarter Stream ID prefix before the payload. This consumes 1–8 bytes of the available QUIC DATAGRAM frame payload. The net effect is that `max_datagram_size()` reported by the WebTransport session is smaller than the raw quinn value — by approximately 8–20 bytes depending on the session stream ID encoding. If the state-diff encoder relies on the raw `Connection::max_datagram_size()` rather than the WebTransport session's datagram size API, it will produce payloads that are slightly too large. Quinn silently drops datagrams that exceed `max_datagram_size` with `SendDatagramError::TooLarge`.
 
----
+**Why it happens:**
 
-### Pitfall M-6: per-channel flow-control window deadlock with scrollback sender
+`wtransport` wraps quinn's `Connection` in its `Session` type. The `Session` may expose a separate `max_datagram_payload_size()` that accounts for the capsule overhead. Developers used to calling `conn.max_datagram_size()` on a raw `quinn::Connection` will naturally use the same call on the wrapped type, but the values differ.
 
-**What goes wrong:** Scrollback sync sends history lines over a reliable channel. The client's per-channel receive window fills up if the client cannot process lines fast enough (e.g. it is rendering or the user is at a fast-scroll boundary). The server's channel write blocks. If the write blocks inside the same `tokio::select!` arm that also handles PTY output and datagram ticks, the entire session pump stalls: PTY output backs up, the terminal model stops updating, and datagram ticks emit stale state.
+**How to avoid:**
 
-**Warning sign:** Live session input latency spikes while scrollback is being sent; or the 16 ms diff tick starts missing.
+When constructing the WebTransport transport adapter, route all datagram size queries through the `wtransport::Session` API rather than the underlying quinn `Connection`. Write a test that encodes a `StateDiff` at the WT session's reported max datagram size, sends it via the WT datagram API, and asserts it arrives without error. Do not assume the raw QUIC MTU figure applies inside a WebTransport session.
 
-**Prevention:** Scrollback channel writes must be driven from a separate tokio task, not inline in the main session pump loop. Use a bounded `mpsc::channel` between the pump and the scrollback task; if the scrollback channel's send buffer is full, drop the oldest lines rather than blocking the pump. Write a test that fills the scrollback channel to capacity and verifies PTY input latency does not spike.
+**Warning signs:**
 
-**Owning phase:** Scrollback sync phase.
+State-diff datagrams sent over WebTransport are silently dropped; the client renders stale state indefinitely. `SendDatagramError::TooLarge` returned from the WT datagram send call. The terminal appears frozen while the control stream (reliable) is still alive. The issue is intermittent when near the MTU boundary and consistent when the path MTU is low (e.g. PPPoE with 1480-byte Ethernet frames, reducing QUIC DATAGRAM space to ~1380 bytes before WT overhead).
 
----
-
-## Scrollback Sync
-
-### Pitfall S-1: sending scrollback over datagrams violates the loss-tolerant channel assumption
-
-**What goes wrong:** The datagram channel (RFC 9221) is explicitly loss-tolerant and latest-state-wins: the receiver always applies the newest datagram it has seen and discards older ones. Scrollback history is sequential and must not have gaps. If any scrollback line is lost in a datagram, the client receives a garbled history with missing lines and no way to detect or correct it (datagrams carry no sequence numbers in the nosh model).
-
-**Warning sign:** Scrollback missing random lines on high-loss connections; or the client and server disagree on scrollback line count.
-
-**Prevention:** Scrollback sync MUST go over a reliable QUIC stream (the channel multiplexing layer). This is noted as a constraint in the ROADMAP ("Scrollback must NOT go over datagrams") and is the primary motivation for building the mux layer first. Enforce this with a compile-time architectural constraint: the scrollback sender must only accept a `quinn::SendStream` (or a channel-abstracted wrapper over one), not a `quinn::Connection::send_datagram` path. Write a test that verifies scrollback lines arrive in order and without gaps under 20% simulated packet loss (possible with quinn's test utilities or a lossy UDP proxy).
-
-**Owning phase:** Scrollback sync phase. Must be verified before any scrollback data is sent.
+**Phase to address:** WebTransport integration phase, before datagram plumbing is wired. Write the MTU sizing unit test first.
 
 ---
 
-### Pitfall S-2: scrollback vs alt-screen confusion — history from the wrong buffer
+### Pitfall WT-3: Inner-handshake channel binding is missing — the proxy becomes a transparent MITM
 
-**What goes wrong:** The terminal has two conceptual buffers: the primary buffer (normal scrollback-eligible content) and the alternate screen (full-screen TUI content — vim, htop — which has no scrollback by convention). If the server sends alt-screen content as scrollback, the client displays `vim`'s internal state as if it were shell output history, which is nonsensical and confusing. The current implementation has `echo_state.alt_screen` as a flag but no separate buffer; scrollback currently only collects primary-buffer lines pushed by `scroll_up()`. Once a real alt-screen is implemented (see Alt-Screen section), the scrollback accumulator must gate on `!alt_screen`.
+**What goes wrong (security-critical — prioritise this pitfall):**
 
-**Warning sign:** Scrollback viewer shows vim/htop control sequences or the TUI's last-rendered state as if it were shell text.
+The current auth design puts mutual SSH-key authentication inside the TLS 1.3 handshake (the outer QUIC connection). The `AuthorizedKeysVerifier` and `HostKeyVerifier` verify each other's SPKI during `CertificateVerify` in TLS. Behind a WebTransport proxy, the proxy terminates the outer QUIC/TLS connection. The nosh server establishes a new inner QUIC/TLS connection to the actual nosh server daemon. The proxy sees all bytes flowing over the WebTransport tunnel.
 
-**Prevention:** The scrollback accumulator (`scroll_up()` in `terminal.rs`) must check `self.echo_state.alt_screen` and suppress `scrollback.push_back()` when the alt screen is active. Add a test: run a sequence that activates alt screen, produces output that would scroll, deactivates alt screen, produces primary-buffer output that scrolls, and assert that only the primary-buffer lines appear in `scrollback`.
+When the inner-auth handshake is a simple challenge-response SSH-key signature without channel binding, the following attack is possible:
 
-**Owning phase:** Alt-screen phase (must land before or alongside scrollback sync).
+1. An adversary controls the proxy (or compromises it).
+2. The client connects to the proxy (outer TLS — terminated at the proxy, establishing a `tls-exporter` value C1).
+3. The proxy connects to the real nosh server (inner TLS — establishing a different `tls-exporter` value C2).
+4. The client sends its inner-auth challenge-response in plaintext over the WebTransport tunnel.
+5. The proxy relays the client's challenge to the real server and relays the server's challenge to the client.
+6. The client signs the server's challenge (bound only to the challenge bytes, not to the outer TLS session). The proxy relays the signature.
+7. The server authenticates the client successfully — to the wrong outer session.
+8. A second client can now be attached to the server session that the first client authenticated.
 
----
+This is the classic confused-deputy attack on inner-auth without channel binding. The outer TLS provides confidentiality from the network, but the proxy is trusted for confidentiality and is simultaneously the attacker.
 
-### Pitfall S-3: resize reflow — scrollback line widths do not match the current terminal width
+**Why it happens:**
 
-**What goes wrong:** `TerminalState::resize()` (line 236) keeps scrollback lines as-is with their original column count ("Scrollback lines are kept as-is (original column count preserved)" per the comment). When the client resizes the terminal, the viewport reflows but scrollback lines retain the old width. Sending these to the client as a grid of `cols`-wide rows either truncates or pads them incorrectly in the scrollback viewer, misaligning content.
+Application-level handshakes naturally sign only the application-visible challenge, not the outer transport session. The TLS 1.3 `tls-exporter` mechanism (RFC 9266) exists specifically to bind application-level auth to a specific TLS session, preventing this attack. Without it, the inner handshake is portable across outer sessions.
 
-**Warning sign:** Scrollback content appears truncated or has extra trailing spaces after a resize; or a line that was 200 columns wide wraps incorrectly in an 80-column view.
+**How to avoid:**
 
-**Prevention:** The scrollback sync protocol must include the original column width of each line in its metadata, or the client's scrollback renderer must handle variable-width lines explicitly. Do not assume scrollback lines match the current terminal width. Alternatively, defer scrollback reflow to the client: send raw scrollback content with per-line width metadata; let the client reflow. Add a test: write to a 200-column terminal, resize to 80 columns, and assert that scrollback lines carry the correct original width.
+The inner-auth challenge must incorporate the outer TLS session's exported keying material (`tls-exporter`) as a nonce component. Specifically:
 
-**Owning phase:** Scrollback sync phase.
+1. Export keying material from the outer TLS 1.3 session (the WebTransport connection) using `rustls::ExportedKeyingMaterial` (or the equivalent quinn/rustls API). The label should be nosh-specific (e.g. `"nosh-inner-auth-v1"`), the context empty.
+2. The challenge the server sends to the client (and the challenge the client sends to the server, for mutual auth) must include this exported key material as a non-negotiable field.
+3. The client's SSH-key signature covers `challenge || tls_exported_material`, not `challenge` alone.
+4. The server verifies the signature against the same exported material from its own outer TLS session.
 
----
+If the proxy is honest, client and server see the same exported material (they share the same TLS session from the proxy's perspective — but this is the case only if the proxy is not intercepting; a MITM proxy will have different exported values on each leg, causing verification failure). This provides binding.
 
-### Pitfall S-4: unbounded scrollback memory — the 10,000-line cap is post-auth only
+The implementation must also bind the server's inner-auth response to the same exported material, for symmetric protection.
 
-**What goes wrong:** `SCROLLBACK_LINE_CAP = 10_000` bounds the in-memory history. At 80 columns and 1 byte per cell character, that is roughly 800 KB per session. With many authenticated sessions (the server is multi-user by design), this multiplies: 100 sessions × 800 KB = 80 MB. Worse, the scrollback synced to the client over the channel consumes additional memory proportional to the un-acked send buffer on the QUIC stream. There is no cap on how much scrollback the client requests at once.
+**Warning signs:**
 
-**Warning sign:** Server RSS grows proportionally to session count; OOM kill on a server with many concurrent users.
+Inner-auth handshake that signs only `challenge_bytes` (a CSPRNG nonce) without any outer-session material. An inner-auth implementation that works identically whether connected directly or through a proxy — this means it has no proxy-binding. A confused-deputy attack is invisible at the protocol level unless binding is checked.
 
-**Prevention:** (a) The `SCROLLBACK_LINE_CAP` is already a reasonable per-session cap. (b) The scrollback sync protocol must support paging/backpressure: the client requests N lines at a time via CREDIT frames (channel flow control), not the entire history in one shot. (c) The per-channel send buffer on the server side must be bounded; if the client is not consuming, the server must not buffer more than a few hundred lines in-memory pending ack. This is part of the Pitfall M-6 pump-isolation requirement. Log the per-session scrollback line count as a metric so operators can detect runaway growth.
-
-**Owning phase:** Scrollback sync phase and mux flow-control phase.
-
----
-
-### Pitfall S-5: consistency between synced scrollback and the live datagram grid
-
-**What goes wrong:** The client has two sources of content: the reliable scrollback sync channel (historical lines) and the live datagram grid (current viewport). There is no synchronisation barrier between them. The datagram grid epoch can advance while a scrollback sync is in progress, leaving the client with scrollback that stops at line N and a live viewport that starts at row M where M < N (overlap) or M > N (gap), depending on timing.
-
-**Warning sign:** The client displays duplicate lines or a gap between scrollback and the live viewport; this is intermittent and depends on how long scrollback sync takes.
-
-**Prevention:** The scrollback sync message must include the epoch and grid state at which the snapshot was taken. The client must apply the historical snapshot up to (but not including) that epoch, then resume from live datagrams. This is the same class of problem as the CR-01 snapshot-at-send-time fix already in `server.rs` (the `epoch_snapshots` VecDeque). Design the scrollback sync handshake to include an `epoch_at_snapshot` field; the client gates its transition from scrollback-replay to live-grid on receiving a datagram with `epoch >= epoch_at_snapshot`.
-
-**Owning phase:** Scrollback sync phase.
+**Phase to address:** Inner-auth design phase (the first phase that defines the inner-handshake wire protocol). Channel binding must be designed in before any implementation begins. It cannot be retrofitted without a wire-breaking protocol change.
 
 ---
 
-## Alt-Screen and Unicode
+### Pitfall WT-4: Inner-auth challenge replay — nonce reuse or predictable nonces enable signature replay
 
-### Pitfall A-1: a half-built alt-screen buffer is worse than the current no-op
+**What goes wrong:**
 
-**What goes wrong:** `terminal.rs` line 505 currently handles `?1049h`/`?1049l` by setting `self.echo_state.alt_screen = enable` — no buffer swap, no save, no restore, no clear-on-enter. Full-screen TUI apps (vim, htop, Claude Code) assume that on `?1049h`: the primary-buffer content is saved, the alt screen is cleared to blank, and cursor position is reset. On `?1049l` the primary content is restored. If the implementation saves the grid in `echo_state.alt_screen = true` but does not clear it, the alt-screen grid inherits the primary-buffer content and TUIs render on top of residual shell text. If it clears on entry but does not restore on exit, the shell prompt disappears after quitting vim. Either half-state is worse than the current no-op (which at least produces consistently wrong behaviour that users recognise).
+The inner-auth handshake is a challenge-response exchange outside TLS (or inside a TLS whose purpose is tunnelling, not auth). The server generates a challenge; the client signs it. If the challenge is short, predictable, or reused across sessions, an attacker who observes one successful handshake can replay the client's signature in a future session against the same challenge. Even with unique nonces, if the challenge is not bound to the session (see Pitfall WT-3), the replay can be directed at a different session.
 
-**Warning sign:** Vim opens but shows shell text bleeding through; or the shell prompt is gone after `:q`; or `echo_state.alt_screen` is `true` but `grid` still contains primary-buffer content.
+A subtler form: the client sends its own challenge to the server for server-auth. If that challenge has lower entropy than the server's challenge — for example, a monotonic counter rather than CSPRNG bytes — the client-to-server auth is weaker and may be predictable.
 
-**Prevention:** The alt-screen implementation is atomic: it must implement all three operations together before shipping — (a) save primary grid + cursor on `?1049h`, (b) clear alt grid to blank on `?1049h`, (c) restore primary grid + cursor on `?1049l`. The 999.5 ROADMAP entry says "investigation-first — reproduce on a Linux client↔server before fixing." Follow this exactly: do not start coding until you can reproduce the garbled rendering on Linux, so you know which path the bug actually takes. The mandatory test: run `vim --noplugin -c q` through a full server PTY, capture the datagram stream, and assert that the primary-buffer content before vim started is fully restored in the grid after vim exits.
+**Why it happens:**
 
-**Owning phase:** 999.5 (full-screen TUI rendering correctness phase).
+Inner-auth implementations reuse challenge generation patterns from simpler systems (e.g. a 32-bit counter, a timestamp, a hash of the connection address). These look random but have low entropy or are guessable.
 
----
+**How to avoid:**
 
-### Pitfall A-2: wide-char column drift — single-width cell written at a wide-char position
+Both challenges (client→server and server→client) must be 32 bytes of CSPRNG output (use `rand::rngs::OsRng` or `ring::rand::SystemRandom`). They must be single-use: the server must not accept the same challenge twice within a session or across sessions for the same identity. The challenge must include the outer `tls-exporter` material (see Pitfall WT-3) so replays across sessions are impossible even if the nonce reused. Do not derive the challenge from the connection address, timestamp, or any observable value.
 
-**What goes wrong:** CJK characters and emoji occupy two terminal columns. The server's `print_char()` (line 306) writes one cell per call and advances `cursor.col` by 1. If a wide character occupies columns 4 and 5, but `print_char()` writes it at column 4 and advances to column 5, then the character at column 5 is overwritten by the next character, causing column drift. All subsequent characters are off by one column.
+**Warning signs:**
 
-**Warning sign:** htop renders misaligned bars; vim's status line has columns shifted by one; a box-drawing character renders as two overlapping glyphs.
+A challenge field shorter than 32 bytes. A challenge derived deterministically from any connection-observable value. No monotonic-use check for challenges on the server side. An inner-auth that passes unit tests when the server is restarted between each test (single-use is not verified).
 
-**Prevention:** `print_char()` must be width-aware: for a `char` with `unicode_width::UnicodeWidthChar::width() == Some(2)`, write the character at `col`, write a placeholder (space or a wide-char continuation marker) at `col + 1`, and advance `cursor.col` by 2. Clamp at the right edge (if `col + 2 > cols`, wrap). Add a unit test: advance `\u{4e2d}` (a CJK wide char, width 2) and assert `cursor.col` is 2 after the write, and that `cell(0, 1)` is a placeholder.
-
-**Owning phase:** 999.5 (unicode cell-width audit).
+**Phase to address:** Inner-auth design phase — challenge generation must be specified with entropy requirements before implementation.
 
 ---
 
-### Pitfall A-3: grapheme cluster and ZWJ sequences — one user-perceived glyph, multiple scalars
+### Pitfall WT-5: Inner-auth downgrade — the client accepts direct QUIC when WebTransport was expected
 
-**What goes wrong:** An emoji like a family emoji (`👨‍👩‍👦`, U+1F468 ZWJ U+1F469 ZWJ U+1F466) is a sequence of Unicode scalars joined by zero-width joiners. `vte` calls `print()` once per scalar value. If `print_char()` advances the cursor after each scalar, the ZWJ scalars each occupy a cell, and the rendered glyph is fragmented across 3–5 cells instead of 2 (the display width of the base emoji).
+**What goes wrong:**
 
-**Warning sign:** Emoji rendered as multiple disconnected glyphs; or the cursor position diverges from what a reference terminal shows for the same content.
+If the client is configured to use the WebTransport mode (reverse-proxy path), but the server also accepts raw QUIC connections on the same port, a MITM or misconfiguration can cause the client to connect directly without going through the proxy. The client performs the outer TLS auth (SPKI-pinned against `known_hosts`) directly with the server, bypassing the proxy's ACLs, firewall rules, and access logging. The inner-auth layer never runs because the outer TLS auth succeeds and there is no inner-auth enforcement on the raw path.
 
-**Prevention:** The predictor already handles this correctly via `EpochReset` for combining marks and ZWJ (`classify_printable` returns `EpochReset` for `UnicodeWidthChar::width` returning `Some(0)` or `None`). The server-side terminal model must apply the same rule: if `UnicodeWidthChar::width(c)` returns `Some(0)`, the character is a combining mark or ZWJ — do NOT advance the cursor; either attach it to the previous cell or ignore it (the scope fence in `D-12-02b` currently ignores it via the implicit default `print()` → `print_char()` → `cursor.col += 1`, which is wrong). Add a unit test: advance ZWJ sequence bytes and assert the cursor does not advance past the base glyph's width.
+This also manifests as a configuration error: the operator intends the server to be reachable only via the proxy but forgets to firewall the direct QUIC port, leaving it open.
 
-**Owning phase:** 999.5 (unicode cell-width audit).
+**Why it happens:**
 
----
+The nosh server currently accepts raw QUIC connections. When WebTransport mode is added, the server may be left running both listeners without a clear mode switch or firewall enforcement. The client has no in-protocol mechanism to verify it connected through the expected proxy topology.
 
-### Pitfall A-4: alt-screen resize — saved primary buffer has different dimensions
+**How to avoid:**
 
-**What goes wrong:** The user resizes the terminal while vim (alt screen) is open. `TerminalState::resize()` resizes `grid` (the active screen) but not the saved primary buffer. When vim exits (`?1049l`), the implementation restores the old primary buffer — which is now the wrong size. The restored buffer is either truncated (rows/cols cut off) or padded with blank rows (if the terminal grew), creating a mismatched viewport.
+The server should have an explicit `--mode` or configuration flag: `raw-quic` (current), `webtransport` (new), or `both` (explicitly opt-in, not default). In `webtransport` mode, the server should not accept raw QUIC connections at all — only WebTransport upgrades. Document the required firewall rule (block raw UDP/443 from the internet, allow only from the proxy IP) in the operator guide. The threat model document (SEC-01) must cover this misconfiguration.
 
-**Warning sign:** After resizing while in vim, the shell prompt is rendered at the wrong position after exit; or content from the primary buffer bleeds into the new rows.
+**Warning signs:**
 
-**Prevention:** When `resize()` is called and alt screen is active, both buffers must be resized — the active alt-screen grid AND the saved primary grid. The saved primary grid's resize follows the same logic as the main `resize()` (truncate or pad). Add a test: activate alt screen, resize from 80×24 to 80×30, deactivate alt screen, and assert primary grid dimensions are 80×30 with correctly placed content.
+Server accepts connections on the raw QUIC path even when configured for WebTransport. Client successfully authenticates directly when the proxy is down. No `--mode` flag exists.
 
-**Owning phase:** 999.5 (alt-screen implementation phase).
-
----
-
-### Pitfall A-5: predictor predicts inside cursor-addressing apps — corrupts the screen
-
-**What goes wrong:** The predictor is designed for shell readline prompts: it predicts character echo at a fixed cursor position. Full-screen TUI apps (vim, htop) use cursor-addressing sequences (`CSI H`, `CSI A/B/C/D`) to position text anywhere on screen. If the predictor is still active during alt-screen mode, it will predict characters at positions that the app is already managing, producing corrupted overlays (e.g., a speculative 'j' appears at row 5, col 22 in the middle of vim's buffer).
-
-**Warning sign:** Characters appear at wrong positions in vim or htop; the predictor's overlay is visible on top of a TUI app's content.
-
-**Prevention:** The predictor already has an `EpochReset` for escape sequences and cursor motion (see `classify_input`: any `\x1b` sequence not matching a known motion key → `EpochReset`). However, this fires per-keystroke; it does not globally disable prediction when the server signals alt-screen mode. The server already sends `?1049h`/`?1049l` via the reliable stream (as PTY data). The client must observe `echo_state.alt_screen` from the server's datagram or a dedicated signal and call `predictor.reset()` (or disable prediction entirely) on transition to alt screen. The existing `EpochReset` is not sufficient alone because the user may not type anything for a full `vte` rendering cycle. Add a test: send `?1049h` through the session, verify `predictor.pending` is empty and `should_display()` is suppressed.
-
-**Owning phase:** 999.5 (client-side predictor integration with alt-screen state).
+**Phase to address:** WebTransport integration phase (server mode flag), and SEC-01 threat model document (misconfiguration coverage).
 
 ---
 
-### Pitfall A-6: cursor save/restore (DECSC/DECRC) not implemented — interacts with alt-screen
+### Pitfall WF-1: Message discriminant corruption — new inner-auth variants inserted at non-tail positions
 
-**What goes wrong:** `?1049h` is specified to save the cursor position as part of the enter-alt-screen operation (equivalent to `ESC 7` DECSC before the switch). `?1049l` restores it (equivalent to `ESC 8` DECRC after the switch). If the implementation saves the primary buffer but not the cursor, the cursor after `?1049l` is at whatever position it was left at when the alt buffer exited, not where it was before vim opened. The shell prompt renders at row 0 instead of the last prompt position.
+**What goes wrong (silent-corruption — security-critical):**
 
-**Warning sign:** Cursor is at (0, 0) after exiting vim; shell prompt appears at the top of the screen instead of the expected position.
+The `nosh-proto` `Message` enum currently has 18 variants at discriminants 0–17 (postcard encodes enums by source-order position). The v1.3 codebase has two `// APPEND-ONLY — do NOT insert or reorder` comments and a `message_discriminant_order_is_stable` test. The inner-auth handshake for WebTransport mode will require new message types: at minimum an `InnerAuthChallenge` (server→client), `InnerAuthResponse` (client→server), and `InnerAuthOk`/`InnerAuthErr` pair. The design pressure is to add these near the top of the enum (logically they come "before" session open) or near the `Reattach`/`ReattachErr` variants (they are conceptually related). Placing them anywhere but after `ScrollbackCredit` (discriminant 17) will shift all following discriminants and silently corrupt every old client that tries to decode a message from a new server — `PtyData` will decode as `InnerAuthChallenge`, `Reattach` will decode as something else, and sessions will silently misbehave or hang.
 
-**Prevention:** The saved primary state must include cursor position. Implement this as a struct: `saved_primary: Option<(Vec<Vec<Cell>>, CursorPos)>`. On `?1049h`: save `(grid.clone(), cursor)`. On `?1049l`: restore both. Add a test: position cursor at (12, 40), activate alt screen, position cursor at (0, 0), deactivate alt screen, assert cursor is at (12, 40).
+**Why it happens:**
 
-**Owning phase:** 999.5 (alt-screen implementation phase). Must be done together with Pitfall A-1 (atomic implementation).
+A new developer sees `Reattach` at discriminant 5 and thinks "inner auth is also a form of session open, so it belongs near Reattach" — and inserts it at position 5. The compiler accepts it. The discriminant stability test catches it only if it is running in CI and the expected values are still hardcoded. If the test was not updated to include the new expected discriminants, it will catch the shift only if a NEW variant happened to land at an old variant's expected byte — easily missed in a busy PR.
 
----
+**How to avoid:**
 
-## Repaint Pacing
+All inner-auth message variants MUST be appended after `ScrollbackCredit` (currently discriminant 17). The `message_discriminant_order_is_stable` test must be updated to include the new variants with their expected discriminant bytes before any new variant is merged. The append-only comment block must be extended to name `ScrollbackCredit` as the current tail. Consider extracting the inner-auth messages into a separate `InnerAuthMessage` enum encoded on a separate channel, so they never pollute the main `Message` enum and the discriminant stability invariant is localised. This is the cleaner long-term design.
 
-### Pitfall R-1: the 999.4 infinite-spin — recomputing fresh_runs during burst drain
+**Warning signs:**
 
-This is the exact failure that caused the 999.4 burst implementation to be reverted. It is documented in ROADMAP 999.6 and the ROADMAP 999.4 plan entry.
+A PR that inserts any `Message` variant between two existing variants. A PR that adds variants without updating `message_discriminant_order_is_stable`. Any live connection where one peer is on a new build and the other is on the old build and messages are decoded as the wrong variant (manifests as unexpected disconnects, garbled session output, or the session hanging immediately after auth).
 
-**What goes wrong:** `build_state_diff()` in `server.rs` (line 294) computes `fresh_runs = compute_diff_runs(&cells, last_acked_snapshot)` on every call. During a burst (multiple datagrams per tick), `last_acked_snapshot` does NOT advance between burst iterations — epoch-acks arrive in a different `select!` arm that does not run while the burst arm is synchronously looping. Re-merging `fresh_runs` into `all_runs` every iteration refills the deferred queue faster than it drains (deferred is prepended to fresh_runs on every call). The `pending_deferred` queue never empties. The result is a `loop` that spins, calling `build_state_diff` forever: `mutual_auth_inprocess_happy_path` hangs, and the session is effectively dead.
-
-**Warning sign:** Integration test `mutual_auth_inprocess_happy_path` (or any live-session test) hangs indefinitely. CPU pegged at 100% on the server session task. `pending_deferred.len()` is non-zero and not decreasing.
-
-**Prevention (from 999.6 mandatory gates):** When `pending_deferred` is non-empty (drain mode), do NOT call `compute_diff_runs` again — use only the existing `pending_deferred` contents as `all_runs`. Only call `compute_diff_runs` on the first datagram of the burst (when `pending_deferred` is empty). The mandatory regression test is named in the ROADMAP: `burst_drains_when_grid_differs_from_acked_baseline`. This test must: set up a non-empty grid vs an empty `last_acked_snapshot`, call `build_state_diff` in a simulated burst loop, and assert that `pending_deferred.len()` is 0 after at most N iterations (N = ceil(grid cells / MTU runs)). The test must FAIL before the fix and PASS after.
-
-**Owning phase:** 999.6 (repaint pacing phase). This test must be the first thing written.
+**Phase to address:** Inner-auth design phase (before any new Message variants are defined). The discriminant stability test update must be part of the same commit as the new variants.
 
 ---
 
-### Pitfall R-2: the 999.4 noecho-epoch security regression — per-datagram epoch increment
+### Pitfall MH-1: Session-fixation via reattach-token theft across the proxy boundary
 
-This is the second failure that caused the 999.4 revert. It is documented in the ROADMAP 999.6 entry and directly interacts with the predictor's structural noecho suppression invariant.
+**What goes wrong:**
 
-**What goes wrong:** The 999.4 burst implementation incremented `current_epoch` once per datagram emitted during the burst (normal: one epoch per tick). On the client, receiving a datagram with `new_epoch > last_known_epoch` causes `cull()` to run and potentially advance `confirmed_epoch`. During a `read -s` / `stty -echo` window, the server never echoes the typed characters, so `cull()` should always find a mismatch and `confirmed_epoch` should never advance. However, the per-datagram epoch increment changed the cadence: the burst sent N datagrams with N distinct epochs before the `read -s` had a chance to suppress echo. The client's `confirmed_epoch` advanced N times during the password-entry window. The literal secret characters remained suppressed (the tentative mechanism still hid them), but the confirmed-state proxy moved — which violates the invariant tested by `noecho_read_dash_s_zero_predicted_chars`.
+The existing cold-reattach protocol uses a 16-byte CSPRNG token (single-use, rotated on every successful reattach) that is bound to the SSH identity via the TLS handshake. In the raw QUIC topology, the reattach token is transmitted only inside the TLS-encrypted QUIC stream — a passive attacker cannot read it, and an active attacker cannot use it without also owning the SSH private key (the TLS handshake requires the SSH key for the new connection's `CertificateVerify`).
 
-**Warning sign:** `noecho_read_dash_s_zero_predicted_chars` integration test fails. Characters typed during `read -s` are not visible (good), but `predictor.confirmed_epoch()` has advanced past `0` (bad — means the proxy moved). On a live session: briefly visible "ghost" predictions during sudo/ssh password entry.
+In the WebTransport topology, the outer TLS is terminated at the proxy. The proxy sees the cleartext WebTransport tunnel. If the inner-auth handshake is not complete before the reattach token is transmitted, or if the token is transmitted over the WebTransport session before the inner auth is proven, the proxy (or any component that can read the WT tunnel) can read the reattach token and use it to steal the session on a different raw-QUIC or WebTransport connection.
 
-**Prevention (from 999.6 mandatory gates):** All datagrams in one burst share a single epoch (one epoch per tick, not per datagram). Assign `current_epoch` once at the start of the burst tick, and stamp all burst datagrams with the same epoch. The client sees repeated datagrams with the same epoch — which is fine; `cull()` already handles `epoch >= epoch_required` (not `==`) and the client's `decode_epoch_ack` path takes `max(last_acked, acked)`. The mandatory test `noecho_read_dash_s_zero_predicted_chars` MUST pass with the burst code active — it is the primary regression gate. Run it in CI as a required check, not an `#[ignore]`-gated test.
+**Why it happens:**
 
-**Owning phase:** 999.6 (repaint pacing phase). Both this and R-1 must be solved together before any burst code ships.
+The temptation is to reuse the existing `Reattach` message unchanged in the WebTransport path, since the session-resume logic is the same. But the security invariant of the existing token — "only someone with the SSH private key can use this token" — relies on the outer TLS for confidentiality. Inside a WT tunnel, the outer TLS is at the proxy, not end-to-end.
 
----
+**How to avoid:**
 
-### Pitfall R-3: QUIC datagram send-buffer pressure and congestion — bursting too hard
+The reattach token MUST NOT be transmitted in the WebTransport session until the inner-auth handshake is complete and the inner session is cryptographically authenticated. The protocol sequencing must be:
 
-**What goes wrong:** `conn.send_datagram()` on quinn 0.11 succeeds synchronously if the send buffer has space. The 999.6 ROADMAP entry notes the confirmed mechanism: "There is no QUIC flow-control ceiling (datagrams are not ack-gated; send buffer is 1 MiB). The only limiter is the one-datagram-per-tick policy." Removing that limiter without a congestion budget means the burst can inject 1 MiB of datagrams into the QUIC send buffer in one tick, overwhelming the congestion window. QUIC will drop or delay the excess. At 150 ms RTT (the live test scenario), injecting more datagrams than the congestion window allows simply causes them to be queued, not delivered faster — the burst becomes indistinguishable from the current drip in terms of delivery time, while consuming more memory.
+1. WebTransport outer session established.
+2. Inner-auth handshake runs (mutual SSH-key challenge-response with outer TLS binding).
+3. Only after `InnerAuthOk`, the client may send `Reattach` or `SessionOpen`.
 
-**Warning sign:** `datagram_send_buffer_space()` (the per-tick budget gate mentioned in the 999.6 ROADMAP) is not used; the burst loop runs until `pending_deferred` is empty regardless of network capacity. Alternatively: `send_datagram` returns `SendDatagramError::TooLarge` (impossible if `encode_datagram` uses `max_datagram_size`) but the buffer fills silently.
+Additionally, for the WebTransport path, the reattach token should be bound not only to the SSH identity but also to the outer TLS session's exported key material (same as the inner-auth binding in Pitfall WT-3), so a stolen token cannot be replayed on a different outer session.
 
-**Prevention:** Use `conn.datagram_send_buffer_space()` (public in quinn 0.11.9 as documented in the 999.6 ROADMAP) as the per-tick budget gate. Send burst datagrams only while `datagram_send_buffer_space() > mtu`. Do not burst more than `min(pending_deferred.len(), floor(buffer_space / mtu))` datagrams per tick. This also provides automatic fall-back to single-datagram behaviour on a congested path. If `datagram_send_buffer_space()` is unavailable or returns an unexpected type in the actual API, use a fixed conservative burst limit (e.g. 8 datagrams per tick) as a fallback.
+**Warning signs:**
 
-**Owning phase:** 999.6 (repaint pacing phase).
+The client sends `Reattach` before an `InnerAuthOk` is received. The server accepts `Reattach` before the inner-auth state machine reaches `Authenticated`. A test that replays a captured `Reattach` token on a different WT session and succeeds.
 
----
-
-### Pitfall R-4: direction artefact — top-down vs bottom-up paint order within a burst
-
-**What goes wrong:** `compute_diff_runs()` (line 212) walks `current` row by row from top (row 0) to bottom. For a full-screen repaint, the first datagram of the burst contains the top rows; subsequent datagrams contain the bottom rows. The client applies datagrams in arrival order. The visual effect is a top-down repaint wave. The converse happens for content that scrolled: older deferred runs (which were cursor-proximate) go first, and the bottom of the screen arrives before the top — a bottom-up artefact. This was observed in the 999.4 live test ("vim startup paints top-down and a pasted multi-line block paints bottom-up in visible waves at 150 ms RTT").
-
-**Warning sign:** A full-screen app like vim appears to "wipe in" from the top or bottom rather than appearing atomically in ~1 RTT.
-
-**Prevention:** The direction artefact is inherent to the sequential cell-walk scan order and is not a bug — it is what happens when a repaint takes more than one MTU. Bursting multiple datagrams reduces the number of ticks over which the repaint drips, collapsing the artefact from "N ticks × RTT" to "1 tick × RTT". At 150 ms RTT and 80×24 terminal, a full repaint is ~1920 cells. With a typical 1200-byte MTU and ~10 cells per run, one datagram covers ~120 cells; 16 datagrams per burst covers the full screen in 1 tick. The artefact is acceptable if the total delivery time collapses to 1 RTT. Do not attempt to reorder runs within the burst (e.g. interleaving top/bottom) — it complicates the deferred queue without measurable benefit.
-
-**Owning phase:** 999.6 (repaint pacing phase). Document the residual artefact in the release notes as a known behaviour, not a bug.
+**Phase to address:** Inner-auth design phase (state-machine sequencing). Must be designed in; cannot be patched after the fact without a protocol change.
 
 ---
 
-## Security-Critical Interactions
+### Pitfall MH-2: Double-attach race — two WebTransport clients reattach to the same orphaned session simultaneously
 
-### Pitfall SEC-1: noecho suppression is structural — anything that advances confirmed_epoch breaks it
+**What goes wrong:**
 
-The predictor's noecho suppression (PREDICT-04) is not an explicit flag. It falls out of the epoch mechanism: when the server never echoes a character (`stty -echo` / `read -s`), `cull()` always finds a mismatch, `confirmed_epoch` never advances, and all predictions remain tentative (hidden). The invariant is proven by `noecho_suppression` (unit test) and `noecho_read_dash_s_zero_predicted_chars` (integration test).
+An orphaned session can be in a `Reconnecting` state for up to the idle timeout (300 s). In the raw QUIC topology, two simultaneous reattach attempts from different connections are arbitrated by the `SessionRegistry` — the second one loses because the registry marks the session as active on the first successful attach. In the WebTransport topology, two clients behind different proxy connections can simultaneously send `Reattach` with the same token. The token is single-use, but if the server's token invalidation is not atomic (check-then-invalidate is not a single critical section), both clients can win the check and both proceed to the reattach session — resulting in two live sessions driving the same PTY, which produces corrupted output for both.
 
-Any change that causes `confirmed_epoch` to advance during a noecho window — regardless of whether literal secret characters are displayed — breaks this invariant. Demonstrated failure modes:
-- 999.4 burst: per-datagram epoch increment → confirmed_epoch advances during `read -s` (the 999.4 revert).
-- Any change that sends a datagram whose epoch the client will advance past, even for non-secret cells, when a `read -s` is in progress.
+**Why it happens:**
 
-**Prevention:**
-- `noecho_read_dash_s_zero_predicted_chars` is the mandatory gate. It must be run as a required (non-`#[ignore]`) test before any datagram-timing or epoch-cadence change ships.
-- Never increment `current_epoch` more than once per tick. All datagrams in a burst share one epoch (R-2 above).
-- Never send epoch-advancing datagrams on a separate timer or background task that runs concurrently with the main tick loop.
-- When adding any new code path that calls `conn.send_datagram`, audit whether it can fire during a `read -s` window and whether the datagram it sends will cause the client to advance `confirmed_epoch`.
+The `SessionRegistry` may use a `Mutex`-guarded `HashMap`, which is correct for the raw QUIC path (each connection runs in its own tokio task and the mutex serialises token checks). Over WebTransport, if the server-side WT session handling spawns a separate tokio task per WT session (the likely design), two tasks can contend on the registry lock. The bug is that "check token validity" and "invalidate token" must be a single atomic operation inside the lock.
 
----
+**How to avoid:**
 
-### Pitfall SEC-2: unbounded server memory from scrollback + OSC accumulation (post-auth OOM)
+The token check-and-invalidate in `SessionRegistry::try_reattach` must be a single `HashMap::remove` call inside the mutex guard — remove the token from the map, returning it if present. If `remove` returns `None`, the token was already used. This is already the correct pattern for the raw QUIC path; confirm it holds when the WebTransport path is wired in. Write a test that fires two concurrent reattach attempts with the same token and asserts only one succeeds.
 
-Two independent post-auth memory exhaustion vectors:
+**Warning signs:**
 
-**Scrollback:** 10,000 lines × 80 columns × (per-cell overhead) per session. With many sessions, RSS grows proportionally. The per-session cap is reasonable; the risk is multi-session accumulation. The scrollback sync channel adds a second buffer (the in-flight send buffer on the QUIC stream). Both must be bounded.
+Two clients successfully reattaching to the same session. `SessionRegistry::try_reattach` that calls `get` (to check) then `remove` (to invalidate) in two separate steps — classic TOCTOU. Intermittent test failure in a concurrent-reattach test.
 
-**OSC accumulation (999.7):** `vte` with the `std` feature accumulates OSC bytes in an unbounded `Vec<u8>` across `advance()` calls until the terminator arrives. `OSC_52_MAX_BYTES` and `MAX_TITLE_BYTES` caps live in `osc_dispatch`, but vte has already allocated the full unbounded buffer before `osc_dispatch` runs. A `ESC]52;c;<100MB>` sequence allocates 100 MB in the server process before any application-level cap fires. This is tracked as Phase 999.7 and is explicitly deferred from M5 — but the risk is real for any exposed server. The mitigation (an OSC-length pre-filter in `TerminalState::advance`) must not be accidentally blocked by M5 work.
-
-**Prevention:**
-- Keep the `SCROLLBACK_LINE_CAP` constant. Do not raise it without a measured reason.
-- Bound the scrollback sync send buffer at the channel layer (Pitfall S-4 / M-6 above).
-- Do not defer 999.7 past M5's security pass. If M5 ships without the OSC pre-filter, document the residual risk explicitly in `docs/999.7-SECURITY.md`.
-- Add a `tracing::warn!` when `scrollback.len()` approaches `SCROLLBACK_LINE_CAP` for operator observability.
+**Phase to address:** Migration handover phase. The registry atomicity must be confirmed (not assumed) before the WebTransport reattach path is wired in.
 
 ---
 
-### Pitfall SEC-3: postcard discriminant invariant as a protocol security boundary
+### Pitfall SEC-1: OSC-OOM live bug — 999.7 mitigation is in place but must survive M7 changes
 
-The `Message` enum's discriminant ordering is a security boundary as well as a compatibility boundary. If a variant is inserted before `ReattachErr` (discriminant 7), old clients will decode the new variant as `ReattachErr`. This means a legitimate `ChannelOpen` message could be decoded as "reattach rejected" by an old client — not a security issue in itself, but a protocol correctness failure that could be exploited if the new variant carries sensitive data that is silently discarded instead of acted on. Conversely, an `ReattachErr` decoded as a `ChannelOpen` by an old server could open an unintended channel.
+**What goes wrong:**
 
-**Prevention:** The discriminant stability test (Pitfall M-1) also covers this case. Run it in CI. Never insert variants before existing ones.
+The `docs/999.7-SECURITY.md` documents that the Phase-16 mitigation reasoning was incorrect: `OSC_52_MAX_BYTES` and `MAX_TITLE_BYTES` run in `osc_dispatch` (after vte has already buffered the full sequence), not before vte accumulates. A multi-chunk giant OSC sequence grows vte's internal `osc_raw` `Vec<u8>` without bound until OOM. Phase 19 Plan 03 added an `osc_prefilter` in `TerminalState::advance` with a 1 MiB cap and a parser resync on overflow. This was the correct fix.
+
+The OOM bug is closed for v1.3. The risk for v1.4 is regression: if any M7 phase modifies `TerminalState::advance`, the channel layer, or adds a new OSC type to `TerminalControlPayload`, the prefilter logic (shadow state `in_osc` / `osc_byte_count`) may be invalidated. Specifically:
+
+- Adding a new OSC category that the prefilter does not account for (e.g. OSC 1337 for iTerm2 image protocol) passes through the prefilter uncapped if the prefilter does not recognise the sequence as an OSC.
+- Changes to the multi-chunk delivery path (e.g. the new WebTransport reliable stream delivering PTY output in larger chunks) change the chunk boundaries that the prefilter sees, potentially breaking the `in_osc`/`osc_byte_count` shadow state if it assumes chunk-aligned OSC sequences.
+
+The fuzz target `osc_accumulation` exists but its `max_len` default (4 096) is too small to catch multi-MiB accumulation. This is documented in 999.1-SECURITY.md §4 footnote 1.
+
+**How to avoid:**
+
+Before the 999.7 re-check phase ships, run the named regression test (`oversized_multi_chunk_osc_is_bounded_then_resyncs`) and the fuzz target with increased max_len (e.g. `LIBFUZZER_MAX_LEN=2097152`) to confirm the prefilter still holds. Any change to `TerminalState::advance` or the OSC dispatch path must re-run this test as a mandatory gate. The 999.7 re-check phase should audit the prefilter against all OSC categories nosh handles, not just OSC 52 and OSC 0/2.
+
+**Warning signs:**
+
+`TerminalState::advance` changes that do not re-run `oversized_multi_chunk_osc_is_bounded_then_resyncs`. Adding a new `TerminalControlPayload` variant without checking whether its corresponding OSC sequence is pre-filtered. Server RSS growing under a session that emits large OSC sequences.
+
+**Phase to address:** 999.7 OSC OOM re-check phase (dedicated). The re-check must be adversarial — probe the specific claim that the prefilter shadow state is correct for all OSC sequence boundaries, not just the single test case.
 
 ---
 
-## Looks Done But Isn't — Sign-off Checklist
+### Pitfall SEC-2: Terminal escape injection from a malicious server — client trust boundary
 
-This checklist is the sign-off criteria for M5. Each item has a specific test or observable that confirms it is genuinely complete, not superficially done.
+**What goes wrong:**
 
-### Channel Multiplexing
+The 999.2 client trust-boundary backlog covers this class. In the current architecture, the server sends `PtyData` (raw PTY bytes) and the client re-emits them directly to the local terminal (stdout). A malicious or compromised server can send arbitrary ANSI/VT sequences to the client terminal, including:
 
-- [ ] `message_discriminant_order_is_stable` test passes — encodes every `Message` variant and asserts its discriminant byte matches the hardcoded expected value. New variants appended after `TerminalControl` (9) must be added to this test.
-- [ ] Channel-id namespace partitioning test passes — client-open and server-open fired simultaneously produce non-colliding ids, session survives.
-- [ ] `ChannelAccept`/`ChannelReject` for unknown id is a no-op, not a panic — verified by a test that sends an accept for a channel the requester already closed.
-- [ ] After cold reattach, scrollback channel is re-opened from scratch and delivers correct content — not replayed from the byte-stream replay.
-- [ ] Flow-control: scrollback channel filled to its window limit; PTY input latency measured and confirmed < 5 ms during the backpressure episode.
+- **OSC 52 write:** inject content into the client's clipboard without user interaction (already gated by the server's OSC 52 passthrough; but the client re-emits the forwarded payload without sanitisation of the `selection` field).
+- **OSC 8 hyperlinks:** inject a link to a `file://` or `shell:` URI that executes code when the user clicks it in a terminal that supports clickable links (e.g. iTerm2, Windows Terminal).
+- **Title injection (OSC 2):** set the terminal window title to a command that looks like it comes from the shell — used in social engineering.
+- **Clipboard poisoning via OSC 52 followed by a crafted prompt:** classic clipboard-injection attack; the user pastes a malicious command thinking it came from a legitimate session.
+- **`\r` + overwrite:** the server sends a line ending in `\r` (carriage return without newline), followed by content that overwrites the displayed prompt — the user sees a fake prompt but the clipboard or terminal title contains something different.
 
-### Scrollback Sync
+The attack surface is particularly wide in the WebTransport topology because the proxy may be internet-facing and the nosh server may be trusted to relay bytes from arbitrary applications running in the session.
 
-- [ ] Scrollback content is sent only over a reliable QUIC stream (channel), never over datagrams — enforced by a type-level constraint (the sender accepts only `SendStream`, not `Connection`).
-- [ ] Scrollback is suppressed while `echo_state.alt_screen` is true — unit test: activate alt screen, force scroll, assert `scrollback.len()` is unchanged.
-- [ ] Scrollback lines include original column-width metadata — client can render a 200-column scrollback line in an 80-column window without truncation artefacts.
-- [ ] `epoch_at_snapshot` field present in scrollback sync handshake — client transitions from scrollback-replay to live-grid cleanly, with no duplicate or missing lines at the boundary.
-- [ ] Scrollback paging works — client requests 100 lines at a time; server does not send the next 100 until a CREDIT frame is received; verified under simulated slow client.
+**Why it happens:**
 
-### Alt-Screen and Unicode
+Remote shell protocols traditionally trust the server fully — the server is the user's own machine. nosh's mobility model changes this: the server may be a shared or cloud-hosted machine, and the connection goes through an internet-facing proxy. A compromised application on the server has a direct byte channel to the client terminal.
 
-- [ ] `?1049h` clears the alt-screen grid to blank and saves the primary grid + cursor — verified by: write to primary, `?1049h`, write to alt, `?1049l`, assert primary content restored and cursor at saved position.
-- [ ] `?1049l` restores primary grid content exactly — bit-for-bit match against the saved state.
-- [ ] Resize while alt-screen is active resizes both the alt grid and the saved primary grid — verified by resize test (Pitfall A-4).
-- [ ] Wide-char (CJK, width 2) advances cursor by 2 and writes a placeholder at `col + 1` — unit test with `\u{4e2d}`.
-- [ ] ZWJ / combining marks do not advance the cursor — unit test with a ZWJ emoji sequence.
-- [ ] Predictor is suppressed or reset when `echo_state.alt_screen` transitions to `true` — unit test: send `?1049h` via PTY bytes, assert `predictor.pending` is empty and no predictions are displayed.
-- [ ] After `:q` from vim, the shell prompt is visible and at the correct position (live human validation required, not automatable).
+**How to avoid:**
 
-### Repaint Pacing
+The 999.2 phase must audit each category of outbound data from server to client and apply the minimum trust for each:
 
-- [ ] `burst_drains_when_grid_differs_from_acked_baseline` test passes — RED before fix, GREEN after. Verifies that `pending_deferred.len()` reaches 0 in a finite number of iterations with a non-empty grid vs an empty acked baseline.
-- [ ] `noecho_read_dash_s_zero_predicted_chars` passes with burst code active — mandatory security gate. Must be a required non-`#[ignore]` test in CI.
-- [ ] `current_epoch` increments exactly once per tick regardless of burst size — unit test: call the burst loop with N=8 datagrams, assert `current_epoch` incremented by 1.
-- [ ] `datagram_send_buffer_space()` is used as the per-tick budget gate — verified by code review; no burst loop that ignores the buffer space.
-- [ ] A full 80×24 screen repaint is delivered in ≤ 2 RTT at 150 ms RTT — live test with `time vim --noplugin -c q` measuring time from the keystroke to the first fully-rendered frame.
+- `PtyData`: cannot be sanitised without breaking legitimate terminal apps. Define an explicit "malicious server" threat model: nosh trusts the server to the same degree as SSH. Document this boundary in SEC-01.
+- `TerminalControl(Clipboard)`: the server-side filter (`osc_dispatch` drops the query form) already exists. Confirm the client does not re-emit the selection field raw — it must validate the selection is a known value (`c`, `p`, `s`, etc.) before forwarding.
+- `TerminalControl(Title)`: the title is already bounded to 1 KiB. Confirm the client strips `\x1b`, `\x07`, `\r`, `\n` from the title before re-emitting — a title containing an OSC terminator can break out of the title sequence on some terminals.
+- OSC 8 hyperlinks: explicitly decide whether to pass through or strip. If the server signals `OSC 8 ; ; <URL> ST`, confirm the URL scheme whitelist (allow `https://`, deny `file://`, `shell:`, `ms-appx:`).
 
-### Security and Memory
+**Warning signs:**
 
-- [ ] `noecho_read_dash_s_zero_predicted_chars` passes — non-negotiable gate for any epoch or datagram timing change.
-- [ ] Server RSS under 100 sessions does not exceed expected bound (100 × scrollback cap × per-cell size) — load test or calculation.
-- [ ] OSC 999.7 mitigation is in place OR `docs/999.7-SECURITY.md` is updated to reflect deferred status with current scope.
-- [ ] `postcard` discriminant test added to CI — any future variant addition that breaks discriminant order fails CI immediately.
+`TerminalControl(Clipboard{selection: ..})` re-emitted without validating the `selection` bytes. `TerminalControl(Title{title: ..})` re-emitted without stripping escape bytes. Any OSC 8 sequence arriving from the server that is not explicitly handled. The client trust-boundary analysis in 999.2 not covering the `TerminalControl` forwarding path.
+
+**Phase to address:** 999.2 client trust-boundary hardening phase. The SEC-01 threat model must define the "malicious server" boundary explicitly.
+
+---
+
+### Pitfall SEC-3: TOFU prompt fatigue — silent accept or non-blocking prompt trains the wrong habit
+
+**What goes wrong:**
+
+SEC-02 requires an interactive TOFU fingerprint-confirm prompt on first contact. The failure mode is a prompt that:
+
+1. Does not display the fingerprint in a human-verifiable form (SHA-256 hex or randomart — not a raw base64 dump that no one reads).
+2. Defaults to "accept" on empty input (pressing Enter once accepts the key — the SSH pattern that most users follow without reading).
+3. Is non-blocking (fires in the background while the session starts, so the user cannot interrupt the session if they reject the key).
+4. Does not pause the session until the user responds (the terminal starts rendering PTY output over the fingerprint prompt, making it unreadable).
+
+All four failure modes produce the same behavioural outcome: the user accepts every key without verifying it, which provides no security benefit over silent TOFU (the v1.3 current behaviour).
+
+**Why it happens:**
+
+Developers model the prompt on the SSH client's `Are you sure you want to continue connecting (yes/no)?` pattern, which also defaults to explicit `yes`, but SSH users have trained to type `yes` reflexively. The goal is to make verification easy, not to add friction that is immediately bypassed.
+
+**How to avoid:**
+
+The prompt must:
+- Display the fingerprint as SHA-256 hex (matches `ssh-keygen -l -E sha256` output so users can verify against a known value) and optionally randomart.
+- Require the user to type `yes` explicitly — no empty-input default.
+- Block session establishment until the user responds — no PTY output until the prompt is answered.
+- On rejection, close the connection cleanly (not leave a half-open session).
+- Be suppressed (no prompt) if `StrictHostKeyChecking=yes` equivalent is configured, returning an error instead.
+
+The prompt must be rendered to the terminal before any PTY output is received, which means the session open sequence must not send `SessionOpen` until after the TOFU prompt resolves.
+
+**Warning signs:**
+
+Prompt that accepts empty input (just Enter). PTY output arriving before the prompt has been answered. The fingerprint displayed as a raw base64 string. The prompt rendered in a way that is overwritten by PTY output during the session.
+
+**Phase to address:** SEC-02 interactive TOFU phase.
+
+---
+
+## Technical Debt Patterns
+
+| Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
+|----------|-------------------|----------------|-----------------|
+| Reuse `Message` enum for inner-auth messages | No new enum, simpler implementation | Every inner-auth protocol change risks discriminant-shift bugs on the main protocol wire | Never — extract inner-auth to a separate `InnerAuthMessage` enum on a separate channel |
+| Skip channel binding in inner auth | Simpler inner-auth implementation | Proxy MITM is undetectable; inner auth provides no security over no auth | Never — channel binding is the entire point of the inner handshake |
+| Trust `X-Forwarded-For` for rate limiting | Simple implementation | XFF is trivially spoofable by any client; rate limits and IP-based caps are bypassed | Never for security decisions; only for non-security logging |
+| Inner auth without nonce freshness guarantee | Reuse existing reattach token as challenge | Replay attacks become possible; prior observed signatures can be replayed if the nonce is predictable | Never |
+| Emit raw `TerminalControl` payload to terminal without sanitisation | Simpler client forwarding code | Malicious server can inject OSC sequences that poison the clipboard or execute code | Never for OSC 8 URLs; acceptable for OSC 52 data if selection field is validated |
+| Silent TOFU (auto-accept, no prompt) | No UX friction | The entire TOFU security model is bypassed; provides the same security as no host key verification | Never for new connections; acceptable only when `StrictHostKeyChecking=no` is explicitly set |
+| Defer OSC-OOM 999.7 re-check to a later milestone | Less scope this milestone | The OOM is a live post-auth DoS on multi-user servers, especially relevant after internet exposure | Never — must be re-verified before internet exposure |
+
+---
+
+## Integration Gotchas
+
+| Integration | Common Mistake | Correct Approach |
+|-------------|----------------|------------------|
+| `wtransport` + `quinn` in same workspace | Using raw `Connection::max_datagram_size()` inside a WT session for payload sizing | Use the WT `Session` API's datagram size method, which accounts for capsule overhead |
+| `wtransport` + `rustls-ring` | Adding `wtransport` without specifying `default-features = false`, pulling in `aws-lc-rs` alongside `ring` | Add with `default-features = false` and pin the crypto provider explicitly |
+| Inner-auth + existing `HostKeyVerifier` | Reusing the outer-TLS `HostKeyVerifier` for the inner-auth server identity check | The inner-auth server check needs a different code path — the outer TLS is at the proxy, the inner auth verifies the nosh server daemon's key against `known_hosts` using the inner challenge |
+| Reattach token + WT session | Transmitting the reattach token before inner auth completes | Strict sequencing: `InnerAuthOk` → `SessionOpen`/`Reattach`; the token must never travel before inner auth is complete |
+| `X-Forwarded-For` + rate limiting | Keying the pre-auth half-open cap on the XFF header value | Key the cap on the actual source IP of the QUIC connection (the proxy's IP); use XFF only for logging, never for security caps |
+| `wtransport` session SETTINGS negotiation | Starting to send nosh data before the WT SETTINGS exchange (`SETTINGS_WT_ENABLED`) is complete | The `wtransport` crate handles SETTINGS internally; wait for `ServerConnection::accept_session()` to complete before starting the nosh session pump |
+| Inner-auth + `Reattach` sequencing | Sending `Reattach` on a new WT session before the inner auth state machine reaches `Authenticated` | State machine must enforce: `Unauthenticated` → `ChallengeExchanged` → `Authenticated`, and only in `Authenticated` state accept `SessionOpen` or `Reattach` |
+
+---
+
+## Performance Traps
+
+| Trap | Symptoms | Prevention | When It Breaks |
+|------|----------|------------|----------------|
+| Inner-auth blocking the tokio event loop | Every new WT session stalls; CPU pegged during handshake bursts | The inner-auth challenge signature (ssh-agent call) is synchronous — wrap in `tokio::task::spawn_blocking` as in the existing TLS `AgentSigner` path | Under > 10 simultaneous new WT sessions |
+| Datagram bursting over WT sending too large | State-diff datagrams silently dropped; terminal frozen | Cap burst payload to WT session's `max_datagram_payload_size()`, not raw QUIC MTU | Any time path MTU is near 1280 bytes (minimum QUIC MTU) |
+| Pre-auth half-open cap applies per-proxy-IP, not per-client | A single proxy IP exhausts the 64-slot cap for all clients | The cap must be per-original-client-IP (from XFF, validated from a trusted proxy) or per-proxy-IP with a much larger limit | More than 64 concurrent new connections from behind a single proxy |
+| Channel multiplexing control-stream contention | Control stream backs up with `InnerAuthChallenge` messages during handshake, blocking `ChannelOpen`/`ChannelAccept` | Inner-auth messages on a separate stream (or early in the session before the control stream is multiplexed), not mixed with channel management messages | Immediately — during handshake, control stream is not yet accepting channel frames |
+
+---
+
+## Security Mistakes
+
+| Mistake | Risk | Prevention |
+|---------|------|------------|
+| Inner auth without `tls-exporter` channel binding | Proxy MITM: proxy relays auth exchange, authenticates to real server on behalf of untrusted client | Mandatory: challenge must include `tls-exporter` material from the outer TLS session (RFC 9266 `tls-exporter` channel binding) |
+| Reattach token transmitted before inner auth | Proxy reads token, attaches to server session without SSH key | Strict state-machine ordering: token transmitted only after `InnerAuthOk` |
+| Rate limiting on `X-Forwarded-For` | Attacker spoofs XFF header, bypasses rate limit or exhausts server memory | Cap on actual source IP (proxy IP); XFF for logging only |
+| TOFU auto-accept (no fingerprint prompt) | MITM on first connect goes undetected | Blocking fingerprint prompt displaying SHA-256 hex; explicit `yes` required |
+| `OSC_ACCUMULATION_MAX` prefilter not verified after M7 changes | Multi-MiB OSC sequence OOMs server, disrupts all sessions | Re-run `oversized_multi_chunk_osc_is_bounded_then_resyncs` after any `TerminalState::advance` change |
+| `Message` inner-auth variants inserted before discriminant 17 | Old client/server decodes wrong message type; session silently corrupts or hangs | Append-only rule enforced by `message_discriminant_order_is_stable` CI test |
+| `TerminalControl(Clipboard)` selection field not validated on client | Malicious server sets an unexpected selection designator, triggering unintended clipboard operations | Validate selection against known values (`c`, `p`, `s`, etc.) before re-emitting |
+| `TerminalControl(Title)` containing escape bytes re-emitted raw | Title containing `\x1b` breaks out of the title sequence, injecting further OSC commands | Strip `\x1b`, `\x07`, `\r`, `\n` from the title before re-emitting |
+| WebTransport mode server also accepts raw QUIC | Proxy ACLs and logging bypassed; attacker connects directly | Server `--mode webtransport` must reject raw QUIC; firewall raw UDP/443 except from proxy IP |
+| Inner auth nonce derived from observable values | Nonce predictable; attacker pre-computes challenge response or replays | Both challenges must be 32 bytes of CSPRNG output, validated single-use on the server |
+
+---
+
+## UX Pitfalls
+
+| Pitfall | User Impact | Better Approach |
+|---------|-------------|-----------------|
+| TOFU prompt displayed after PTY output starts | User cannot read the fingerprint; accepts blindly | Block `SessionOpen` until TOFU resolves; render prompt to stderr/tty before any PTY output |
+| TOFU prompt with default "yes" on empty input | User presses Enter reflexively; key is never verified | Require explicit `yes` string; treat empty input as "no" |
+| Fingerprint shown as raw base64 | User has no way to verify; copies nothing useful from `ssh-keygen -l` output | Display SHA-256 hex in `sha256:...` format matching `ssh-keygen -l -E sha256` |
+| Migration handover shows the connection-lost banner | User sees "connection lost, reconnecting" on every Wi-Fi→mobile handover | WT migration handover should be silent (same as raw QUIC migration) if the reconnect completes within the keep-alive window |
+| Inner-auth failure indistinguishable from network failure | User retries indefinitely, not knowing the server key changed | Inner-auth failure (key mismatch) must produce a clear distinct error, not a generic "connection failed" |
+
+---
+
+## "Looks Done But Isn't" Checklist
+
+- [ ] **WebTransport datagram sizing:** Datagram encoder uses WT session's `max_datagram_payload_size()` — not raw `conn.max_datagram_size()`. Verified with a test that sends at maximum WT payload size with no `TooLarge` error.
+- [ ] **Inner-auth channel binding:** The challenge signed by the client includes the `tls-exporter` material from the outer TLS session. Verified: a signature over `challenge_only` (no exporter material) fails server verification.
+- [ ] **Inner-auth nonce freshness:** Both client→server and server→client challenges are 32 bytes of CSPRNG output. Verified: the same challenge cannot be accepted twice (server rejects replayed nonce).
+- [ ] **Reattach sequencing:** The server state machine rejects `Reattach` and `SessionOpen` messages received before `InnerAuthOk`. Verified: sending `Reattach` before inner auth is complete produces a clean error close, not a hang.
+- [ ] **Double-attach race:** Concurrent reattach with the same token — only one succeeds. Verified: a test fires two simultaneous `Reattach` with the same token and asserts only one session is active.
+- [ ] **Discriminant stability after new variants:** `message_discriminant_order_is_stable` test includes all new inner-auth variants with their expected discriminant bytes. Verified: the test fails if any variant is inserted before the expected tail.
+- [ ] **OSC-OOM re-verification:** `oversized_multi_chunk_osc_is_bounded_then_resyncs` passes after all M7 changes to `TerminalState::advance`. Fuzz target re-run with increased `max_len`.
+- [ ] **TOFU prompt blocks session open:** No PTY output reaches the client before the TOFU prompt resolves. Verified: sending `SessionOpen` without user confirmation is rejected at the client, not at the server.
+- [ ] **Server mode gate:** Server in `webtransport` mode rejects raw QUIC connections. Verified: a raw quinn client cannot connect when the server is in WT-only mode.
+- [ ] **`TerminalControl` sanitisation:** Clipboard `selection` field validated against known values; `Title` field stripped of escape bytes before re-emission. Verified by unit tests with adversarial inputs.
+- [ ] **XFF handling:** Pre-auth half-open cap is keyed on source IP (proxy IP), not XFF value. Rate-limiting that uses XFF uses only the rightmost trusted proxy entry. Verified: a client that spoofs an XFF header is not able to exhaust rate limits or bypass caps.
+
+---
+
+## Recovery Strategies
+
+| Pitfall | Recovery Cost | Recovery Steps |
+|---------|---------------|----------------|
+| Crypto-provider conflict (WT-1) | LOW | Remove conflicting feature from `wtransport` dep; `cargo clean`; rebuild |
+| Datagram size mismatch (WT-2) | LOW | Update encoder to use WT session MTU API; existing tests catch size regressions |
+| Missing channel binding (WT-3) | HIGH — wire-breaking protocol change | Redesign inner-auth to include `tls-exporter` field in challenge; bump inner-auth protocol version; all deployed clients must update |
+| Discriminant shift (WF-1) | HIGH — all connections from mismatched versions are broken | Revert the insertion; append the variant at the tail; re-deploy; add discriminant test to CI |
+| Reattach token before inner auth (MH-1) | HIGH — live sessions may be hijacked | Add inner-auth state-machine enforcement; rotate all outstanding reattach tokens via a forced full re-auth on all sessions |
+| OSC OOM regression (SEC-1) | MEDIUM — availability DoS, not data loss | Re-apply the prefilter; re-run regression test; patch deployed servers |
+| TOFU auto-accept shipped to users | MEDIUM — past sessions may be MITM'd; no way to retroactively verify | Force `known_hosts` reset and re-TOFU on next connection; add a `--rehash-host-keys` command |
+
+---
+
+## Pitfall-to-Phase Mapping
+
+| Pitfall | Prevention Phase | Verification |
+|---------|------------------|--------------|
+| WT-1: crypto provider conflict | Phase that adds `wtransport` to workspace (day one) | `cargo tree -f "{p} {f}" \| grep rustls` shows only `ring`, not `aws-lc-rs` |
+| WT-2: WT datagram MTU | WebTransport integration phase | Unit test: encode at WT max payload, send, assert no `TooLarge` error |
+| WT-3: inner-auth channel binding | Inner-auth design phase (before implementation) | Test: signature over `challenge_only` fails; signature over `challenge||tls_exporter` passes |
+| WT-4: inner-auth nonce replay | Inner-auth design phase | Test: replaying a captured challenge-response on a new session fails |
+| WT-5: inner-auth downgrade | WebTransport integration phase (server mode flag) | Test: raw quinn client cannot connect in WT-only mode |
+| WF-1: discriminant corruption | Inner-auth design phase (new Message variants) | `message_discriminant_order_is_stable` CI test updated and passing with new discriminant values |
+| MH-1: reattach token theft | Migration handover phase | Test: `Reattach` before `InnerAuthOk` is rejected; token not in WT stream before auth |
+| MH-2: double-attach race | Migration handover phase | Test: concurrent same-token reattach — exactly one session active |
+| SEC-1: OSC-OOM regression | 999.7 re-check phase | `oversized_multi_chunk_osc_is_bounded_then_resyncs` passes; fuzz target re-run |
+| SEC-2: terminal escape injection | 999.2 client trust-boundary phase | Adversarial `TerminalControl` inputs with escape bytes, malicious URLs, and unknown selection fields rejected or sanitised |
+| SEC-3: TOFU fatigue | SEC-02 interactive TOFU phase | Manual test: empty input at TOFU prompt does not accept the key; session blocked until explicit `yes` |
 
 ---
 
 ## Sources
 
-- `.planning/ROADMAP.md` — 999.4, 999.5, 999.6, 999.7 phase entries (exact bug descriptions, reverts, mandatory gates). HIGH confidence — these are first-party documented production failures.
-- `crates/nosh-server/src/server.rs` — `build_state_diff`, `compute_diff_runs`, `run_session`, `run_reattach_session`, `EPOCH_SNAPSHOT_CAP`. HIGH confidence.
-- `crates/nosh-server/src/terminal.rs` — `TerminalState`, `EchoState`, `SCROLLBACK_LINE_CAP`, `csi_dispatch` (`?1049` no-op at line 505), `print_char` (width-agnostic at line 306), `scroll_up`. HIGH confidence.
-- `crates/nosh-client/src/predictor.rs` — `PredictionOverlay`, noecho suppression invariant, `confirmed_epoch`, `cull()`, `classify_input`, `is_tentative`. HIGH confidence.
-- `crates/nosh-proto/src/messages.rs` — `Message` enum, discriminant-order comments (lines 56–62, 154–160), append-only invariant. HIGH confidence.
-- `.planning/PROJECT.md` — milestone context, feature scope, security invariants. HIGH confidence.
-- `CLAUDE.md` — security invariants section, discriminant-order and noecho decisions. HIGH confidence.
+- `.planning/PROJECT.md` — v1.4 scope, 999.x backlog, 999.7 finding. HIGH confidence.
+- `docs/999.7-SECURITY.md` — OSC accumulation OOM analysis, Phase-16 mitigation-was-wrong finding, regression test reference. HIGH confidence.
+- `docs/999.1-SECURITY.md` — Pre-auth security review; residual risks; HTTP/3 reverse-proxy topology noted as out-of-scope for that review. HIGH confidence.
+- `crates/nosh-proto/src/messages.rs` — `Message` enum with 18 variants (discriminants 0–17), append-only invariant, `ChannelType` enum. HIGH confidence — first-party source.
+- `crates/nosh-auth/src/verifier.rs` — `HostKeyVerifier` and `AuthorizedKeysVerifier`; TLS-handshake-based auth; SPKI pinning. HIGH confidence.
+- `crates/nosh-proto/src/transport.rs` — Transport config, datagram buffer sizes, keep-alive. HIGH confidence.
+- `CLAUDE.md` — Security invariants (env sanitisation, `SSH_AUTH_SOCK`, discriminant stability, noecho invariant). HIGH confidence.
+- `docs.rs/crate/wtransport/latest/source/Cargo.toml` — wtransport 0.7.1 depends on `quinn ^0.11.6`, `rustls ^0.23.23`, `default-features = false`. HIGH confidence — verified at source.
+- RFC 9266 "Channel Bindings for TLS 1.3" (`tls-exporter` binding) — MEDIUM confidence (standard, but rustls API surface for keying material export must be verified at implementation time).
+- RFC 9297 "HTTP Datagrams and the Capsule Protocol" — Quarter Stream ID overhead in WebTransport datagrams. MEDIUM confidence.
+- `github.com/rustls/rustls/issues/1877` — ring + aws-lc-rs dual-activation panic. MEDIUM confidence.
+- Terminal escape injection: Trail of Bits blog (MCP/ANSI injection, 2025); InfosecMatter terminal escape injection reference. MEDIUM confidence — attack vectors verified; specific nosh mitigations are first-party design.
+- Trust on first use / TOFU UX: HandWiki; SSH fingerprint verification research (arxiv 2208.08846). MEDIUM confidence — UX failure modes well-documented.
+
+---
+*Pitfalls research for: nosh v1.4 M7 WebTransport + Inner Auth + Security Hardening*
+*Researched: 2026-06-13*
