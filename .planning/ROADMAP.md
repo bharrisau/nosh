@@ -69,7 +69,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 - [x] **Phase 23: Transport Abstraction Seam** — `NoshTransport`/`NoshSendStream`/`NoshRecvStream` traits; Quinn concrete wrappers; session pump made generic; all existing tests green with zero behavioural change (completed 2026-06-13)
 - [x] **Phase 24: WebTransport Endpoint + Mode A** — `wtransport` 0.7.1 integrated; server binds UDP/443 as a WebTransport-over-HTTP/3 listener; client connects; full shell session (datagrams, streams, channels) over the WebTransport pump; downgrade protection (completed 2026-06-13)
 - [x] **Phase 25: Inner SSH-Key Handshake + TOFU Prompt** — four-step mutual challenge-response (discriminants 18-21) with RFC 9266 tls-exporter channel binding; interactive blocking TOFU fingerprint prompt on first contact; inner auth gated before any `SessionOpen` or `Reattach` (completed 2026-06-13)
-- [ ] **Phase 26: Migration Handover over WebTransport** — client detects WebTransport session loss, reconnects, re-runs inner auth, resumes via 1-RTT cold reattach with byte-exact replay; concurrent same-token reattach resolved atomically
+- [x] **Phase 26: Migration Handover over WebTransport** — client detects WebTransport session loss, reconnects, re-runs inner auth, resumes via 1-RTT cold reattach with byte-exact replay; concurrent same-token reattach resolved atomically (completed 2026-06-13)
 - [ ] **Phase 27: Security Hardening Pass** — OSC OOM adversarial re-verification (999.7) + regression CI gate; SEC-04 client trust-boundary hardening (per-OSC byte gate, clipboard-read rejection, escape stripping, resize rate-limit, recv cap, channel-ID validation); SEC-01 threat-model document (`docs/SECURITY.md`)
 - [ ] **Phase 28: Interactive UAT Clearing** — human-driven, one item at a time: carried-forward backlog (Windows alt-screen, 999.3, 999.4, CI gates) then new M7 path end-to-end
 
@@ -154,8 +154,9 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 26-01-PLAN.md — SC#4 seamless-resume-over-WebTransport integration test + WT session-loss-detection doc
-- [ ] 26-02-PLAN.md — MH-2 concurrent same-token reattach integration test over WebTransport
+
+- [x] 26-01-PLAN.md — SC#4 seamless-resume-over-WebTransport integration test + WT session-loss-detection doc
+- [x] 26-02-PLAN.md — MH-2 concurrent same-token reattach integration test over WebTransport
 
 ### Phase 27: Security Hardening Pass
 
@@ -216,6 +217,6 @@ Plans:
 | 23. Transport Abstraction Seam | 2/2 | Complete    | 2026-06-13 |
 | 24. WebTransport Endpoint + Mode A | 5/5 | Complete    | 2026-06-13 |
 | 25. Inner SSH-Key Handshake + TOFU Prompt | 4/4 | Complete    | 2026-06-13 |
-| 26. Migration Handover over WebTransport | 0/? | Not started | - |
+| 26. Migration Handover over WebTransport | 2/2 | Complete   | 2026-06-13 |
 | 27. Security Hardening Pass | 0/? | Not started | - |
 | 28. Interactive UAT Clearing | 0/? | Not started | - |
