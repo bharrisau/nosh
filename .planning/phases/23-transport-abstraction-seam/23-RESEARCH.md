@@ -650,17 +650,17 @@ This table documents every transport-level method call found by reading the prod
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **`quinn::SendStream::finish()` exact API in 0.11.9**
    - What we know: ARCHITECTURE.md and the session pump code call `ch_send.finish()` with no `.await` in many places; the code assigns `let _ = ch_send.finish()` suggesting it returns `Result<(), _>` or `()`.
    - What's unclear: Whether `finish()` is `fn finish(&mut self)` or `fn finish(&mut self) -> Result<()>`. The wrapper's `async fn finish()` should propagate the result.
-   - Recommendation: The planner should include a task to check `cargo doc --open quinn::SendStream` for the exact signature, and wire the wrapper accordingly (either `.map_err(Into::into)?` or `Ok(())`).
+   - RESOLVED: quinn 0.11.9 exposes `fn finish(&mut self) -> Result<(), ClosedStream>` — it is SYNCHRONOUS (not async). The `QuinnSendStream::finish` wrapper body therefore uses `let _ = self.0.finish(); Ok(())` (discard the `ClosedStream` result; do NOT `.await` the quinn call). CRITICAL distinction: the `NoshSendStream` trait's `finish()` is `async fn` (so the trait stays object-safe under `#[async_trait]`). Trait-object CALLERS in `nosh-server/src/channel.rs` (lines 138, 372, 390, 436) and `nosh-server/src/server.rs` (lines 1437, 1568, 2127) MUST therefore `.await` the call — `let _ = ch_send.finish().await;`. An un-awaited `let _ = ch_send.finish();` on a `Box<dyn NoshSendStream>` builds the Future and drops it unpolled, silently no-op-ing the QUIC half-close. See Plan 23-02 (the CRITICAL note in `<objective>` and the grep gates in Tasks 2 and 3).
 
 2. **`nosh-client` test helpers return `quinn::SendStream` / `quinn::RecvStream` directly — will zero-test-modification hold?**
    - What we know: D-05 is absolute. The tests in `crates/nosh-client/tests/` call helpers like `open_channel(conn, ...)` that currently return `(quinn::SendStream, quinn::RecvStream)`. After the refactor these return `(Box<dyn NoshSendStream>, Box<dyn NoshRecvStream>)`.
    - What's unclear: Whether the test bodies call quinn-specific methods (e.g. `send.reset(...)`) that are NOT on the trait, which would force a test modification.
-   - Recommendation: The planner should include a task to audit each test file for quinn-specific method calls on the returned stream pair before finalising the plan. If found, those calls must be moved into the trait or the test is a false failure.
+   - RESOLVED: ~12 nosh-client integration test files in `crates/nosh-client/tests/` use concrete quinn types directly — they call `conn.open_bi()`, pass the returned concrete `quinn::SendStream`/`quinn::RecvStream` into `nosh_proto::read_message`/`write_message` (which require `AsyncRead`/`AsyncWrite`), call `ch_send.finish()`/`read_exact`/`read` on them, and declare helper params as `&mut quinn::RecvStream` (e.g. `read_pid`, `send_request_read_page`). Converting these to `Box<dyn ...>` would force test edits → a direct D-05 violation. Therefore the client helpers STAY on concrete quinn types per the Plan 23-02 scope boundary (this phase converts the SERVER session pump only; D-03 names the server functions, and the client helpers are D-05-protected test support). Phase 24 converts the client side as part of the WebTransport work. See the SCOPE BOUNDARY paragraph in Plan 23-02 `<objective>`.
 
 ---
 
