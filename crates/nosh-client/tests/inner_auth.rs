@@ -90,12 +90,11 @@ async fn inner_auth_happy_path() {
         .expect("spawn_wt_server_real_auth failed");
 
     // Step 5: dial the server.
-    let config = client_config_with_pinning(&server.cert_hash);
     let url = format!("https://127.0.0.1:{}/nosh", server.addr.port());
-    let config_for_first = client_config_with_pinning(&server.cert_hash);
+    let config = client_config_with_pinning(&server.cert_hash);
     let transport = tokio::time::timeout(
         Duration::from_secs(10),
-        connect_wt(config_for_first, &url),
+        connect_wt(config, &url),
     )
     .await
     .expect("connect_wt timed out")
