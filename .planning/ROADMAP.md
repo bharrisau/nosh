@@ -119,7 +119,11 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
   3. `InnerAuthFail` is fieldless — it reveals neither whether the key exists nor whether the signature was valid
   4. On first contact with an unknown server host key, the client displays a blocking, explicit fingerprint-confirm prompt (SHA-256 hex fingerprint, requires typing `yes`) and produces no PTY output until resolved
   5. A server that passes inner auth with a key not in `authorized_keys` is rejected; a client that receives a server key not in `known_hosts` (and declines the TOFU prompt) disconnects cleanly
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 25-01-PLAN.md — Wire foundation: Message variants 18-21 + discriminant-stability/fieldless tests + transcript label consts + NoshTransport::export_keying_material + nosh-auth check_authorized_key/verify_ed25519_spki helpers
+- [ ] 25-02-PLAN.md — Server inner auth: run_inner_auth_server state machine (EKM-bound transcripts, single-use nonce, spawn_blocking signing) + WT export_keying_material + handle_connection_wt gate + main.rs host-key/authorized_keys wiring
+- [ ] 25-03-PLAN.md — Client inner auth: run_inner_auth_client + blocking SEC-02 TOFU prompt (fail-closed on no-TTY) + WT connect-path wiring + native-path TofuPolicy replacing silent-record
+- [ ] 25-04-PLAN.md — Adversarial integration tests: happy path + tampered channel binding (WT-3) + pre-auth SessionOpen rejection (MH-1) + unknown client key + TOFU no-TTY fail-closed
 
 ### Phase 26: Migration Handover over WebTransport
 **Goal**: A nosh client survives a network change in WebTransport mode by transparently reconnecting, re-authenticating, and resuming the server-side session with byte-exact replay
@@ -185,7 +189,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 | 22. Scrollback Sync | 5/5 | Shipped | 2026-06-12 |
 | 23. Transport Abstraction Seam | 2/2 | Complete    | 2026-06-13 |
 | 24. WebTransport Endpoint + Mode A | 5/5 | Complete    | 2026-06-13 |
-| 25. Inner SSH-Key Handshake + TOFU Prompt | 0/? | Not started | - |
+| 25. Inner SSH-Key Handshake + TOFU Prompt | 0/4 | Planned | - |
 | 26. Migration Handover over WebTransport | 0/? | Not started | - |
 | 27. Security Hardening Pass | 0/? | Not started | - |
 | 28. Interactive UAT Clearing | 0/? | Not started | - |
