@@ -194,7 +194,7 @@ async fn wt02_datagram_sync_over_webtransport() {
 async fn wt03_raw_quic_downgrade_rejected() {
     let server = common::spawn_wt_server(None)
         .await
-        .expect("spawn_wt_server returned None — /bin/sh missing");
+        .expect("spawn_wt_server returned None");
 
     // Build a native QUIC client endpoint.
     // We need a throwaway host key pair to satisfy make_endpoint's signature.
