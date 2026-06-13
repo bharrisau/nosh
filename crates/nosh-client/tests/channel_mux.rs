@@ -29,8 +29,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nosh_client::client::{self, ReattachOutcome};
+use nosh_client::quinn_transport::{QuinnTransport, QuinnSendStream, QuinnRecvStream};
 use nosh_proto::datagram::{decode_datagram, encode_epoch_ack};
 use nosh_proto::messages::ChannelType;
+use nosh_proto::transport_trait::{NoshTransport, NoshSendStream, NoshRecvStream};
 use nosh_server::registry::SessionRegistry;
 use tokio::sync::mpsc;
 
@@ -78,12 +80,12 @@ fn client_endpoint_for(key: &TestKey) -> (quinn::Endpoint, tempfile::TempDir) {
 /// channel data-stream I/O). For tests that do ch_send/ch_recv operations,
 /// use `spawn_ctrl_drain` instead to avoid deadlocks.
 async fn recv_channel_reply(
-    recv: &mut quinn::RecvStream,
+    recv: &mut dyn NoshRecvStream,
     timeout_ms: u64,
 ) -> anyhow::Result<nosh_proto::Message> {
     let deadline = Duration::from_millis(timeout_ms);
     loop {
-        let msg = tokio::time::timeout(deadline, nosh_proto::read_message(recv))
+        let msg = tokio::time::timeout(deadline, nosh_proto::read_message_ns(recv))
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for channel reply"))?
             .map_err(|e| anyhow::anyhow!("control stream error: {e}"))?;
@@ -106,12 +108,12 @@ async fn recv_channel_reply(
 ///
 /// The spawned task runs until ctrl_recv closes or the JoinHandle is aborted.
 fn spawn_ctrl_drain(
-    mut ctrl_recv: quinn::RecvStream,
+    mut ctrl_recv: Box<dyn NoshRecvStream>,
     frame_tx: mpsc::UnboundedSender<nosh_proto::Message>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match nosh_proto::read_message(&mut ctrl_recv).await {
+            match nosh_proto::read_message_ns(&mut *ctrl_recv).await {
                 Ok(msg) => {
                     if frame_tx.send(msg).is_err() {
                         break; // receiver dropped; test is done
@@ -179,9 +181,10 @@ async fn channel_open_accept_reject() {
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
+    let qt = QuinnTransport(conn.clone());
 
     let (mut ctrl_send, mut ctrl_recv, _token) =
-        client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session");
 
@@ -189,10 +192,10 @@ async fn channel_open_accept_reject() {
     // MUX-01: the ACCEPT must arrive on the control stream BEFORE any bidi data
     // stream is opened by the client.
     let echo_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send, echo_id, ChannelType::Echo)
+    client::send_channel_open(&mut *ctrl_send, echo_id, ChannelType::Echo)
         .await
         .expect("send ChannelOpen for Echo");
-    let reply = recv_channel_reply(&mut ctrl_recv, 2000)
+    let reply = recv_channel_reply(&mut *ctrl_recv, 2000)
         .await
         .expect("recv channel reply for Echo");
     assert!(
@@ -203,10 +206,10 @@ async fn channel_open_accept_reject() {
 
     // ── PortForward: opaque ChannelReject ─────────────────────────────────────
     let pf_id: u32 = 4;
-    client::send_channel_open(&mut ctrl_send, pf_id, ChannelType::PortForward)
+    client::send_channel_open(&mut *ctrl_send, pf_id, ChannelType::PortForward)
         .await
         .expect("send ChannelOpen for PortForward");
-    let pf_reply = recv_channel_reply(&mut ctrl_recv, 2000)
+    let pf_reply = recv_channel_reply(&mut *ctrl_recv, 2000)
         .await
         .expect("recv channel reply for PortForward");
     match pf_reply {
@@ -231,10 +234,10 @@ async fn channel_open_accept_reject() {
 
     // ── AgentForward: opaque ChannelReject ────────────────────────────────────
     let af_id: u32 = 6;
-    client::send_channel_open(&mut ctrl_send, af_id, ChannelType::AgentForward)
+    client::send_channel_open(&mut *ctrl_send, af_id, ChannelType::AgentForward)
         .await
         .expect("send ChannelOpen for AgentForward");
-    let af_reply = recv_channel_reply(&mut ctrl_recv, 2000)
+    let af_reply = recv_channel_reply(&mut *ctrl_recv, 2000)
         .await
         .expect("recv AgentForward reply");
     assert!(
@@ -246,10 +249,10 @@ async fn channel_open_accept_reject() {
     // The ACCEPT arrives on the control stream before any bidi data stream is
     // bound (MUX-01); the server then spawns run_scrollback_sender_task.
     let sb_id: u32 = 8;
-    client::send_channel_open(&mut ctrl_send, sb_id, ChannelType::Scrollback)
+    client::send_channel_open(&mut *ctrl_send, sb_id, ChannelType::Scrollback)
         .await
         .expect("send ChannelOpen for Scrollback");
-    let sb_reply = recv_channel_reply(&mut ctrl_recv, 2000)
+    let sb_reply = recv_channel_reply(&mut *ctrl_recv, 2000)
         .await
         .expect("recv Scrollback reply");
     assert!(
@@ -286,9 +289,10 @@ async fn channel_echo_roundtrip() {
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
+    let qt = QuinnTransport(conn.clone());
 
     let (mut ctrl_send, ctrl_recv, _token) =
-        client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session");
 
@@ -299,7 +303,7 @@ async fn channel_echo_roundtrip() {
 
     // ── Open Echo channel ─────────────────────────────────────────────────────
     let echo_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send, echo_id, ChannelType::Echo)
+    client::send_channel_open(&mut *ctrl_send, echo_id, ChannelType::Echo)
         .await
         .expect("send ChannelOpen for Echo");
     let accepted = await_channel_accept_from_drain(&mut frame_rx, echo_id, 2000)
@@ -356,7 +360,7 @@ async fn channel_echo_roundtrip() {
     for i in 0..SC3_SAMPLES {
         let marker = format!("SC3_PTY_LATENCY_NOSH_{i}");
         let t0 = Instant::now();
-        client::send_input(&mut ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
+        client::send_input(&mut *ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
             .await
             .expect("send PTY input");
 
@@ -420,9 +424,10 @@ async fn channel_flow_control_backpressure() {
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
+    let qt = QuinnTransport(conn.clone());
 
     let (mut ctrl_send, ctrl_recv, _token) =
-        client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session");
 
@@ -432,7 +437,7 @@ async fn channel_flow_control_backpressure() {
 
     // Open an Echo channel.
     let echo_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send, echo_id, ChannelType::Echo)
+    client::send_channel_open(&mut *ctrl_send, echo_id, ChannelType::Echo)
         .await
         .expect("send ChannelOpen for Echo");
     let accepted =
@@ -474,8 +479,8 @@ async fn channel_flow_control_backpressure() {
                 let since_last = total_received - credit_baseline;
                 // Replenish in 128 KiB chunks (half the initial window).
                 if since_last >= 128 * 1024 {
-                    nosh_proto::write_message(
-                        &mut ctrl_send,
+                    nosh_proto::write_message_ns(
+                        &mut *ctrl_send,
                         &nosh_proto::Message::ChannelCredit {
                             channel_id: echo_id,
                             bytes: since_last as u64,
@@ -500,8 +505,8 @@ async fn channel_flow_control_backpressure() {
     // Send final credit for any remainder.
     let remainder = total_received - credit_baseline;
     if remainder > 0 {
-        nosh_proto::write_message(
-            &mut ctrl_send,
+        nosh_proto::write_message_ns(
+            &mut *ctrl_send,
             &nosh_proto::Message::ChannelCredit {
                 channel_id: echo_id,
                 bytes: remainder as u64,
@@ -545,9 +550,10 @@ async fn channel_lifecycle_clean() {
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
+    let qt = QuinnTransport(conn.clone());
 
     let (mut ctrl_send, ctrl_recv, _token) =
-        client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session");
 
@@ -557,7 +563,7 @@ async fn channel_lifecycle_clean() {
 
     // Open an Echo channel.
     let echo_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send, echo_id, ChannelType::Echo)
+    client::send_channel_open(&mut *ctrl_send, echo_id, ChannelType::Echo)
         .await
         .expect("send ChannelOpen for Echo");
     let accepted = await_channel_accept_from_drain(&mut frame_rx, echo_id, 2000)
@@ -599,8 +605,8 @@ async fn channel_lifecycle_clean() {
     );
 
     // ── Second ChannelClose for the same id: no-op ────────────────────────────
-    nosh_proto::write_message(
-        &mut ctrl_send,
+    nosh_proto::write_message_ns(
+        &mut *ctrl_send,
         &nosh_proto::Message::ChannelClose { channel_id: echo_id },
     )
     .await
@@ -611,8 +617,8 @@ async fn channel_lifecycle_clean() {
     // server-initiated open (under the test-support feature gate). Since no
     // server-initiated open with id 9999 was issued, this is a logged no-op
     // (T-21-07 no-panic rule).
-    nosh_proto::write_message(
-        &mut ctrl_send,
+    nosh_proto::write_message_ns(
+        &mut *ctrl_send,
         &nosh_proto::Message::ChannelAccept { channel_id: 9999 },
     )
     .await
@@ -621,8 +627,8 @@ async fn channel_lifecycle_clean() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // ── Session survival: control stream must still accept writes ─────────────
-    let alive = nosh_proto::write_message(
-        &mut ctrl_send,
+    let alive = nosh_proto::write_message_ns(
+        &mut *ctrl_send,
         &nosh_proto::Message::Ack { seq: 0 },
     )
     .await;
@@ -658,9 +664,10 @@ async fn channel_simultaneous_open() {
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
+    let qt = QuinnTransport(conn.clone());
 
     let (mut ctrl_send, ctrl_recv, _token) =
-        client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session");
 
@@ -699,7 +706,7 @@ async fn channel_simultaneous_open() {
 
     // Immediately send client ChannelOpen for even id 2.
     let client_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send, client_id, ChannelType::Echo)
+    client::send_channel_open(&mut *ctrl_send, client_id, ChannelType::Echo)
         .await
         .expect("send client ChannelOpen");
 
@@ -722,8 +729,8 @@ async fn channel_simultaneous_open() {
             nosh_proto::Message::ChannelOpen { channel_id, .. } => {
                 server_open_id = Some(channel_id);
                 // Client must reply ChannelAccept to the server-initiated open.
-                nosh_proto::write_message(
-                    &mut ctrl_send,
+                nosh_proto::write_message_ns(
+                    &mut *ctrl_send,
                     &nosh_proto::Message::ChannelAccept { channel_id },
                 )
                 .await
@@ -769,8 +776,8 @@ async fn channel_simultaneous_open() {
     assert_eq!(&se, b"odd--ch", "server channel echo must round-trip");
 
     // ── (e) Session survives ──────────────────────────────────────────────────
-    let alive = nosh_proto::write_message(
-        &mut ctrl_send,
+    let alive = nosh_proto::write_message_ns(
+        &mut *ctrl_send,
         &nosh_proto::Message::Ack { seq: 0 },
     )
     .await;
@@ -801,9 +808,10 @@ async fn channel_reattach_reopen() {
     let conn1 = client::connect(&ep1, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect");
+    let qt1 = QuinnTransport(conn1.clone());
 
     let (mut ctrl_send1, ctrl_recv1, token) =
-        client::open_session_with_token(&conn1, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt1, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session 1");
 
@@ -811,7 +819,7 @@ async fn channel_reattach_reopen() {
     let _drain1 = spawn_ctrl_drain(ctrl_recv1, frame_tx1);
 
     let echo_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send1, echo_id, ChannelType::Echo)
+    client::send_channel_open(&mut *ctrl_send1, echo_id, ChannelType::Echo)
         .await
         .expect("send ChannelOpen session 1");
     let accepted1 = await_channel_accept_from_drain(&mut frame_rx1, echo_id, 2000)
@@ -852,13 +860,15 @@ async fn channel_reattach_reopen() {
         .await
         .expect("connect for reattach");
 
-    let (mut ctrl_send2, mut ctrl_recv2) = conn2.open_bi().await.expect("open bi for reattach");
-    client::send_reattach(&mut ctrl_send2, token, 0)
+    let (s2, r2) = conn2.open_bi().await.expect("open bi for reattach");
+    let mut ctrl_send2: Box<dyn NoshSendStream> = Box::new(QuinnSendStream(s2));
+    let mut ctrl_recv2: Box<dyn NoshRecvStream> = Box::new(QuinnRecvStream(r2));
+    client::send_reattach(&mut *ctrl_send2, token, 0)
         .await
         .expect("send Reattach");
 
     // await_reattach_reply reads directly from ctrl_recv2 before the drain is started.
-    let outcome = client::await_reattach_reply(&mut ctrl_recv2)
+    let outcome = client::await_reattach_reply(&mut *ctrl_recv2)
         .await
         .expect("await reattach reply");
     assert!(
@@ -873,7 +883,7 @@ async fn channel_reattach_reopen() {
     // ── Re-open the Echo channel AFTER ReattachOk ─────────────────────────────
     // The server cleared its channel_map on orphan (no replay of channel state).
     // The client must issue a fresh ChannelOpen (Pitfall 4 / MUX-05).
-    client::send_channel_open(&mut ctrl_send2, echo_id, ChannelType::Echo)
+    client::send_channel_open(&mut *ctrl_send2, echo_id, ChannelType::Echo)
         .await
         .expect("send ChannelOpen after reattach");
 
@@ -924,9 +934,10 @@ async fn channel_reattach_reopen() {
 /// duration of the test (the ctrl_drain task writes to it concurrently).
 async fn produce_scrollback(
     conn: &quinn::Connection,
-) -> (quinn::SendStream, mpsc::UnboundedReceiver<nosh_proto::Message>) {
+) -> (Box<dyn NoshSendStream>, mpsc::UnboundedReceiver<nosh_proto::Message>) {
+    let qt = QuinnTransport(conn.clone());
     let (mut ctrl_send, ctrl_recv, _token) =
-        client::open_session_with_token(conn, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session for produce_scrollback");
 
@@ -937,7 +948,7 @@ async fn produce_scrollback(
     // the server-side scrollback VecDeque.
     for i in 0..40u32 {
         client::send_input(
-            &mut ctrl_send,
+            &mut *ctrl_send,
             format!("printf 'line_{i}\\n'\n").as_bytes(),
         )
         .await
@@ -976,7 +987,7 @@ async fn produce_scrollback(
 /// Returns `(ch_send, ch_recv, channel_id)`.  Never uses `recv_channel_reply`.
 async fn open_scrollback_channel(
     conn: &quinn::Connection,
-    ctrl_send: &mut quinn::SendStream,
+    ctrl_send: &mut dyn NoshSendStream,
     frame_rx: &mut mpsc::UnboundedReceiver<nosh_proto::Message>,
 ) -> (quinn::SendStream, quinn::RecvStream, u32) {
     let channel_id: u32 = 2;
@@ -1055,7 +1066,7 @@ async fn scrollback_basic_fetch() {
     let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
 
     let (mut ch_send, mut ch_recv, channel_id) =
-        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+        open_scrollback_channel(&conn, &mut *ctrl_send, &mut frame_rx).await;
 
     // Request up to 256 lines starting from the newest.
     let page = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 256).await;
@@ -1087,7 +1098,7 @@ async fn scrollback_basic_fetch() {
     // While the scrollback channel is open, generate more PTY output and assert
     // that datagrams keep arriving with strictly increasing epochs — proving the
     // server pump is NOT stalling because of the open scrollback channel.
-    client::send_input(&mut ctrl_send, b"printf 'epoch_check\\n'\n")
+    client::send_input(&mut *ctrl_send, b"printf 'epoch_check\\n'\n")
         .await
         .expect("send PTY input during scrollback");
 
@@ -1118,8 +1129,8 @@ async fn scrollback_basic_fetch() {
     );
 
     // Grant credit so the sender can clean up.
-    let _ = nosh_proto::write_message(
-        &mut ctrl_send,
+    let _ = nosh_proto::write_message_ns(
+        &mut *ctrl_send,
         &nosh_proto::Message::ScrollbackCredit {
             channel_id,
             bytes: 256 * 1024,
@@ -1185,7 +1196,7 @@ async fn scrollback_epoch_handoff_no_gap() {
     }
 
     let (mut ch_send, mut ch_recv, channel_id) =
-        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+        open_scrollback_channel(&conn, &mut *ctrl_send, &mut frame_rx).await;
 
     // First request — concurrent with diff ticks (no quiesce before this).
     let page1 = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 256).await;
@@ -1207,8 +1218,8 @@ async fn scrollback_epoch_handoff_no_gap() {
     );
 
     // Grant credit so a second request can be served.
-    let _ = nosh_proto::write_message(
-        &mut ctrl_send,
+    let _ = nosh_proto::write_message_ns(
+        &mut *ctrl_send,
         &nosh_proto::Message::ScrollbackCredit {
             channel_id,
             bytes: 256 * 1024,
@@ -1256,9 +1267,10 @@ async fn scrollback_post_reattach() {
     let conn1 = client::connect(&ep1, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect session 1");
+    let qt1 = QuinnTransport(conn1.clone());
 
     let (mut ctrl_send1, ctrl_recv1, token) =
-        client::open_session_with_token(&conn1, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt1, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session 1 with token");
 
@@ -1268,7 +1280,7 @@ async fn scrollback_post_reattach() {
     // Produce scrollback via PTY.
     for i in 0..40u32 {
         client::send_input(
-            &mut ctrl_send1,
+            &mut *ctrl_send1,
             format!("printf 'pre_{i}\\n'\n").as_bytes(),
         )
         .await
@@ -1280,7 +1292,7 @@ async fn scrollback_post_reattach() {
 
     // Open a Scrollback channel (pre-orphan).
     let pre_orphan_sb_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send1, pre_orphan_sb_id, ChannelType::Scrollback)
+    client::send_channel_open(&mut *ctrl_send1, pre_orphan_sb_id, ChannelType::Scrollback)
         .await
         .expect("send ChannelOpen pre-orphan");
     let accepted1 = await_channel_accept_from_drain(&mut frame_rx1, pre_orphan_sb_id, 3000)
@@ -1313,12 +1325,14 @@ async fn scrollback_post_reattach() {
         .await
         .expect("connect for reattach");
 
-    let (mut ctrl_send2, mut ctrl_recv2) = conn2.open_bi().await.expect("open bi for reattach");
-    client::send_reattach(&mut ctrl_send2, token, 0)
+    let (s2, r2) = conn2.open_bi().await.expect("open bi for reattach");
+    let mut ctrl_send2: Box<dyn NoshSendStream> = Box::new(QuinnSendStream(s2));
+    let mut ctrl_recv2: Box<dyn NoshRecvStream> = Box::new(QuinnRecvStream(r2));
+    client::send_reattach(&mut *ctrl_send2, token, 0)
         .await
         .expect("send Reattach");
 
-    let outcome = client::await_reattach_reply(&mut ctrl_recv2)
+    let outcome = client::await_reattach_reply(&mut *ctrl_recv2)
         .await
         .expect("await reattach reply");
     assert!(
@@ -1333,7 +1347,7 @@ async fn scrollback_post_reattach() {
     // EvenIdAllocator starts at 2 for every new session, so post_reattach_sb_id == 2.
     // The server cleared its channel_map on orphan, so the Accept proves fresh-open.
     let post_reattach_sb_id: u32 = 2;
-    client::send_channel_open(&mut ctrl_send2, post_reattach_sb_id, ChannelType::Scrollback)
+    client::send_channel_open(&mut *ctrl_send2, post_reattach_sb_id, ChannelType::Scrollback)
         .await
         .expect("send ChannelOpen post-reattach");
 
@@ -1399,7 +1413,7 @@ async fn scrollback_pty_latency_isolation() {
     let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
 
     let (mut ch_send, mut ch_recv, channel_id) =
-        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+        open_scrollback_channel(&conn, &mut *ctrl_send, &mut frame_rx).await;
 
     // Issue a large request to keep the sender active.
     nosh_proto::write_message(
@@ -1431,7 +1445,7 @@ async fn scrollback_pty_latency_isolation() {
     for i in 0..SAMPLES {
         let marker = format!("M6_LAT_{i}");
         let t0 = Instant::now();
-        client::send_input(&mut ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
+        client::send_input(&mut *ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
             .await
             .expect("send PTY during transfer");
 
@@ -1496,7 +1510,7 @@ async fn scrollback_backpressure_drop_oldest() {
     let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
 
     let (mut ch_send, _ch_recv, channel_id) =
-        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+        open_scrollback_channel(&conn, &mut *ctrl_send, &mut frame_rx).await;
 
     // Flood requests without granting any credit.  After the first page is
     // written (exhausting the 256 KiB INITIAL_CREDIT), the sender will block in
@@ -1518,7 +1532,7 @@ async fn scrollback_backpressure_drop_oldest() {
 
     // ── Session liveness: PTY input must still echo ───────────────────────────
     let marker = "S4_ALIVE_NOSH";
-    client::send_input(&mut ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
+    client::send_input(&mut *ctrl_send, format!("printf '{marker}\\n'\n").as_bytes())
         .await
         .expect("send PTY under scrollback back-pressure");
 
@@ -1582,7 +1596,7 @@ async fn scrollback_inorder_under_loss() {
     let (mut ctrl_send, mut frame_rx) = produce_scrollback(&conn).await;
 
     let (mut ch_send, mut ch_recv, channel_id) =
-        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+        open_scrollback_channel(&conn, &mut *ctrl_send, &mut frame_rx).await;
 
     // ── First page: from_line=0, count=16 ────────────────────────────────────
     let page1 = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 16).await;
@@ -1608,8 +1622,8 @@ async fn scrollback_inorder_under_loss() {
     }
 
     // Grant credit for the second page.
-    let _ = nosh_proto::write_message(
-        &mut ctrl_send,
+    let _ = nosh_proto::write_message_ns(
+        &mut *ctrl_send,
         &nosh_proto::Message::ScrollbackCredit {
             channel_id,
             bytes: 256 * 1024,
@@ -1686,7 +1700,7 @@ async fn scrollback_keybinding_snap_back() {
 
     // ── (1) Enter Active: open Scrollback channel + send ScrollbackRequest ────
     let (mut ch_send, mut ch_recv, channel_id) =
-        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+        open_scrollback_channel(&conn, &mut *ctrl_send, &mut frame_rx).await;
 
     // Send the initial ScrollbackRequest (the action Shift-PageUp triggers).
     let page = send_request_read_page(&mut ch_send, &mut ch_recv, channel_id, 0, 256).await;
@@ -1789,7 +1803,7 @@ async fn scrollback_deep_paging_replenishes_credit() {
 
     // ── Open a scrollback channel ─────────────────────────────────────────────
     let (mut ch_send, mut ch_recv, channel_id) =
-        open_scrollback_channel(&conn, &mut ctrl_send, &mut frame_rx).await;
+        open_scrollback_channel(&conn, &mut *ctrl_send, &mut frame_rx).await;
 
     // ── Deep-paging loop: request pages and grant credit after each ───────────
     //
@@ -1851,8 +1865,8 @@ async fn scrollback_deep_paging_replenishes_credit() {
         // Grant credit equal to the encoded cost of the page we just consumed.
         // Critical path: with the bug this is silently dropped and the server stalls;
         // with the fix it reaches ChannelEvent::Credit and replenishes the window.
-        nosh_proto::write_message(
-            &mut ctrl_send,
+        nosh_proto::write_message_ns(
+            &mut *ctrl_send,
             &nosh_proto::Message::ScrollbackCredit {
                 channel_id,
                 bytes: encoded_len,

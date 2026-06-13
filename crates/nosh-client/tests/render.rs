@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nosh_client::client;
+use nosh_client::quinn_transport::QuinnTransport;
+use nosh_proto::transport_trait::NoshTransport as _;
 use nosh_client::screen::ClientScreen;
 use nosh_proto::datagram::{
     decode_datagram, encode_datagram, CellStyle, CursorPos, DiffRun, StateDiff,
@@ -342,12 +344,13 @@ async fn render_integration_client_screen_matches_server_output() {
         .expect("connect");
 
     // Open a PTY session; keep streams alive while datagrams flow.
-    let (mut send, mut recv) = client::open_session(&conn, "xterm".into(), 80, 24, vec![])
+    let qt = QuinnTransport(conn.clone());
+    let (mut send, mut recv) = client::open_session(&qt, "xterm".into(), 80, 24, vec![])
         .await
         .expect("open_session");
 
     // Discard the SessionOpened frame (contains the reattach token).
-    match nosh_proto::read_message(&mut recv).await {
+    match nosh_proto::read_message_ns(&mut *recv).await {
         Ok(_) => {} // SessionOpened — expected; discard token
         Err(e) => panic!("expected SessionOpened, got error: {e}"),
     }
@@ -366,7 +369,7 @@ async fn render_integration_client_screen_matches_server_output() {
     let deadline = Duration::from_secs(5);
 
     loop {
-        match tokio::time::timeout(deadline, conn.read_datagram()).await {
+        match tokio::time::timeout(deadline, qt.read_datagram()).await {
             Ok(Ok(bytes)) => {
                 // Decode and apply.  Non-StateDiff datagrams (e.g. wrong tag) are
                 // silently skipped — the server only emits TAG_STATE_DIFF this phase,

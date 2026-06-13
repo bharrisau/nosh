@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nosh_client::client;
+use nosh_client::quinn_transport::QuinnTransport;
 use nosh_client::predictor::{PredictDisplayMode, PredictionOverlay};
 use nosh_client::screen::{ClientScreen, Overlay};
 use nosh_proto::datagram::{CellStyle, CursorPos, DiffRun, StateDiff};
@@ -759,13 +760,14 @@ async fn noecho_read_dash_s_zero_predicted_chars() {
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect to server");
+    let qt = QuinnTransport(conn.clone());
 
-    let (mut send, mut recv) = client::open_session(&conn, "xterm".into(), 80, 24, vec![])
+    let (mut send, mut recv) = client::open_session(&qt, "xterm".into(), 80, 24, vec![])
         .await
         .expect("open_session");
 
     // Discard the SessionOpened frame.
-    match nosh_proto::read_message(&mut recv).await {
+    match nosh_proto::read_message_ns(&mut *recv).await {
         Ok(_) => {}
         Err(e) => panic!("expected SessionOpened frame, got error: {e}"),
     }
@@ -776,7 +778,7 @@ async fn noecho_read_dash_s_zero_predicted_chars() {
     let mut predictor = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
 
     // Drain initial shell prompt datagrams.
-    drain_datagrams_until_quiet(&conn, &mut screen, &mut predictor, Duration::from_secs(5)).await;
+    drain_datagrams_until_quiet(&qt, &mut screen, &mut predictor, Duration::from_secs(5)).await;
 
     // Run `read -s X` in the shell — suppresses echo for the next typed value.
     client::send_input(&mut send, b"read -s X\n")
@@ -784,7 +786,7 @@ async fn noecho_read_dash_s_zero_predicted_chars() {
         .expect("send 'read -s X' command");
 
     // Wait for server to process the command and update datagrams.
-    drain_datagrams_until_quiet(&conn, &mut screen, &mut predictor, Duration::from_secs(3)).await;
+    drain_datagrams_until_quiet(&qt, &mut screen, &mut predictor, Duration::from_secs(3)).await;
 
     // Sync the predictor's cursor to the confirmed cursor position (the password
     // input line). Do this AFTER the read-s-X\n drain so the cursor is at the
@@ -820,7 +822,7 @@ async fn noecho_read_dash_s_zero_predicted_chars() {
             .expect("send password char to server");
 
         // Wait briefly and cull against incoming datagrams.
-        drain_datagrams_with_cull(&conn, &mut screen, &mut predictor, Duration::from_millis(500)).await;
+        drain_datagrams_with_cull(&qt, &mut screen, &mut predictor, Duration::from_millis(500)).await;
 
         // Also sync predicted cursor from confirmed so the predictor tracks the real
         // cursor row (CR-01 fix) — ensures noecho assertion covers the correct row.
@@ -891,13 +893,14 @@ async fn end_to_end_printable_echo_confirms() {
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect to server");
+    let qt = QuinnTransport(conn.clone());
 
-    let (mut send, mut recv) = client::open_session(&conn, "xterm".into(), 80, 24, vec![])
+    let (mut send, mut recv) = client::open_session(&qt, "xterm".into(), 80, 24, vec![])
         .await
         .expect("open_session");
 
     // Discard SessionOpened frame.
-    match nosh_proto::read_message(&mut recv).await {
+    match nosh_proto::read_message_ns(&mut *recv).await {
         Ok(_) => {}
         Err(e) => panic!("expected SessionOpened, got: {e}"),
     }
@@ -906,7 +909,7 @@ async fn end_to_end_printable_echo_confirms() {
     let mut predictor = PredictionOverlay::new(PredictDisplayMode::Always, 80, 24);
 
     // Drain initial prompt datagrams.
-    drain_datagrams_until_quiet(&conn, &mut screen, &mut predictor, Duration::from_secs(5)).await;
+    drain_datagrams_until_quiet(&qt, &mut screen, &mut predictor, Duration::from_secs(5)).await;
 
     // Enter become_tentative so predictions start hidden and only become visible
     // after a Correct confirmation. This makes the test more robust.
@@ -995,7 +998,7 @@ async fn end_to_end_printable_echo_confirms() {
 /// value (tracked via `last_culled_epoch`) to preserve the one-cull-per-tick
 /// invariant (D-20-04: all burst datagrams in a tick share one epoch).
 async fn drain_datagrams_until_quiet(
-    conn: &quinn::Connection,
+    conn: &dyn nosh_proto::transport_trait::NoshTransport,
     screen: &mut ClientScreen,
     predictor: &mut PredictionOverlay,
     duration: Duration,
@@ -1040,7 +1043,7 @@ async fn drain_datagrams_until_quiet(
 /// up-to-date before any prediction is evaluated. Cull fires at most once per drain
 /// call (once for the highest epoch seen in the window), mirroring D-20-04.
 async fn drain_datagrams_with_cull(
-    conn: &quinn::Connection,
+    conn: &dyn nosh_proto::transport_trait::NoshTransport,
     screen: &mut ClientScreen,
     predictor: &mut PredictionOverlay,
     duration: Duration,

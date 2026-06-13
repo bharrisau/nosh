@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nosh_client::client::{self, ReattachOutcome};
+use nosh_client::quinn_transport::{QuinnTransport, QuinnSendStream, QuinnRecvStream};
+use nosh_proto::transport_trait::{NoshSendStream, NoshRecvStream};
 use nosh_server::registry::SessionRegistry;
 
 mod common;
@@ -122,8 +124,9 @@ async fn reattach_replays_unacked_output_byte_exact() {
     // ── Fresh session ────────────────────────────────────────────────────────
     let (ep, _dir) = client_endpoint_for(&client_key);
     let conn = client::connect(&ep, server.addr, HOST, Duration::from_secs(30)).await.expect("connect");
+    let qt = QuinnTransport(conn.clone());
     let (mut send, mut recv, mut token) =
-        client::open_session_with_token(&conn, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open_session_with_token");
 
@@ -165,7 +168,7 @@ async fn reattach_replays_unacked_output_byte_exact() {
     // block until a deadline. Stopping on idle keeps the test fast while still
     // applying every byte the server sends in this window.
     async fn drain_n(
-        recv: &mut quinn::RecvStream,
+        recv: &mut dyn NoshRecvStream,
         applied: &mut Vec<u8>,
         counter: &mut ClientCounter,
         stop_after_chunks: u32,
@@ -173,7 +176,7 @@ async fn reattach_replays_unacked_output_byte_exact() {
         let mut got = 0u32;
         let mut idle_strikes = 0u32;
         while got < stop_after_chunks {
-            match tokio::time::timeout(Duration::from_millis(400), nosh_proto::read_message(recv)).await {
+            match tokio::time::timeout(Duration::from_millis(400), nosh_proto::read_message_ns(recv)).await {
                 Ok(Ok(nosh_proto::Message::PtyData { data })) => {
                     applied.extend_from_slice(&data);
                     counter.apply_chunk();
@@ -196,7 +199,7 @@ async fn reattach_replays_unacked_output_byte_exact() {
     }
 
     // Apply a handful of chunks on the fresh session before the first drop.
-    drain_n(&mut recv, &mut applied, &mut counter, 3).await;
+    drain_n(&mut *recv, &mut applied, &mut counter, 3).await;
 
     // ── Disconnect → reattach cycles ───────────────────────────────────────────
     let mut cur_conn = conn;
@@ -229,12 +232,15 @@ async fn reattach_replays_unacked_output_byte_exact() {
         let conn2 = client::connect(&ep2, server.addr, HOST, Duration::from_secs(30))
             .await
             .expect("reconnect");
-        let (mut send2, mut recv2) = conn2.open_bi().await.expect("open bi");
-        client::send_reattach(&mut send2, token, counter.last_acked_seq())
+        // Box the stream pair from open_bi() so they satisfy NoshSendStream/NoshRecvStream.
+        let (send2_quinn, recv2_quinn) = conn2.open_bi().await.expect("open bi");
+        let mut send2: Box<dyn NoshSendStream> = Box::new(QuinnSendStream(send2_quinn));
+        let mut recv2: Box<dyn NoshRecvStream> = Box::new(QuinnRecvStream(recv2_quinn));
+        client::send_reattach(&mut *send2, token, counter.last_acked_seq())
             .await
             .expect("send reattach");
 
-        let outcome = client::await_reattach_reply(&mut recv2)
+        let outcome = client::await_reattach_reply(&mut *recv2)
             .await
             .expect("await_reattach_reply");
         let replaying_from_seq = match outcome {
@@ -251,7 +257,7 @@ async fn reattach_replays_unacked_output_byte_exact() {
         // Apply a couple more chunks this cycle (drain everything on the final
         // cycle via the large target + idle cutoff).
         let take = if cycle == CYCLES - 1 { u32::MAX } else { 2 };
-        drain_n(&mut recv2, &mut applied, &mut counter, take).await;
+        drain_n(&mut *recv2, &mut applied, &mut counter, take).await;
 
         send = send2;
         recv = recv2;
@@ -262,7 +268,7 @@ async fn reattach_replays_unacked_output_byte_exact() {
 
     // Final top-up: the last cycle already drained to idle, but make sure the
     // terminal marker landed (bounded by idle cutoff inside drain_n).
-    drain_n(&mut recv, &mut applied, &mut counter, u32::MAX).await;
+    drain_n(&mut *recv, &mut applied, &mut counter, u32::MAX).await;
 
     // Clean up: unblock the shell's `read` so it exits immediately.
     let _ = client::send_input(&mut send, b"\n").await;
@@ -326,8 +332,9 @@ async fn reattach_wrong_key_rejected_like_bad_token() {
     // Connect with key A, open session, capture token, then drop → orphan.
     let (ep_a1, _dir_a1) = client_endpoint_for(&key_a);
     let conn_a1 = client::connect(&ep_a1, server.addr, HOST, Duration::from_secs(30)).await.expect("connect A");
+    let qt_a1 = QuinnTransport(conn_a1.clone());
     let (_send, _recv, token_a) =
-        client::open_session_with_token(&conn_a1, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt_a1, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session A");
     conn_a1.close(1u32.into(), b"test drop");
@@ -349,7 +356,8 @@ async fn reattach_wrong_key_rejected_like_bad_token() {
     // Case 1: valid token_a, but reconnect with key B (wrong identity) → Err.
     let (ep_b, _dir_b) = client_endpoint_for(&key_b);
     let conn_b = client::connect(&ep_b, server.addr, HOST, Duration::from_secs(30)).await.expect("connect B");
-    let (outcome_b, _, _) = client::reattach_collect(&conn_b, token_a, 0)
+    let qt_b = QuinnTransport(conn_b.clone());
+    let (outcome_b, _, _) = client::reattach_collect(&qt_b, token_a, 0)
         .await
         .expect("reattach with wrong key");
     conn_b.close(0u32.into(), b"done");
@@ -365,7 +373,8 @@ async fn reattach_wrong_key_rejected_like_bad_token() {
     let bogus_token = [0xDEu8; 16];
     let (ep_a2, _dir_a2) = client_endpoint_for(&key_a);
     let conn_a2 = client::connect(&ep_a2, server.addr, HOST, Duration::from_secs(30)).await.expect("connect A2");
-    let (outcome_a2, _, _) = client::reattach_collect(&conn_a2, bogus_token, 0)
+    let qt_a2 = QuinnTransport(conn_a2.clone());
+    let (outcome_a2, _, _) = client::reattach_collect(&qt_a2, bogus_token, 0)
         .await
         .expect("reattach with bogus token");
     conn_a2.close(0u32.into(), b"done");
@@ -403,8 +412,9 @@ async fn reattach_rejected_while_session_active() {
     // Connect with key A and KEEP the connection active (do NOT drop).
     let (ep1, _dir1) = client_endpoint_for(&client_key);
     let conn1 = client::connect(&ep1, server.addr, HOST, Duration::from_secs(30)).await.expect("connect 1");
+    let qt1 = QuinnTransport(conn1.clone());
     let (_send1, _recv1, token) =
-        client::open_session_with_token(&conn1, "xterm".to_string(), 80, 24, vec![])
+        client::open_session_with_token(&qt1, "xterm".to_string(), 80, 24, vec![])
             .await
             .expect("open session 1");
 
@@ -414,7 +424,8 @@ async fn reattach_rejected_while_session_active() {
     // From a second endpoint with the SAME key, attempt to reattach the Active session.
     let (ep2, _dir2) = client_endpoint_for(&client_key);
     let conn2 = client::connect(&ep2, server.addr, HOST, Duration::from_secs(30)).await.expect("connect 2");
-    let (outcome2, _, _) = client::reattach_collect(&conn2, token, 0)
+    let qt2 = QuinnTransport(conn2.clone());
+    let (outcome2, _, _) = client::reattach_collect(&qt2, token, 0)
         .await
         .expect("reattach_collect for active slot");
     conn2.close(0u32.into(), b"done");

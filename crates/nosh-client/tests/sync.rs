@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nosh_client::client::{self, ReattachOutcome};
+use nosh_client::quinn_transport::{QuinnTransport, QuinnSendStream, QuinnRecvStream};
 use nosh_proto::datagram::{decode_datagram, encode_epoch_ack};
+use nosh_proto::transport_trait::{NoshTransport, NoshSendStream, NoshRecvStream};
 use nosh_server::registry::SessionRegistry;
 use nosh_server::server::AuthLimits;
 
@@ -77,12 +79,13 @@ async fn sync03_server_emits_datagram_after_pty_output() {
 
     // open_session does NOT read the SessionOpened frame; do it manually so we
     // can keep the streams alive while datagrams flow.
-    let (mut send, mut recv) = client::open_session(&conn, "xterm".into(), 80, 24, vec![])
+    let qt = QuinnTransport(conn.clone());
+    let (mut send, mut recv) = client::open_session(&qt, "xterm".into(), 80, 24, vec![])
         .await
         .expect("open_session");
 
     // Discard the SessionOpened frame (contains the reattach token).
-    match nosh_proto::read_message(&mut recv).await {
+    match nosh_proto::read_message_ns(&mut *recv).await {
         Ok(_) => {} // SessionOpened — expected; discard token
         Err(e) => panic!("expected SessionOpened, got error: {e}"),
     }
@@ -98,7 +101,7 @@ async fn sync03_server_emits_datagram_after_pty_output() {
     // robustness, but it should not occur.
     let deadline = Duration::from_secs(5);
     let diff = loop {
-        match tokio::time::timeout(deadline, conn.read_datagram()).await {
+        match tokio::time::timeout(deadline, qt.read_datagram()).await {
             Ok(Ok(bytes)) => {
                 match decode_datagram(&bytes) {
                     Ok(d) if !d.runs.is_empty() => break d,
@@ -152,18 +155,19 @@ async fn sync03_acked_epoch_advances_baseline() {
         .await
         .expect("connect");
 
-    let (mut send, mut recv) = client::open_session(&conn, "xterm".into(), 80, 24, vec![])
+    let qt = QuinnTransport(conn.clone());
+    let (mut send, mut recv) = client::open_session(&qt, "xterm".into(), 80, 24, vec![])
         .await
         .expect("open_session");
 
     // Discard SessionOpened frame.
-    match nosh_proto::read_message(&mut recv).await {
+    match nosh_proto::read_message_ns(&mut *recv).await {
         Ok(_) => {}
         Err(e) => panic!("expected SessionOpened, got error: {e}"),
     }
 
     // Helper: loop read_datagram until a non-empty StateDiff arrives.
-    async fn read_nonempty_diff(conn: &quinn::Connection) -> nosh_proto::datagram::StateDiff {
+    async fn read_nonempty_diff(conn: &dyn nosh_proto::transport_trait::NoshTransport) -> nosh_proto::datagram::StateDiff {
         let deadline = Duration::from_secs(5);
         loop {
             match tokio::time::timeout(deadline, conn.read_datagram()).await {
@@ -188,7 +192,7 @@ async fn sync03_acked_epoch_advances_baseline() {
     // server genuinely never advances its epoch after the ack, so it cannot mask
     // a real epoch-advance regression.
     async fn read_diff_epoch_above(
-        conn: &quinn::Connection,
+        conn: &dyn nosh_proto::transport_trait::NoshTransport,
         min_epoch: u64,
     ) -> nosh_proto::datagram::StateDiff {
         let deadline = Duration::from_secs(5);
@@ -212,12 +216,12 @@ async fn sync03_acked_epoch_advances_baseline() {
     client::send_input(&mut send, b"echo A\n")
         .await
         .expect("send_input A");
-    let diff_e1 = read_nonempty_diff(&conn).await;
+    let diff_e1 = read_nonempty_diff(&qt).await;
     let e1 = diff_e1.epoch;
     assert!(e1 >= 1, "epoch must be >= 1 after first output (got {e1})");
 
     // Step 2: send an epoch-ack for E1 so the server advances its baseline.
-    conn.send_datagram(encode_epoch_ack(e1))
+    qt.send_datagram(encode_epoch_ack(e1))
         .expect("send epoch-ack");
 
     // Step 3: send "echo B\n" and read the next StateDiff whose epoch is past E1.
@@ -226,7 +230,7 @@ async fn sync03_acked_epoch_advances_baseline() {
     client::send_input(&mut send, b"echo B\n")
         .await
         .expect("send_input B");
-    let diff_e2 = read_diff_epoch_above(&conn, e1).await;
+    let diff_e2 = read_diff_epoch_above(&qt, e1).await;
     let e2 = diff_e2.epoch;
 
     // Weak robust assertion: epoch advanced after the ack (D-13-01c).
@@ -283,8 +287,9 @@ async fn sync03_datagrams_flow_after_resume() {
         .await
         .expect("connect 1");
 
+    let qt1 = QuinnTransport(conn1.clone());
     let (mut send1, _recv1, token) =
-        client::open_session_with_token(&conn1, "xterm".into(), 80, 24, vec![])
+        client::open_session_with_token(&qt1, "xterm".into(), 80, 24, vec![])
             .await
             .expect("open_session_with_token");
 
@@ -323,17 +328,20 @@ async fn sync03_datagrams_flow_after_resume() {
     let conn2 = client::connect(&ep2, server.addr, HOST, Duration::from_secs(30))
         .await
         .expect("connect 2");
+    let qt2 = QuinnTransport(conn2.clone());
 
     // ── Step 4: Reattach using lower-level helpers (keep conn2 alive for datagrams)
 
     // We must NOT use reattach_collect here — it drains to SessionClose, which
     // would close the session before we can read post-resume datagrams.
-    let (mut send2, mut recv2) = conn2.open_bi().await.expect("open bi for reattach");
-    client::send_reattach(&mut send2, token, 0)
+    let (s2q, r2q) = conn2.open_bi().await.expect("open bi for reattach");
+    let mut send2: Box<dyn NoshSendStream> = Box::new(QuinnSendStream(s2q));
+    let mut recv2: Box<dyn NoshRecvStream> = Box::new(QuinnRecvStream(r2q));
+    client::send_reattach(&mut *send2, token, 0)
         .await
         .expect("send_reattach");
 
-    let outcome = client::await_reattach_reply(&mut recv2)
+    let outcome = client::await_reattach_reply(&mut *recv2)
         .await
         .expect("await_reattach_reply");
 
@@ -362,7 +370,7 @@ async fn sync03_datagrams_flow_after_resume() {
         if remaining.is_zero() {
             break; // deadline reached between frames (read_message is not in flight)
         }
-        match tokio::time::timeout(remaining, nosh_proto::read_message(&mut recv2)).await {
+        match tokio::time::timeout(remaining, nosh_proto::read_message_ns(&mut *recv2)).await {
             Ok(Ok(nosh_proto::Message::PtyData { .. })) => {
                 // Replayed chunk received; keep draining.
             }
@@ -384,7 +392,7 @@ async fn sync03_datagrams_flow_after_resume() {
     // one with enough content to confirm the full-screen property.
     let deadline = Duration::from_secs(5);
     let post_resume_diff = loop {
-        match tokio::time::timeout(deadline, conn2.read_datagram()).await {
+        match tokio::time::timeout(deadline, qt2.read_datagram()).await {
             Ok(Ok(bytes)) => match decode_datagram(&bytes) {
                 Ok(d) if !d.runs.is_empty() => break d,
                 Ok(_) => continue,

@@ -14,6 +14,7 @@
 use std::time::{Duration, Instant};
 
 use nosh_client::client;
+use nosh_client::quinn_transport::QuinnTransport;
 use nosh_proto::Message;
 use nosh_server::server::AuthLimits;
 
@@ -75,8 +76,10 @@ async fn run_migration_test() {
         .expect("mutual auth handshake");
 
     // ── Step 3: Open a session (discards SessionOpened frame, Phase 6 protocol) ─
+    // Wrap the quinn connection in the NoshTransport trait object seam.
+    let qt = QuinnTransport(conn.clone());
     let (mut send, mut recv) = client::open_session(
-        &conn,
+        &qt,
         "xterm".to_string(),
         80,
         24,
@@ -97,7 +100,7 @@ async fn run_migration_test() {
     {
         let first = tokio::time::timeout(
             Duration::from_secs(10),
-            nosh_proto::read_message(&mut recv),
+            nosh_proto::read_message_ns(&mut *recv),
         )
         .await
         .expect("no hang waiting for first frame")
@@ -179,7 +182,7 @@ async fn run_migration_test() {
         } else {
             tokio::time::timeout(
                 Duration::from_secs(10),
-                nosh_proto::read_message(&mut recv),
+                nosh_proto::read_message_ns(&mut *recv),
             )
             .await
             .expect("no hang waiting for frame")
@@ -303,7 +306,7 @@ async fn run_migration_test() {
             // Give a brief moment for SessionClose or DONE to arrive.
             let _ = tokio::time::timeout(
                 Duration::from_millis(500),
-                nosh_proto::read_message(&mut recv),
+                nosh_proto::read_message_ns(&mut *recv),
             )
             .await;
             break;

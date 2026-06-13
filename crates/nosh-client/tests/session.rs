@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use nosh_client::client;
+use nosh_client::quinn_transport::QuinnTransport;
 use nosh_proto::Message;
 
 mod common;
@@ -52,11 +53,12 @@ async fn sess01_02_04_real_tty_and_io() {
     let Some((_ep, conn, _srv)) = connect_session_server().await else {
         return;
     };
+    let qt = QuinnTransport(conn.clone());
     let env = vec![("TERM".to_string(), "xterm-256color".to_string())];
     let script = b"test -t 0 && echo IS_TTY; echo hello-nosh; stty size; exit 0\n";
     let (out, code) = tokio::time::timeout(
         Duration::from_secs(15),
-        client::run_session_collect(&conn, "xterm-256color", 132, 40, env, script),
+        client::run_session_collect(&qt, "xterm-256color", 132, 40, env, script),
     )
     .await
     .expect("session did not hang")
@@ -84,8 +86,9 @@ async fn sess05_resize() {
     let Some((_ep, conn, _srv)) = connect_session_server().await else {
         return;
     };
+    let qt = QuinnTransport(conn.clone());
     let (mut send, mut recv) = client::open_session(
-        &conn,
+        &qt,
         "xterm-256color".to_string(),
         80,
         24,
@@ -103,7 +106,7 @@ async fn sess05_resize() {
 
     let (out, _code) = tokio::time::timeout(
         Duration::from_secs(15),
-        client::collect_until_close(&mut recv),
+        client::collect_until_close(&mut *recv),
     )
     .await
     .expect("no hang")
@@ -122,6 +125,7 @@ async fn sess07_env_sanitization() {
     let Some((_ep, conn, _srv)) = connect_session_server().await else {
         return;
     };
+    let qt = QuinnTransport(conn.clone());
     let env = vec![
         ("LD_PRELOAD".to_string(), "/evil.so".to_string()),
         ("BASH_ENV".to_string(), "/x".to_string()),
@@ -136,7 +140,7 @@ async fn sess07_env_sanitization() {
     ];
     let (out, _code) = tokio::time::timeout(
         Duration::from_secs(15),
-        client::run_session_collect(&conn, "xterm-256color", 80, 24, env, b"env; exit 0\n"),
+        client::run_session_collect(&qt, "xterm-256color", 80, 24, env, b"env; exit 0\n"),
     )
     .await
     .expect("no hang")
@@ -190,9 +194,10 @@ async fn sess08_exit_code() {
     let Some((_ep, conn, _srv)) = connect_session_server().await else {
         return;
     };
+    let qt = QuinnTransport(conn.clone());
     let (_out, code) = tokio::time::timeout(
         Duration::from_secs(15),
-        client::run_session_collect(&conn, "xterm", 80, 24, vec![], b"exit 42\n"),
+        client::run_session_collect(&qt, "xterm", 80, 24, vec![], b"exit 42\n"),
     )
     .await
     .expect("no hang")
@@ -209,9 +214,10 @@ async fn sess09_clean_close() {
     let Some((_ep, conn, _srv)) = connect_session_server().await else {
         return;
     };
+    let qt = QuinnTransport(conn.clone());
     let (_out, code) = tokio::time::timeout(
         Duration::from_secs(15),
-        client::run_session_collect(&conn, "xterm", 80, 24, vec![], b"exit 0\n"),
+        client::run_session_collect(&qt, "xterm", 80, 24, vec![], b"exit 0\n"),
     )
     .await
     .expect("no hang")
@@ -247,8 +253,9 @@ async fn sess10_no_zombie_after_disconnect() {
     let Some((endpoint, conn, _srv)) = connect_session_server().await else {
         return;
     };
+    let qt = QuinnTransport(conn.clone());
     // Start a long-lived foreground process and have the shell print its own pid.
-    let (mut send, mut recv) = client::open_session(&conn, "xterm".to_string(), 80, 24, vec![])
+    let (mut send, mut recv) = client::open_session(&qt, "xterm".to_string(), 80, 24, vec![])
         .await
         .unwrap();
     client::send_input(&mut send, b"echo PID:$$; sleep 30\n")
@@ -256,7 +263,7 @@ async fn sess10_no_zombie_after_disconnect() {
         .unwrap();
 
     // Read until we see the PID line.
-    let pid = read_pid(&mut recv).await.expect("shell printed its pid");
+    let pid = read_pid(&mut *recv).await.expect("shell printed its pid");
 
     // Abruptly drop the client connection/endpoint (simulates transport loss).
     conn.close(0u32.into(), b"client gone");
@@ -285,10 +292,10 @@ async fn sess10_no_zombie_after_disconnect() {
 /// of digits terminated by a non-digit) is seen; return the pid. The shell
 /// echoes the command (`PID:$$`) before running it, so we must scan every
 /// `PID:` occurrence and accept only one immediately followed by digits.
-async fn read_pid(recv: &mut quinn::RecvStream) -> Option<i32> {
+async fn read_pid(recv: &mut dyn nosh_proto::transport_trait::NoshRecvStream) -> Option<i32> {
     let mut buf = Vec::new();
     for _ in 0..200 {
-        match tokio::time::timeout(Duration::from_secs(5), nosh_proto::read_message(recv)).await {
+        match tokio::time::timeout(Duration::from_secs(5), nosh_proto::read_message_ns(recv)).await {
             Ok(Ok(Message::PtyData { data })) => {
                 buf.extend_from_slice(&data);
                 let text = String::from_utf8_lossy(&buf);

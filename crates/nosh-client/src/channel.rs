@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use nosh_proto::Message;
+use nosh_proto::transport_trait::{NoshSendStream, NoshRecvStream};
 
 /// Initial per-channel credit window advertised to the server (256 KiB, MUX-03).
 pub const INITIAL_CREDIT: u64 = 256 * 1024;
@@ -203,8 +204,8 @@ pub async fn run_channel_task(
 /// stream; writing to `ch_send` cannot stall reading from `ch_recv`.
 pub async fn run_scrollback_drain_task(
     channel_id: u32,
-    mut ch_recv: quinn::RecvStream,
-    mut ch_send: quinn::SendStream,
+    mut ch_recv: Box<dyn NoshRecvStream>,
+    mut ch_send: Box<dyn NoshSendStream>,
     control_tx: mpsc::Sender<Message>,
     page_tx: mpsc::Sender<Message>,
     mut req_rx: mpsc::Receiver<Message>,
@@ -220,7 +221,7 @@ pub async fn run_scrollback_drain_task(
                 match req {
                     Some(msg) => {
                         // Write the request to ch_send (client → server direction).
-                        if nosh_proto::write_message(&mut ch_send, &msg).await.is_err() {
+                        if nosh_proto::write_message_ns(&mut *ch_send, &msg).await.is_err() {
                             tracing::debug!(channel_id, "scrollback ch_send write error; exiting drain task");
                             break;
                         }
@@ -233,7 +234,7 @@ pub async fn run_scrollback_drain_task(
                 }
             }
             // Path 2: server sent a ScrollbackPage frame.
-            msg_result = nosh_proto::read_message(&mut ch_recv) => {
+            msg_result = nosh_proto::read_message_ns(&mut *ch_recv) => {
                 match msg_result {
                     Ok(msg) => {
                         // Track bytes consumed for flow-control credit.
@@ -327,7 +328,7 @@ pub async fn run_scrollback_drain_task(
 
     // Half-close: finish the client send side and wait briefly for the server to
     // acknowledge (mirrors the server-side half-close pattern in MUX-03).
-    let _ = ch_send.finish();
+    let _ = ch_send.finish().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), ch_send.stopped()).await;
 
     // Notify the session pump to remove this channel from the map and send

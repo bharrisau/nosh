@@ -34,9 +34,11 @@ use nosh_client::channel::{EvenIdAllocator, run_scrollback_drain_task};
 use nosh_client::client::{self, ClientIdentity, ReattachOutcome};
 use nosh_client::platform;
 use nosh_client::predictor::{PredictDisplayMode, PredictionOverlay};
+use nosh_client::quinn_transport::QuinnTransport;
 use nosh_client::screen::ConnectionLossOverlay;
 use nosh_proto::{Message, TerminalControlPayload};
 use nosh_proto::messages::ChannelType;
+use nosh_proto::transport_trait::{NoshTransport, NoshSendStream, NoshRecvStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -1333,7 +1335,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let conn = match client::connect(&endpoint, server_addr, &args.host, connect_timeout).await {
+        let quinn_conn = match client::connect(&endpoint, server_addr, &args.host, connect_timeout).await {
             Ok(c) => c,
             Err(e) => {
                 // BUG-A: a host-key mismatch (TOFU known_hosts pin violation) or a
@@ -1369,12 +1371,16 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+        // Box the quinn connection behind the NoshTransport trait object seam.
+        // Phase 24: all pump functions operate on &dyn NoshTransport; a WebTransport
+        // client (Plan 04) plugs a Box<WtransportTransport> into the same slot.
+        let conn: Box<dyn NoshTransport> = Box::new(QuinnTransport(quinn_conn));
 
         // Either fresh open (no token) or reattach (have token).
         let pump_outcome = if let Some(tok) = token {
             // Reattach path (D-03 / ROAM-02).
             let reattach_result = reattach_session(
-                &conn,
+                &*conn,
                 tok,
                 highest_applied,
                 &mut highest_applied,
@@ -1388,7 +1394,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             // Fresh session path.
             let fresh_result = fresh_session(
-                &conn,
+                &*conn,
                 term.clone(),
                 cols,
                 rows,
@@ -1402,7 +1408,7 @@ async fn main() -> anyhow::Result<()> {
             fresh_result.unwrap_or(PumpOutcome::TransportDrop)
         };
 
-        conn.close(0u32.into(), b"pump ended");
+        conn.close(0, b"pump ended");
         endpoint.wait_idle().await;
 
         match pump_outcome {
@@ -1439,7 +1445,7 @@ async fn main() -> anyhow::Result<()> {
 /// Updates `highest_applied` and `token` in-place.
 #[allow(clippy::too_many_arguments)]
 async fn fresh_session(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     term: String,
     cols: u16,
     rows: u16,
@@ -1456,7 +1462,7 @@ async fn fresh_session(
     // Fresh session starts at seq 0.
     *highest_applied = 0;
 
-    run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, 0, predict_mode, status).await
+    run_pump(conn, cols, rows, &mut *send, &mut *recv, highest_applied, resize, 0, predict_mode, status).await
 }
 
 /// Run a reattach session. Updates `highest_applied` and `token_out` in-place.
@@ -1465,7 +1471,7 @@ async fn fresh_session(
 /// `PumpOutcome::UserQuit` if the user quit.
 #[allow(clippy::too_many_arguments)]
 async fn reattach_session(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     token: [u8; 16],
     last_acked_seq: u64,
     highest_applied: &mut u64,
@@ -1475,9 +1481,9 @@ async fn reattach_session(
     status: bool,
 ) -> anyhow::Result<PumpOutcome> {
     let (mut send, mut recv) = conn.open_bi().await.context("open bi for reattach")?;
-    client::send_reattach(&mut send, token, last_acked_seq).await?;
+    client::send_reattach(&mut *send, token, last_acked_seq).await?;
 
-    match client::await_reattach_reply(&mut recv).await? {
+    match client::await_reattach_reply(&mut *recv).await? {
         ReattachOutcome::Err => {
             // Terminal: the session is gone (D-11). Clear the token so we do
             // not try to reattach again — a new session would be started.
@@ -1508,7 +1514,7 @@ async fn reattach_session(
             // baseline to exactly what the server is sending.
             *highest_applied = replaying_from_seq;
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            run_pump(conn, cols, rows, &mut send, &mut recv, highest_applied, resize, *highest_applied, predict_mode, status).await
+            run_pump(conn, cols, rows, &mut *send, &mut *recv, highest_applied, resize, *highest_applied, predict_mode, status).await
         }
     }
 }
@@ -1517,11 +1523,11 @@ async fn reattach_session(
 /// Ack. Returns the pump outcome.
 #[allow(clippy::too_many_arguments)] // 10 args are load-bearing: conn + streams + state + watcher + baseline + predict_mode + status
 async fn run_pump(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     cols: u16,
     rows: u16,
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+    send: &mut dyn NoshSendStream,
+    recv: &mut dyn NoshRecvStream,
     highest_applied: &mut u64,
     resize: &mut platform::ResizeWatcher,
     _seq_baseline: u64,
@@ -1757,7 +1763,7 @@ async fn run_pump(
 
         tokio::select! {
             // Server → client reliable stream frames (QOL-02/03: TerminalControl re-emit).
-            msg = nosh_proto::read_message(recv) => {
+            msg = nosh_proto::read_message_ns(recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
                         // D-14-02: display comes exclusively from datagrams via
@@ -1897,7 +1903,7 @@ async fn run_pump(
                                 was_alt_screen = diff.alt_screen;
                                 // Cull predictions against the new confirmed state and quinn RTT
                                 // (D-17-02a: latency instrumentation hook — see below).
-                                let rtt_ms = conn.rtt().as_millis() as u64;
+                                let rtt_ms = conn.rtt().as_millis() as u64; // via NoshTransport::rtt()
                                 let epoch_before_cull = predictor.confirmed_epoch();
                                 predictor.cull(&screen, diff.epoch, rtt_ms);
                                 // WR-01: update predictor dimensions when terminal was resized.
@@ -2016,7 +2022,7 @@ async fn run_pump(
                 // is the in-session banner for a path that has gone quiet AND is confirmed
                 // closed. C6 migration (which keeps close_reason() == None throughout) does
                 // NOT trip this — preserving the working migration path.
-                if conn.close_reason().is_some() {
+                if conn.is_closed() { // via NoshTransport::is_closed()
                     loss_overlay.active = true;
                     loss_overlay.last_contact = last_datagram_time.into_std();
                     let mut buf: Vec<u8> = Vec::new();
@@ -2123,7 +2129,7 @@ async fn run_pump(
                     match &msg {
                         Message::ScrollbackCredit { .. } | Message::ChannelClose { .. } => {
                             // Forward the credit/close to the server via the control stream.
-                            if nosh_proto::write_message(send, &msg).await.is_err() {
+                            if nosh_proto::write_message_ns(send, &msg).await.is_err() {
                                 return Ok(PumpOutcome::TransportDrop);
                             }
                         }
@@ -2435,6 +2441,6 @@ async fn run_pump(
         }
     }
 
-    let _ = send.finish();
+    let _ = send.finish().await;
     Ok(PumpOutcome::CleanExit(exit_code))
 }

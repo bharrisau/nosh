@@ -13,6 +13,8 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use nosh_auth::{InProcessEd25519Signer, NoshPublicKey, RawEd25519Signer};
 use nosh_client::client::{self, ClientIdentity};
+use nosh_client::quinn_transport::QuinnTransport;
+use nosh_proto::transport_trait::NoshTransport;
 use nosh_server::registry::SessionRegistry;
 use nosh_server::server::{self, AuthLimits};
 use ssh_key::private::Ed25519Keypair;
@@ -231,10 +233,12 @@ pub fn have_sh() -> bool {
 /// runs a real PTY session instead of echo loops. Requires the server to have
 /// been started with `--shell /bin/sh` (see `spawn_server_with_shell`).
 pub async fn session_marker_usable(conn: &quinn::Connection, marker: &str) -> bool {
+    // Wrap the quinn::Connection in QuinnTransport so it satisfies &dyn NoshTransport.
+    let qt = QuinnTransport(conn.clone());
     let script = format!("printf '%s\\n' {marker}; exit 0\n");
     match tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        client::run_session_collect(conn, "xterm", 80, 24, Vec::new(), script.as_bytes()),
+        client::run_session_collect(&qt, "xterm", 80, 24, Vec::new(), script.as_bytes()),
     )
     .await
     {

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nosh_client::client;
+use nosh_client::quinn_transport::QuinnTransport;
 use nosh_proto::Message;
 use nosh_server::registry::SessionRegistry;
 
@@ -68,9 +69,10 @@ async fn shell_exit_does_not_orphan() {
         .expect("connect");
 
     // Run a script that exits immediately.
+    let qt = QuinnTransport(conn.clone());
     let _ = tokio::time::timeout(
         Duration::from_secs(15),
-        client::run_session_collect(&conn, "xterm", 80, 24, vec![], b"exit 0\n"),
+        client::run_session_collect(&qt, "xterm", 80, 24, vec![], b"exit 0\n"),
     )
     .await
     .expect("session did not hang")
@@ -105,9 +107,10 @@ async fn clean_session_close_does_not_orphan() {
         .expect("connect");
 
     // Run a quick script to get a clean close.
+    let qt = QuinnTransport(conn.clone());
     let _ = tokio::time::timeout(
         Duration::from_secs(15),
-        client::run_session_collect(&conn, "xterm", 80, 24, vec![], b"exit 0\n"),
+        client::run_session_collect(&qt, "xterm", 80, 24, vec![], b"exit 0\n"),
     )
     .await
     .expect("session did not hang")
@@ -156,8 +159,9 @@ async fn transport_loss_orphans_without_sighup() {
         "trap 'echo GOTHUP > {hup_file}' HUP; echo PID=$$; echo READY; sleep 60\n"
     );
 
+    let qt = QuinnTransport(conn.clone());
     let (mut send, mut recv) = client::open_session(
-        &conn,
+        &qt,
         "xterm".to_string(),
         80,
         24,
@@ -189,7 +193,7 @@ async fn transport_loss_orphans_without_sighup() {
     let mut buf = Vec::new();
     let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), nosh_proto::read_message(&mut recv))
+        match tokio::time::timeout(Duration::from_secs(5), nosh_proto::read_message_ns(&mut *recv))
             .await
         {
             Ok(Ok(Message::PtyData { data })) => {
