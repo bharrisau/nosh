@@ -58,6 +58,8 @@ const MIN_RESIZE_INTERVAL_MS: u64 = 300;
 /// size in docs/999.1-SECURITY.md and treats oversized PtyData as a transport anomaly.
 /// PtyData on the control stream is the reattach-replay byte sequence; the client
 /// discards it (let _ = data) but should not buffer unbounded content.
+/// NOTE: The 16 MiB MAX_FRAME_LEN is the true allocation bound; this 1 MiB inner cap
+/// is enforced post-allocation as a transport-integrity check (WR-03).
 const MAX_PTYDATA_FRAME_BYTES: usize = 1_048_576; // 1 MiB
 
 /// Ack cadence: send an Ack frame roughly every 750ms when output has been
@@ -1839,6 +1841,10 @@ async fn run_pump(
     // maintained correctly. Fed ONLY local stdin bytes — server PtyData output
     // NEVER enters this machine (T-09-01).
     let mut escape = EscapeState::new();
+    // D-06: track last server-issued resize for rate-limiting (SC#3).
+    // Prevents a malicious server from flooding Resize frames and causing
+    // excessive terminal re-renders or allocations.
+    let mut last_server_resize: Option<tokio::time::Instant> = None;
     // ClientScreen compositor: the SOLE display path (D-14-02 / CLAUDE.md).
     // Constructing a fresh screen per run_pump invocation means physical grid
     // always starts blank — this IS the reattach full-repaint reset (D-13-01b
@@ -2084,6 +2090,27 @@ async fn run_pump(
                         // via the separate Scrollback channel (page_rx arm below).
                         let _ = data;
                         *highest_applied = highest_applied.saturating_add(1);
+                    }
+                    Ok(Message::Resize { cols, rows }) => {
+                        // D-06 / SC#3: rate-limit server-issued Resize frames.
+                        // A malicious server could flood Resize messages causing
+                        // excessive terminal re-renders or allocations.
+                        let now = tokio::time::Instant::now();
+                        if let Some(last_resize) = last_server_resize {
+                            if now.duration_since(last_resize) < Duration::from_millis(MIN_RESIZE_INTERVAL_MS) {
+                                tracing::warn!(
+                                    cols, rows,
+                                    "server-issued Resize rate-limited; dropping frame within MIN_RESIZE_INTERVAL_MS"
+                                );
+                                continue;
+                            }
+                        }
+                        last_server_resize = Some(now);
+                        // Apply the resize to the local screen
+                        screen.resize(cols, rows);
+                        // Update predictor dimensions to match the new size
+                        predictor.set_size(cols, rows);
+                        predictor.reset();
                     }
                     Ok(Message::SessionClose { exit_code: code, .. }) => {
                         exit_code = code;
