@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
 status: executing
-stopped_at: Completed 23-01-PLAN.md (transport trait definitions + codec helpers)
-last_updated: "2026-06-13T08:46:33.726Z"
-last_activity: 2026-06-13 -- Phase 25 execution started
+stopped_at: Phase 25 wave-2 merged to main (25-02 server + 25-03 client inner auth); post-merge gate green after quick-fix 260614-47b (TofuPolicy::Silent test seam). NEXT = 25-04 adversarial integration tests.
+last_updated: "2026-06-14T00:00:00.000Z"
+last_activity: 2026-06-14 -- 25-02/25-03 merged; TOFU test-harness regression quick-fixed; full gate green
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 11
-  completed_plans: 8
+  completed_plans: 10
   percent: 33
 ---
 
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-13)
 ## Current Position
 
 Phase: 25 (inner-ssh-key-handshake-tofu-prompt) — EXECUTING
-Plan: 2 of 4
-Status: Executing Phase 25
-Last activity: 2026-06-13 -- Phase 25 execution started
+Plan: 4 of 4 (25-01/02/03 merged to main; 25-04 next)
+Status: Executing Phase 25 — wave-2 merged, post-merge gate green
+Last activity: 2026-06-14 -- 25-02/25-03 merged; TOFU test-harness regression quick-fixed; full gate green
 
 ```
-Progress: [███████░░░] 73%
+Progress: [████████░░] 83%
 ```
 
 ## Performance Metrics
@@ -115,6 +115,12 @@ None at roadmap time. Concerns to watch during execution:
 - Phase 26: Double-attach race (MH-2) must be confirmed atomic before the reconnect loop ships
 - Phase 27: 999.7 re-verification must precede any SEC-04 hardening work — if re-verification reveals the prefilter has a gap, a gap-closure plan takes priority
 
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260614-47b | Fix post-merge TOFU test-harness regression (TofuPolicy::Silent seam for integration tests) | 2026-06-14 | 54a1d4b | [260614-47b-fix-post-merge-tofu-test-harness-regress](./quick/260614-47b-fix-post-merge-tofu-test-harness-regress/) |
+
 ## Deferred Items
 
 Items acknowledged and carried forward from previous milestones:
@@ -141,10 +147,11 @@ Items acknowledged and carried forward from previous milestones:
 
 ## Session Continuity
 
-Last session: 2026-06-13T08:46:33.703Z
-Stopped at: Completed 23-01-PLAN.md (transport trait definitions + codec helpers)
-Resume file: .planning/phases/23-transport-abstraction-seam/23-01-SUMMARY.md
+Last session: 2026-06-14T00:00:00.000Z
+Stopped at: Phase 25 wave-2 (25-02 server + 25-03 client) merged to main; quick-fix 260614-47b restored the integration-test gate to green. HEAD = 54a1d4b.
+Resume file: .planning/phases/25-inner-ssh-key-handshake-tofu-prompt/25-03-SUMMARY.md
 
 ## Operator Next Steps
 
-- Execute Phase 23 Plan 02 with `/gsd:execute-phase 23` (Quinn wrapper impls + server/client refactor)
+- Dispatch Phase 25 Plan 04 (adversarial integration tests) — MUST use the InnerAuthMode::Required real-auth WT harness (spawn_wt_server_real_auth, NOT TestBypass): tampered-EKM→auth-fail (WT-3), pre-auth SessionOpen→reject (MH-1), no-TTY→fail-closed (D-10), happy-path mutual-auth. Then code-review → fix → opus verifier → phase.complete 25.
+- Verifier watch-item: `run_inner_auth_server` + helpers were dead-code after the wave-2 merge (server live WT accept path may not invoke inner auth yet despite InnerAuthMode::Required default) — 25-04 must wire/exercise it and the opus verifier must confirm enforcement is reachable, not vacuous.
