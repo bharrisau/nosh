@@ -136,6 +136,22 @@ impl NoshTransport for WtransportTransport {
         // wtransport::VarInt does NOT impl From<u32>; use the explicit constructor.
         self.0.close(VarInt::from_u32(code), reason)
     }
+
+    // D-01 channel binding: delegate to the underlying quinn::Connection's EKM export.
+    // quinn's export_keying_material takes &mut [u8] (unsized slice); coerce the
+    // fixed-size [u8; 32] via `output as &mut [u8]` — this is always safe and
+    // preserves the 32-byte size requirement by the type system.
+    fn export_keying_material(
+        &self,
+        output: &mut [u8; 32],
+        label: &[u8],
+        context: &[u8],
+    ) -> anyhow::Result<()> {
+        self.0
+            .quic_connection()
+            .export_keying_material(output as &mut [u8], label, context)
+            .map_err(|e| anyhow::anyhow!("export_keying_material failed: {e:?}"))
+    }
 }
 
 // ── WtransportSendStream ───────────────────────────────────────────────────────
