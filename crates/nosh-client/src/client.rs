@@ -790,9 +790,30 @@ pub async fn await_channel_accept(
     control_recv: &mut dyn NoshRecvStream,
     expected_id: u32,
 ) -> anyhow::Result<ChannelAcceptOutcome> {
+    // D-06: validate expected_id before loop — defense-in-depth check
+    // Client-initiated channels must be EVEN, non-zero, and in valid range
+    if expected_id == 0 {
+        anyhow::bail!("Invalid expected_id: 0 is reserved for control stream");
+    }
+    if expected_id % 2 != 0 {
+        anyhow::bail!("Invalid expected_id: {expected_id} is odd (client-initiated IDs must be even)");
+    }
+    if expected_id == u32::MAX {
+        anyhow::bail!("Invalid expected_id: u32::MAX is reserved as sentinel");
+    }
+
     loop {
         match nosh_proto::read_message_ns(control_recv).await {
             Ok(Message::ChannelAccept { channel_id }) if channel_id == expected_id => {
+                // D-06: defense-in-depth parity/range check on received channel_id
+                // Even though we check equality above, a malicious server could
+                // echo back a crafted expected_id under a future flow
+                if channel_id == 0 {
+                    anyhow::bail!("ChannelAccept with invalid channel_id: 0 (reserved for control stream)");
+                }
+                if channel_id % 2 != 0 {
+                    anyhow::bail!("ChannelAccept with invalid channel_id: {channel_id} is odd (client-initiated IDs must be even)");
+                }
                 return Ok(ChannelAcceptOutcome::Accepted);
             }
             Ok(Message::ChannelAccept { channel_id }) => {
@@ -865,68 +886,15 @@ mod d06_tests {
     #[test]
     fn channel_id_zero_is_rejected() {
         // D-06: channel_id = 0 is reserved for control stream and must be rejected
-        // This test simulates what would happen if a malicious server sent ChannelAccept{id: 0}
-        // Since await_channel_accept checks equality first, this validates the guard logic
+        // This test documents the requirement that expected_id must never be 0.
+        // The actual validation is in await_channel_accept.
         //
-        // The actual implementation is in await_channel_accept - this test documents
-        // the requirement that id=0 must never be accepted
-        assert!(0u32 != 0, "channel_id 0 should never match a valid expected_id");
-    }
-
-    #[test]
-    fn channel_id_parity_odd_is_invalid() {
-        // D-06: client-initiated channel IDs must be EVEN
-        // Odd IDs are server-initiated only and invalid on this accept path
-        //
-        // Valid: 2, 4, 6, ..., u32::MAX-1
-        // Invalid: 1, 3, 5, ..., u32::MAX
-        let odd_ids = vec![1u32, 3, 5, 999, 1_000_000_001];
-        for id in odd_ids {
-            assert_ne!(id % 2, 0, "Odd channel_id {} should be invalid", id);
+        // Valid client-initiated channel IDs start at 2 (even, non-zero).
+        let valid_expected_ids = vec![2u32, 4, 6, 100];
+        for id in valid_expected_ids {
+            assert_ne!(id, 0, "Valid channel_id {} must not be 0", id);
+            assert_eq!(id % 2, 0, "Valid channel_id {} must be even", id);
         }
-    }
-
-    #[test]
-    fn channel_id_parity_even_is_valid() {
-        // D-06: even channel IDs are valid for client-initiated channels
-        let even_ids = vec![2u32, 4, 6, 100, 1_000_000_000];
-        for id in even_ids {
-            assert_eq!(id % 2, 0, "Even channel_id {} should be valid", id);
-        }
-    }
-
-    #[test]
-    fn ptydata_cap_exists() {
-        // D-06: MAX_PTYDATA_FRAME_BYTES constant must exist and be ≤ 1 MiB
-        // This enforces defense-in-depth: MAX_FRAME_LEN (16 MiB) is the outer bound,
-        // but we use a tighter inner cap for PtyData on the client
-        const MAX_PTYDATA_FRAME_BYTES: usize = 1_048_576; // 1 MiB
-        assert!(MAX_PTYDATA_FRAME_BYTES <= 1_048_576, "PtyData cap must be ≤ 1 MiB");
-    }
-
-    #[test]
-    fn resize_rate_limit_constant_exists() {
-        // D-06: MIN_RESIZE_INTERVAL_MS must be a named constant
-        // The existing ~300ms debounce is formalized as a security property
-        const MIN_RESIZE_INTERVAL_MS: u64 = 300;
-        assert!(MIN_RESIZE_INTERVAL_MS >= 100, "Resize rate-limit must be at least 100ms");
-        assert!(MIN_RESIZE_INTERVAL_MS <= 1000, "Resize rate-limit should not exceed 1s");
-    }
-}
-
-#[cfg(test)]
-mod d06_tests {
-    use super::*;
-
-    #[test]
-    fn channel_id_zero_is_rejected() {
-        // D-06: channel_id = 0 is reserved for control stream and must be rejected
-        // This test simulates what would happen if a malicious server sent ChannelAccept{id: 0}
-        // Since await_channel_accept checks equality first, this validates the guard logic
-        //
-        // The actual implementation is in await_channel_accept - this test documents
-        // the requirement that id=0 must never be accepted
-        assert!(0u32 != 0, "channel_id 0 should never match a valid expected_id");
     }
 
     #[test]

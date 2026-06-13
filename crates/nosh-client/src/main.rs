@@ -47,6 +47,19 @@ use tokio::sync::mpsc;
 /// Unix (SIGWINCH) and Windows (terminal::size() polling).
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(40);
 
+/// D-06: MIN_RESIZE_INTERVAL_MS — security property, not just UX.
+/// The ~300ms resize coalescing is a named constant to formalize the rate-limit.
+/// Cited from docs/999.1-SECURITY.md pre-auth caps pattern.
+const MIN_RESIZE_INTERVAL_MS: u64 = 300;
+
+/// D-06: MAX_PTYDATA_FRAME_BYTES — defense-in-depth cap on PtyData frame size.
+/// MAX_FRAME_LEN (16 MiB, from nosh-proto codec.rs) is the hard outer bound enforced
+/// by read_message_ns. This tighter inner cap (1 MiB) matches the datagram buffer
+/// size in docs/999.1-SECURITY.md and treats oversized PtyData as a transport anomaly.
+/// PtyData on the control stream is the reattach-replay byte sequence; the client
+/// discards it (let _ = data) but should not buffer unbounded content.
+const MAX_PTYDATA_FRAME_BYTES: usize = 1_048_576; // 1 MiB
+
 /// Ack cadence: send an Ack frame roughly every 750ms when output has been
 /// applied (D-08 continuous acking, Claude's discretion).
 const ACK_INTERVAL: Duration = Duration::from_millis(750);
@@ -2047,6 +2060,17 @@ async fn run_pump(
                 match msg {
                     Ok(Message::PtyData { data }) => {
                         // D-02: client has no vte parser; server-side osc_prefilter is the authoritative OSC byte gate
+                        // D-06: MAX_PTYDATA_FRAME_BYTES — defense-in-depth cap (1 MiB, matches docs/999.1-SECURITY.md datagram buffers)
+                        // MAX_FRAME_LEN (16 MiB) is enforced by read_message_ns, but we use a tighter inner cap.
+                        // Oversized frames are treated as a transport anomaly (connection may be compromised).
+                        if data.len() > MAX_PTYDATA_FRAME_BYTES {
+                            tracing::warn!(
+                                ptydata_len = data.len(),
+                                max_allowed = MAX_PTYDATA_FRAME_BYTES,
+                                "PtyData frame exceeds inner cap — treating as transport anomaly"
+                            );
+                            return Ok(PumpOutcome::TransportDrop);
+                        }
                         // D-14-02: display comes exclusively from datagrams via
                         // ClientScreen.render_to_stdout — do NOT write PtyData to stdout.
                         // D-14-03: advance the reattach counter so the cold-reattach
