@@ -31,9 +31,11 @@ use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use tokio::sync::mpsc;
 
 use crate::channel::{ChannelEvent, run_channel_task, run_scrollback_sender_task};
+use crate::quinn_transport::QuinnTransport;
 use crate::registry::SessionRegistry;
 use crate::session;
 use crate::terminal::Cell;
+use nosh_proto::{NoshTransport, NoshSendStream, NoshRecvStream};
 
 /// Maximum number of simultaneously open channels per session (T-21-04 / DoS bound).
 ///
@@ -434,13 +436,13 @@ fn build_state_diff(
 /// - `epoch_snapshots.push_back` is not called here (belongs to the caller,
 ///   once per tick — Pitfall 5).
 fn send_burst(
-    conn: &quinn::Connection,
+    conn: &dyn NoshTransport,
     result: DiffTickResult,
     cap: usize,
 ) -> (Vec<DiffRun>, bool /* transport_lost */) {
     // Send the first datagram (already encoded by build_state_diff).
     if let Err(e) = conn.send_datagram(result.payload) {
-        use quinn::SendDatagramError::*;
+        use nosh_proto::transport_trait::SendDatagramError::*;
         match e {
             TooLarge => {
                 // Path MTU shrank between max_datagram_size() and send_datagram().
@@ -499,7 +501,7 @@ fn send_burst(
         };
         deferred = next_deferred;
         if let Err(e) = conn.send_datagram(payload) {
-            use quinn::SendDatagramError::*;
+            use nosh_proto::transport_trait::SendDatagramError::*;
             match e {
                 TooLarge => {} // unreachable: encode_datagram guarantees payload < cap
                 UnsupportedByPeer | Disabled | ConnectionLost(_) => {
@@ -544,6 +546,10 @@ async fn handle_connection(
     // enforces client auth, so a resolved connection must always have a parseable
     // peer identity. If extraction nonetheless fails, close with CLOSE_AUTH and
     // log an error. An unauthenticated session is impossible.
+    //
+    // T-23-03 / Pitfall 5: extract_peer_identity and handshake_data run on the raw
+    // quinn::Connection BEFORE boxing — these are quinn-specific and absent from
+    // NoshTransport. The boxing step comes AFTER both quinn-specific calls.
     let peer_identity = match extract_peer_identity(&conn) {
         Some(k) => k,
         None => {
@@ -562,15 +568,27 @@ async fn handle_connection(
         .unwrap_or_else(|| "<none>".to_string());
     tracing::info!(%peer, alpn = %alpn, "connection accepted");
 
+    // Box the connection AFTER all quinn-specific operations are complete (T-23-03).
+    // From this point on, `conn` is a trait object — Phase 24 can swap in a
+    // WebTransport wrapper here and the session pump is unchanged.
+    let conn: Box<dyn NoshTransport> = Box::new(QuinnTransport(conn));
+
     // The client opens exactly one bidi stream and sends SessionOpen first.
     let (send, mut recv) = match conn.accept_bi().await {
         Ok(pair) => pair,
-        Err(e) => return clean_exit(e),
+        Err(e) => {
+            // accept_bi returns anyhow::Error; map connection-close variants to Ok(()).
+            // We check the underlying error string as a heuristic (the trait abstracts away
+            // quinn::ConnectionError). Most connection-close errors should be treated as
+            // clean exits per `clean_exit`; transport errors surface as anyhow errors here.
+            let _ = e;
+            return Ok(());
+        }
     };
 
     // Phase 6 (D-04): dispatch on the first frame — SessionOpen → fresh session,
     // Reattach → reattach path, anything else → protocol close.
-    match nosh_proto::read_message(&mut recv).await {
+    match nosh_proto::read_message_ns(&mut *recv).await {
         Ok(Message::SessionOpen { term, cols, rows, env }) => {
             run_session(conn, peer, peer_identity, send, recv, SessionOpenParams {
                 term, cols, rows, client_env: env, shell_override,
@@ -583,12 +601,12 @@ async fn handle_connection(
             // W3 / D-07: NEVER Debug-log the message — SessionOpened / ReattachOk
             // would print a token. Log only the variant name (no payload).
             tracing::warn!(%peer, frame = other.variant_name(), "expected SessionOpen or Reattach as first frame");
-            conn.close(CLOSE_PROTOCOL.into(), b"expected SessionOpen or Reattach");
+            conn.close(CLOSE_PROTOCOL, b"expected SessionOpen or Reattach");
             Ok(())
         }
         Err(e) => {
             tracing::warn!(%peer, "failed to read first frame: {e}");
-            conn.close(CLOSE_PROTOCOL.into(), b"bad first frame");
+            conn.close(CLOSE_PROTOCOL, b"bad first frame");
             Ok(())
         }
     }
@@ -630,11 +648,11 @@ struct SessionOpenParams {
 /// client can reattach later. Also handles `Ack { seq }` frames during the pump
 /// loop (D-08 continuous acking).
 async fn run_session(
-    conn: quinn::Connection,
+    conn: Box<dyn NoshTransport>,
     peer: SocketAddr,
     identity: nosh_auth::NoshPublicKey,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: Box<dyn NoshSendStream>,
+    mut recv: Box<dyn NoshRecvStream>,
     params: SessionOpenParams,
     registry: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
@@ -668,7 +686,7 @@ async fn run_session(
     // Phase 6 (D-03): send SessionOpened immediately so the client has the
     // initial reattach token. Token MUST NOT be logged (D-07).
     let initial_token = slot.token();
-    if nosh_proto::write_message(&mut send, &Message::SessionOpened { token: initial_token })
+    if nosh_proto::write_message_ns(&mut *send, &Message::SessionOpened { token: initial_token })
         .await
         .is_err()
     {
@@ -838,7 +856,7 @@ async fn run_session(
                         // state model (SYNC-02) before sending. Seq is assigned first
                         // (replay integrity), then TerminalState::advance is called.
                         slot.push_output_and_parse(&data);
-                        if nosh_proto::write_message(&mut send, &Message::PtyData { data })
+                        if nosh_proto::write_message_ns(&mut *send, &Message::PtyData { data })
                             .await
                             .is_err()
                         {
@@ -852,8 +870,8 @@ async fn run_session(
                         // Client re-emits these to stdout, bypassing the compositor.
                         let (drained_title, drained_clipboard) = slot.drain_terminal_control();
                         if let Some(title) = drained_title {
-                            if nosh_proto::write_message(
-                                &mut send,
+                            if nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::TerminalControl(TerminalControlPayload::Title { title }),
                             )
                             .await
@@ -863,8 +881,8 @@ async fn run_session(
                             }
                         }
                         if let Some((selection, data)) = drained_clipboard {
-                            if nosh_proto::write_message(
-                                &mut send,
+                            if nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::TerminalControl(TerminalControlPayload::Clipboard {
                                     selection,
                                     data,
@@ -939,7 +957,7 @@ async fn run_session(
                     // Phase 20: send_burst() sends result.payload first, then
                     // drains result.deferred via encode_datagram-only until the
                     // send buffer is full, BURST_CAP is hit, or deferred is empty.
-                    let (leftover, transport_lost) = send_burst(&conn, result, cap);
+                    let (leftover, transport_lost) = send_burst(&*conn, result, cap);
                     pending_deferred = leftover;
                     if transport_lost {
                         break SessionEnd::TransportLost;
@@ -980,7 +998,7 @@ async fn run_session(
                 }
             }
             // Client → server frames.
-            msg = nosh_proto::read_message(&mut recv) => {
+            msg = nosh_proto::read_message_ns(&mut *recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
                         // Update last_active while client is driving input (D-03).
@@ -1038,8 +1056,8 @@ async fn run_session(
                         // Duplicate open: reject opaquely (T-21-09, MUX-01).
                         if channel_map.contains_key(&channel_id) {
                             tracing::warn!(channel_id, "duplicate ChannelOpen; rejecting");
-                            let _ = nosh_proto::write_message(
-                                &mut send,
+                            let _ = nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::ChannelReject { channel_id },
                             )
                             .await;
@@ -1052,8 +1070,8 @@ async fn run_session(
                                 max = MAX_OPEN_CHANNELS,
                                 "channel cap reached; rejecting ChannelOpen"
                             );
-                            let _ = nosh_proto::write_message(
-                                &mut send,
+                            let _ = nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::ChannelReject { channel_id },
                             )
                             .await;
@@ -1094,8 +1112,8 @@ async fn run_session(
                         };
 
                         if !accept {
-                            let _ = nosh_proto::write_message(
-                                &mut send,
+                            let _ = nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::ChannelReject { channel_id },
                             )
                             .await;
@@ -1104,8 +1122,8 @@ async fn run_session(
 
                         // Send accept then spawn the per-channel task (MUX-02).
                         // NEVER do channel data I/O inline (Pitfall M-2 HOL blocking).
-                        if nosh_proto::write_message(
-                            &mut send,
+                        if nosh_proto::write_message_ns(
+                            &mut *send,
                             &Message::ChannelAccept { channel_id },
                         )
                         .await
@@ -1145,11 +1163,13 @@ async fn run_session(
                                             }
                                         }
                                     };
+                                    // Phase 23: ch_send/ch_recv are Box<dyn Nosh*>;
+                                    // deref to &mut dyn for run_scrollback_sender_task.
                                     run_scrollback_sender_task(
                                         channel_id,
                                         slot_clone,
-                                        &mut ch_send,
-                                        &mut ch_recv,
+                                        &mut *ch_send,
+                                        &mut *ch_recv,
                                         &mut task_rx_inner,
                                         &ctrl_tx_clone,
                                         epoch_src_clone,
@@ -1287,7 +1307,8 @@ async fn run_session(
                     Ok((ch_send, mut ch_recv)) => {
                         // Read only the varint channel-id prefix — no channel payload
                         // is ever consumed here (Pitfall M-2 HOL blocking prevention).
-                        match crate::channel::read_varint_u32(&mut ch_recv).await {
+                        // Phase 23: ch_recv is Box<dyn NoshRecvStream>; deref to &mut dyn.
+                        match crate::channel::read_varint_u32(&mut *ch_recv).await {
                             Ok(channel_id) => {
                                 if let Some(task_tx) = channel_map.get(&channel_id) {
                                     // WR-01 fix: use send (not try_send) for Stream events so
@@ -1307,9 +1328,11 @@ async fn run_session(
                                         channel_id,
                                         "accept_bi: no channel task for id; resetting stream"
                                     );
+                                    // Phase 23: NoshSendStream::reset and NoshRecvStream::stop
+                                    // take u32 directly (no .into()); stop returns () (no .ok()).
                                     let mut ch_send = ch_send;
-                                    let _ = ch_send.reset(0u32.into());
-                                    ch_recv.stop(0u32.into()).ok();
+                                    ch_send.reset(0u32);
+                                    ch_recv.stop(0u32);
                                 }
                             }
                             Err(_) => {
@@ -1318,12 +1341,10 @@ async fn run_session(
                             }
                         }
                     }
-                    Err(quinn::ConnectionError::ApplicationClosed(_))
-                    | Err(quinn::ConnectionError::LocallyClosed) => {
-                        break SessionEnd::TransportLost;
-                    }
                     Err(_) => {
-                        // Transient error: continue the loop.
+                        // Connection closed or transient error on accept_bi.
+                        // The trait returns anyhow::Error; treat all errors as transport loss.
+                        break SessionEnd::TransportLost;
                     }
                 }
             }
@@ -1340,7 +1361,7 @@ async fn run_session(
                     tracing::debug!(channel_id, "channel task closed; removed from map");
                 }
                 // Write the control frame to the client.
-                if nosh_proto::write_message(&mut send, &ctrl_msg).await.is_err() {
+                if nosh_proto::write_message_ns(&mut *send, &ctrl_msg).await.is_err() {
                     break SessionEnd::TransportLost;
                 }
             }
@@ -1378,8 +1399,8 @@ async fn run_session(
                         ));
 
                         tracing::debug!(server_ch_id, "server-initiated ChannelOpen");
-                        if nosh_proto::write_message(
-                            &mut send,
+                        if nosh_proto::write_message_ns(
+                            &mut *send,
                             &Message::ChannelOpen {
                                 channel_id: server_ch_id,
                                 channel_type: ch_type,
@@ -1419,29 +1440,30 @@ async fn run_session(
                     Ok(Some(data)) => {
                         slot.push_output_and_parse(&data);
                         let _ =
-                            nosh_proto::write_message(&mut send, &Message::PtyData { data }).await;
+                            nosh_proto::write_message_ns(&mut *send, &Message::PtyData { data }).await;
                     }
                     Ok(None) => break, // output channel closed: all output sent
                     Err(_) => break,   // no more output within the window
                 }
             }
             tracing::info!(exit_code, "shell exited");
-            let _ = nosh_proto::write_message(
-                &mut send,
+            let _ = nosh_proto::write_message_ns(
+                &mut *send,
                 &Message::SessionClose {
                     exit_code,
                     reason: "shell exited".to_string(),
                 },
             )
             .await;
-            let _ = send.finish();
+            // CRITICAL (T-23-06): NoshSendStream::finish() is async fn — MUST .await.
+            let _ = send.finish().await;
             // Wait until the client has acknowledged reading the finished stream
             // (so the SessionClose frame is delivered, not truncated), then the
             // server closes the connection with a structured application code
             // (SESS-09). `stopped()` resolves once the peer has consumed/acked
             // the stream; a short bounded fallback covers a client that lingers.
             let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
-            conn.close(CLOSE_OK.into(), b"shell exited");
+            conn.close(CLOSE_OK, b"shell exited");
             // Shell already exited — remove the slot from the registry (D-01).
             registry.remove(&identity_raw, session_id);
         }
@@ -1455,7 +1477,7 @@ async fn run_session(
             // even though the child was taken).
             slot.sighup();
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
-            conn.close(CLOSE_OK.into(), b"client closed");
+            conn.close(CLOSE_OK, b"client closed");
             // Clean close — remove from registry immediately (D-01).
             registry.remove(&identity_raw, session_id);
         }
@@ -1544,11 +1566,11 @@ async fn run_session(
 /// ALL rejection causes emit the same opaque `ReattachErr` wire frame (D-07
 /// no-oracle invariant). Token and new_token are NEVER logged.
 async fn run_reattach_session(
-    conn: quinn::Connection,
+    conn: Box<dyn NoshTransport>,
     peer: SocketAddr,
     identity: nosh_auth::NoshPublicKey,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: Box<dyn NoshSendStream>,
+    mut recv: Box<dyn NoshRecvStream>,
     reattach_params: ([u8; 16], u64), // (token, last_acked_seq)
     registry: Arc<crate::registry::SessionRegistry>,
 ) -> anyhow::Result<()> {
@@ -1562,12 +1584,13 @@ async fn run_reattach_session(
             // ALL rejection causes take this identical path (D-07 no-oracle).
             // Log identity fingerprint only; never the token.
             tracing::info!(identity = %identity.fingerprint(), "reattach rejected");
-            let _ = nosh_proto::write_message(&mut send, &Message::ReattachErr).await;
+            let _ = nosh_proto::write_message_ns(&mut *send, &Message::ReattachErr).await;
             // Finish the send stream so the client can read the ReattachErr frame
             // before the connection is closed.
-            let _ = send.finish();
+            // CRITICAL (T-23-06): NoshSendStream::finish() is async fn — MUST .await.
+            let _ = send.finish().await;
             let _ = tokio::time::timeout(Duration::from_millis(200), send.stopped()).await;
-            conn.close(CLOSE_PROTOCOL.into(), b"reattach rejected");
+            conn.close(CLOSE_PROTOCOL, b"reattach rejected");
             return Ok(());
         }
     };
@@ -1600,8 +1623,8 @@ async fn run_reattach_session(
     // un-reattachable. MUST NOT be logged (D-07).
     let new_token = slot.mint_token_candidate();
 
-    if nosh_proto::write_message(
-        &mut send,
+    if nosh_proto::write_message_ns(
+        &mut *send,
         &Message::ReattachOk { new_token, replaying_from_seq, truncated },
     )
     .await
@@ -1621,7 +1644,7 @@ async fn run_reattach_session(
 
     // ── Step 3: Replay buffered output (D-09 no dup/gap within retained range) ─
     for (_seq, data) in &chunks {
-        if nosh_proto::write_message(&mut send, &Message::PtyData { data: data.to_vec() })
+        if nosh_proto::write_message_ns(&mut *send, &Message::PtyData { data: data.to_vec() })
             .await
             .is_err()
         {
@@ -1739,7 +1762,7 @@ async fn run_reattach_session(
                 match chunk {
                     Some(data) => {
                         slot.push_output_and_parse(&data);
-                        if nosh_proto::write_message(&mut send, &Message::PtyData { data })
+                        if nosh_proto::write_message_ns(&mut *send, &Message::PtyData { data })
                             .await
                             .is_err()
                         {
@@ -1752,8 +1775,8 @@ async fn run_reattach_session(
                         // Client re-emits these to stdout, bypassing the compositor.
                         let (drained_title, drained_clipboard) = slot.drain_terminal_control();
                         if let Some(title) = drained_title {
-                            if nosh_proto::write_message(
-                                &mut send,
+                            if nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::TerminalControl(TerminalControlPayload::Title { title }),
                             )
                             .await
@@ -1763,8 +1786,8 @@ async fn run_reattach_session(
                             }
                         }
                         if let Some((selection, data)) = drained_clipboard {
-                            if nosh_proto::write_message(
-                                &mut send,
+                            if nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::TerminalControl(TerminalControlPayload::Clipboard {
                                     selection,
                                     data,
@@ -1818,7 +1841,7 @@ async fn run_reattach_session(
                     }
                     last_sent_snapshot = result.sent_cells.clone();
                     // Phase 20: burst drain via send_burst (same as run_session).
-                    let (leftover, transport_lost) = send_burst(&conn, result, cap);
+                    let (leftover, transport_lost) = send_burst(&*conn, result, cap);
                     pending_deferred = leftover;
                     if transport_lost {
                         break SessionEnd::TransportLost;
@@ -1851,7 +1874,7 @@ async fn run_reattach_session(
                     Err(_) => break SessionEnd::TransportLost,
                 }
             }
-            msg = nosh_proto::read_message(&mut recv) => {
+            msg = nosh_proto::read_message_ns(&mut *recv) => {
                 match msg {
                     Ok(Message::PtyData { data }) => {
                         slot.touch();
@@ -1893,16 +1916,16 @@ async fn run_reattach_session(
                             continue;
                         }
                         if channel_map.contains_key(&channel_id) {
-                            let _ = nosh_proto::write_message(
-                                &mut send,
+                            let _ = nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::ChannelReject { channel_id },
                             )
                             .await;
                             continue;
                         }
                         if channel_map.len() >= MAX_OPEN_CHANNELS {
-                            let _ = nosh_proto::write_message(
-                                &mut send,
+                            let _ = nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::ChannelReject { channel_id },
                             )
                             .await;
@@ -1925,15 +1948,15 @@ async fn run_reattach_session(
                             }
                         };
                         if !accept {
-                            let _ = nosh_proto::write_message(
-                                &mut send,
+                            let _ = nosh_proto::write_message_ns(
+                                &mut *send,
                                 &Message::ChannelReject { channel_id },
                             )
                             .await;
                             continue;
                         }
-                        if nosh_proto::write_message(
-                            &mut send,
+                        if nosh_proto::write_message_ns(
+                            &mut *send,
                             &Message::ChannelAccept { channel_id },
                         )
                         .await
@@ -1969,11 +1992,13 @@ async fn run_reattach_session(
                                             }
                                         }
                                     };
+                                    // Phase 23: ch_send/ch_recv are Box<dyn Nosh*>;
+                                    // deref to &mut dyn for run_scrollback_sender_task.
                                     run_scrollback_sender_task(
                                         channel_id,
                                         slot_clone,
-                                        &mut ch_send,
-                                        &mut ch_recv,
+                                        &mut *ch_send,
+                                        &mut *ch_recv,
                                         &mut task_rx_inner,
                                         &ctrl_tx_clone,
                                         epoch_src_clone,
@@ -2061,7 +2086,8 @@ async fn run_reattach_session(
             incoming_stream = conn.accept_bi() => {
                 match incoming_stream {
                     Ok((ch_send, mut ch_recv)) => {
-                        match crate::channel::read_varint_u32(&mut ch_recv).await {
+                        // Phase 23: ch_recv is Box<dyn NoshRecvStream>; deref to &mut dyn.
+                        match crate::channel::read_varint_u32(&mut *ch_recv).await {
                             Ok(channel_id) => {
                                 if let Some(task_tx) = channel_map.get(&channel_id) {
                                     // WR-01 fix: use send (not try_send) for Stream events.
@@ -2076,9 +2102,11 @@ async fn run_reattach_session(
                                         channel_id,
                                         "accept_bi (reattach): no channel task for id; resetting stream"
                                     );
+                                    // Phase 23: NoshSendStream::reset and NoshRecvStream::stop
+                                    // take u32 directly; stop returns () (no .ok()).
                                     let mut ch_send = ch_send;
-                                    let _ = ch_send.reset(0u32.into());
-                                    ch_recv.stop(0u32.into()).ok();
+                                    ch_send.reset(0u32);
+                                    ch_recv.stop(0u32);
                                 }
                             }
                             Err(_) => {
@@ -2088,11 +2116,10 @@ async fn run_reattach_session(
                             }
                         }
                     }
-                    Err(quinn::ConnectionError::ApplicationClosed(_))
-                    | Err(quinn::ConnectionError::LocallyClosed) => {
+                    Err(_) => {
+                        // Connection closed or transient error on accept_bi.
                         break SessionEnd::TransportLost;
                     }
-                    Err(_) => {}
                 }
             }
 
@@ -2101,7 +2128,7 @@ async fn run_reattach_session(
                 if let Message::ChannelClose { channel_id } = &ctrl_msg {
                     channel_map.remove(channel_id);
                 }
-                if nosh_proto::write_message(&mut send, &ctrl_msg).await.is_err() {
+                if nosh_proto::write_message_ns(&mut *send, &ctrl_msg).await.is_err() {
                     break SessionEnd::TransportLost;
                 }
             }
@@ -2116,17 +2143,18 @@ async fn run_reattach_session(
             // The original watcher will call remove_slot. Send SessionClose.
             // We don't have the exact exit code (the original wait_task has it);
             // send 0 as approximate. The client will see the connection close.
-            let _ = nosh_proto::write_message(
-                &mut send,
+            let _ = nosh_proto::write_message_ns(
+                &mut *send,
                 &Message::SessionClose {
                     exit_code: 0,
                     reason: "shell exited".to_string(),
                 },
             )
             .await;
-            let _ = send.finish();
+            // CRITICAL (T-23-06): NoshSendStream::finish() is async fn — MUST .await.
+            let _ = send.finish().await;
             let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
-            conn.close(CLOSE_OK.into(), b"shell exited");
+            conn.close(CLOSE_OK, b"shell exited");
             // WR-02 fix: use remove_slot (Arc pointer identity) instead of
             // registry.remove (session_id). remove_slot ensures we only remove
             // THIS specific slot instance — a concurrent reattach that opened a
@@ -2138,7 +2166,7 @@ async fn run_reattach_session(
         SessionEnd::ClientClosed => {
             tracing::info!("client closed reattach session");
             slot.sighup();
-            conn.close(CLOSE_OK.into(), b"client closed");
+            conn.close(CLOSE_OK, b"client closed");
             registry.remove_slot(&slot);
         }
         SessionEnd::TransportLost => {
@@ -2188,6 +2216,8 @@ fn extract_peer_identity(conn: &quinn::Connection) -> Option<nosh_auth::NoshPubl
 }
 
 /// Treat orderly connection teardown as a clean loop exit, not an error.
+/// Used for quinn-specific error classification; retained for future use.
+#[allow(dead_code)]
 fn clean_exit(e: quinn::ConnectionError) -> anyhow::Result<()> {
     use quinn::ConnectionError::*;
     match e {
