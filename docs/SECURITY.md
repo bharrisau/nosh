@@ -136,11 +136,11 @@ This section assumes an internet-exposed Mode A deployment. Adjust for Mode B ac
 | **Denial of Service** | OSC OOM via unbounded accumulation | `osc_prefilter` bounds at 1 MiB (`OSC_ACCUMULATION_MAX`); parser resync on overflow (SEC-05) | ✅ Mitigated |
 | **Denial of Service** | Pre-auth connection flood | `AuthLimits { max_concurrent: 64, auth_timeout: 5s }`; excess connections refused (docs/999.1-SECURITY.md) | ✅ Mitigated |
 | **Denial of Service** | PtyData recv exhaustion | `MAX_PTYDATA_FRAME_BYTES` (1 MiB) cap on client (SEC-04 D-06) | ✅ Mitigated |
-| **Denial of Service** | Resize storm (server → client) | `MIN_RESIZE_INTERVAL_MS` (300ms) constant formalizes existing debounce (SEC-04 D-06) | ⚠️ Partial (see note below) |
+| **Denial of Service** | Resize storm (server → client) | `MIN_RESIZE_INTERVAL_MS` (300ms) rate-limit enforced at main.rs:2094-2114 with `last_server_resize` tracking (SEC-04 D-06) | ✅ Mitigated |
 | **Elevation of Privilege** | Env var privilege escalation | Environment-variable sanitization on every shell/exec (LD_*, DYLD_*, BASH_ENV, ENV, IFS, SHELLOPTS, PYTHONPATH, NODE_OPTIONS) — CLAUDE.md invariant | ✅ Mitigated |
 | **Elevation of Privilege** | Agent forwarding via env var | `SSH_AUTH_SOCK` never forwarded via environment; agent forwarding uses dedicated channel (future) | ✅ Mitigated |
 
-**Note on resize rate-limit (DoS):** `MIN_RESIZE_INTERVAL_MS` is defined as a named constant (300ms) to formalize the existing `RESIZE_DEBOUNCE` behavior. However, this bounds **client-initiated** resizes (SIGWINCH coalescing via `ResizeWatcher`). Server-initiated dimension changes flow through `StateDiff` datagrams, which are already bounded by the transport's 1 MiB datagram cap. There is no explicit rate-limit on how many `Resize` messages a malicious server can send on the control stream, but the practical impact is limited (resize events are cheap to process and the client re-reads `terminal::size()` authoritatively).
+**Note on resize rate-limit (DoS):** `MIN_RESIZE_INTERVAL_MS` (300ms) is enforced as a runtime guard at main.rs:2094-2114. The client tracks `last_server_resize: Option<Instant>` (state at 1847) and skips server-issued `Resize` frames that arrive within 300ms of the previous one (via `duration_since < Duration::from_millis(MIN_RESIZE_INTERVAL_MS) → continue`). The latest valid frame still applies (resizes screen + predictor). This bounds both client-initiated resizes (SIGWINCH coalescing) and malicious server floods on the control stream.
 
 ---
 
@@ -246,16 +246,35 @@ if channel_id == 0 || channel_id % 2 != 0 || channel_id == u32::MAX {
 - Enforces even parity (client-initiated), non-zero, not u32::MAX.
 - Defense-in-depth check in `await_channel_accept()`.
 
-#### Resize Rate-Limit Constant (D-06)
+#### Resize Rate-Limit (D-06)
 
-**File:** `crates/nosh-client/src/main.rs` (line 53)
+**File:** `crates/nosh-client/src/main.rs` (lines 53, 1847, 2094-2114)
 
 ```rust
-const MIN_RESIZE_INTERVAL_MS: u64 = 300;
+const MIN_RESIZE_INTERVAL_MS: u64 = 300;  // Line 53
+
+// State field in select! loop
+last_server_resize: Option<Instant> = None;  // Line 1847
+
+// Runtime enforcement in Message::Resize handler
+Ok(Message::Resize { cols, rows }) => {
+    let now = tokio::time::Instant::now();
+    if let Some(last_resize) = last_server_resize {
+        if now.duration_since(last_resize) < Duration::from_millis(MIN_RESIZE_INTERVAL_MS) {
+            tracing::warn!("server-issued Resize rate-limited; dropping frame within MIN_RESIZE_INTERVAL_MS");
+            continue;  // Skip flood, latest valid frame still applied
+        }
+    }
+    last_server_resize = Some(now);
+    screen.resize(cols, rows);
+    predictor.set_size(cols, rows);
+    predictor.reset();
+}  // Lines 2094-2114
 ```
 
-- Formalizes existing ~300ms debounce as a security property.
-- Note: This bounds client-initiated resizes (SIGWINCH coalescing). Server-initiated resizes flow through datagrams.
+- **Mechanism:** Runtime rate-limit on server-issued `Resize` frames. Tracks `last_server_resize` and skips floods within 300ms (`duration_since < MIN_RESIZE_INTERVAL_MS → continue`). Latest valid frame still applies (resizes screen + predictor).
+- **Bounds:** Both client-initiated resizes (SIGWINCH coalescing) and malicious server floods on the control stream.
+- **Verification:** `resize_rate_limit_enforced_in_main` test verifies source presence (integration test tracked as backlog). Runtime guard independently verified correct in 27-VERIFICATION.md.
 
 #### OSC 8 Hyperlink Scheme Whitelist (D-07)
 

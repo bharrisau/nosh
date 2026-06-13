@@ -910,25 +910,91 @@ mod d06_tests {
         }
     }
 
-    #[test]
-    fn channel_id_parity_enforced_in_await_accept() {
+    #[tokio::test]
+    async fn channel_id_parity_enforced_in_await_accept() {
         // WR-02: Verify that channel ID parity validation is actually enforced.
-        // This test will FAIL if the parity check is removed from await_channel_accept.
-        // We verify this by checking that the function contains the parity validation logic
-        // in active code (not just comments or test code).
-        let client_rs = std::fs::read_to_string("src/client.rs")
-            .expect("Unable to read client.rs");
-        // Find the await_channel_accept function and verify it validates parity
-        assert!(client_rs.contains("await_channel_accept"),
-                "await_channel_accept function must exist");
-        // Look for the active parity check pattern in the production code
-        // We need to verify that the parity check exists AND it's not just in test code
-        // The function should check that expected_id is even and bail on odd
-        // We look for the specific pattern that appears in the production code
-        let has_parity_bail = client_rs.contains("expected_id % 2 != 0") &&
-                              client_rs.contains("is odd (client-initiated IDs must be even)");
-        assert!(has_parity_bail,
-                "await_channel_accept must validate expected_id parity with 'expected_id % 2 != 0' check and bail with odd message");
+        // This is a BEHAVIORAL test that calls await_channel_accept directly
+        // with invalid expected_id values and asserts it bails BEFORE any stream read.
+        //
+        // The test constructs a mock NoshRecvStream that would return a valid
+        // ChannelAccept message if read, but the parity bail should trigger first.
+
+        // Mock stream that always returns ChannelAccept for channel 2
+        struct MockRecvStream {
+            /// Data to return on read_exact calls
+            data: std::io::Cursor<Vec<u8>>,
+            /// Whether read_exact was called (proves we didn't bail early)
+            read_was_called: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl nosh_proto::transport_trait::NoshRecvStream for MockRecvStream {
+            async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+                self.read_was_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                use std::io::Read;
+                let n = self.data.read(buf).map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
+                if n != buf.len() {
+                    anyhow::bail!("unexpected EOF");
+                }
+                Ok(())
+            }
+
+            async fn read(&mut self, _buf: &mut [u8]) -> anyhow::Result<Option<usize>> {
+                Ok(None)
+            }
+
+            fn stop(&mut self, _code: u32) {
+                // No-op for mock
+            }
+        }
+
+        // Helper to create a mock stream that returns ChannelAccept for a given channel_id
+        fn make_mock_stream(channel_id: u32) -> MockRecvStream {
+            // Encode a ChannelAccept message
+            let msg = nosh_proto::Message::ChannelAccept { channel_id };
+            let frame = nosh_proto::codec::encode(&msg)
+                .expect("ChannelAccept should encode successfully");
+            MockRecvStream {
+                data: std::io::Cursor::new(frame),
+                read_was_called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        // Test 1: odd expected_id should bail immediately
+        let mut mock = make_mock_stream(2);
+        let result = await_channel_accept(&mut mock, 1).await;
+        assert!(result.is_err(), "await_channel_accept should reject odd expected_id");
+        assert!(
+            !mock.read_was_called.load(std::sync::atomic::Ordering::SeqCst),
+            "read_exact should not be called when expected_id is odd (bail before stream read)"
+        );
+
+        // Test 2: expected_id = 0 should bail immediately
+        let mut mock = make_mock_stream(2);
+        let result = await_channel_accept(&mut mock, 0).await;
+        assert!(result.is_err(), "await_channel_accept should reject expected_id = 0");
+        assert!(
+            !mock.read_was_called.load(std::sync::atomic::Ordering::SeqCst),
+            "read_exact should not be called when expected_id is 0 (bail before stream read)"
+        );
+
+        // Test 3: expected_id = u32::MAX should bail immediately
+        let mut mock = make_mock_stream(2);
+        let result = await_channel_accept(&mut mock, u32::MAX).await;
+        assert!(result.is_err(), "await_channel_accept should reject expected_id = u32::MAX");
+        assert!(
+            !mock.read_was_called.load(std::sync::atomic::Ordering::SeqCst),
+            "read_exact should not be called when expected_id is u32::MAX (bail before stream read)"
+        );
+
+        // Test 4: valid even expected_id should proceed to read (positive control)
+        let mut mock = make_mock_stream(2);
+        let result = await_channel_accept(&mut mock, 2).await;
+        assert!(result.is_ok(), "await_channel_accept should accept valid even expected_id = 2");
+        assert!(
+            mock.read_was_called.load(std::sync::atomic::Ordering::SeqCst),
+            "read_exact should be called when expected_id is valid (proceeds to stream read)"
+        );
     }
 
     #[test]
@@ -951,7 +1017,16 @@ mod d06_tests {
 
     #[test]
     fn ptydata_cap_enforced_in_main() {
-        // WR-01: Verify that MAX_PTYDATA_FRAME_BYTES is actually enforced at runtime.
+        // WR-01: SOURCE-PRESENCE TEST (not behavioral — pragmatic floor for binary-crate select! loop guards).
+        //
+        // The PtyData cap enforcement lives in the binary-crate select! loop (main.rs:2072-2079),
+        // which is genuinely hard to unit-test directly. This test verifies the guard code is
+        // present in source (MAX_PTYDATA_FRAME_BYTES constant + comparison pattern).
+        //
+        // A proper behavioral integration test (spawns server, floods oversized PtyData frames,
+        // asserts TransportDrop) is tracked as backlog. Runtime guard was independently verified
+        // correct in 27-VERIFICATION.md.
+        //
         // This test will FAIL if the enforcement check is removed from main.rs.
         // We verify this by checking that the constant is used in an active size comparison
         // (not just in comments).
@@ -986,7 +1061,17 @@ mod d06_tests {
 
     #[test]
     fn resize_rate_limit_enforced_in_main() {
-        // CR-01: Verify that MIN_RESIZE_INTERVAL_MS is actually enforced at runtime.
+        // CR-01: SOURCE-PRESENCE TEST (not behavioral — pragmatic floor for binary-crate select! loop guards).
+        //
+        // The server-issued Resize rate-limit enforcement lives in the binary-crate select! loop
+        // (main.rs:2094-2114 with last_server_resize state at 1847), which is genuinely hard to
+        // unit-test directly. This test verifies the guard code is present in source
+        // (MIN_RESIZE_INTERVAL_MS constant + duration_since comparison pattern).
+        //
+        // A proper behavioral integration test (spawns malicious server, floods Resize frames,
+        // asserts rate-limit skip) is tracked as backlog. Runtime guard was independently
+        // verified correct in 27-VERIFICATION.md.
+        //
         // This test ensures the constant is consumed, not just defined.
         // The test will FAIL if the rate-limit check is removed from main.rs.
         // We verify this by checking that the constant is referenced in main.rs source
