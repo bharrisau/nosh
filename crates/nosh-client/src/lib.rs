@@ -7,6 +7,8 @@ pub mod platform;
 pub mod predictor; // NEW: PredictionOverlay, PendingPrediction, Validity, InputAction
 pub mod quinn_transport; // Phase 24: Quinn pass-through wrappers over NoshTransport
 pub mod screen; // NEW: ClientScreen, Overlay, ConnectionLossOverlay
+#[cfg(feature = "webtransport")]
+pub mod wt_transport; // Phase 24 Plan 04: WebTransport client wrapper + connect_wt
 
 pub use client::{
     build_client_config, connect, make_endpoint,
