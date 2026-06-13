@@ -230,6 +230,65 @@ pub fn check_authorized_key(key: &NoshPublicKey, authorized: &[NoshPublicKey]) -
     authorized.contains(key)
 }
 
+/// Shared TOFU prompt helper — blocks for explicit user acceptance (D-08, D-10).
+///
+/// Returns `Ok(true)` iff the user types exactly "yes" on a TTY.
+/// Returns `Ok(false)` or `Err` if the prompt fails (no-TTY, I/O error, etc.).
+/// The caller decides whether to record the key on acceptance — this function
+/// only handles the UI contract.
+///
+/// ## Behaviour (DO NOT weaken — WR-02 security baseline)
+/// - Prints fingerprint to stderr (diagnostic visibility even on failure).
+/// - Checks `stdin.is_terminal()` — **fails closed** on non-interactive contexts.
+/// - Accepts **only** the literal string `"yes"` (after trimming whitespace).
+/// - NO silent acceptance, NO fallback to `y`/`Y`/`ok`/`true`.
+/// - Writes exclusively to stderr (D-08: never stdout/PTY).
+///
+/// Used by both:
+/// - `nosh_auth::verifier::prompt_and_record` (TLS verifier path)
+/// - `nosh_client::inner_auth::prompt_tofu_or_fail` (WebTransport inner-auth path)
+pub fn prompt_host_key_accept(host: &str, fingerprint: &str) -> anyhow::Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let stderr = std::io::stderr();
+    let mut out = stderr.lock();
+
+    // Always print the key fingerprint before the yes/no decision (D-08).
+    writeln!(out, "The authenticity of host '{host}' can't be established.")?;
+    writeln!(out, "ED25519 key fingerprint is {fingerprint}.")?;
+
+    // D-10: non-interactive context fails closed.
+    if !std::io::stdin().is_terminal() {
+        writeln!(out, "Host key verification failed: stdin is not a TTY.")?;
+        writeln!(
+            out,
+            "Use --trust-key <fingerprint> (future flag) for non-interactive use."
+        )?;
+        return Ok(false);
+    }
+
+    // Interactive path: prompt and read one line.
+    write!(out, "Are you sure you want to continue connecting (yes/no)? ")?;
+    out.flush()?;
+    drop(out); // release stderr lock before locking stdin
+
+    let line = std::io::stdin()
+        .lock()
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("stdin closed during TOFU prompt"))??;
+
+    Ok(parse_yes(&line))
+}
+
+/// Parse a yes/no prompt response (shared helper for unit tests).
+///
+/// Returns `true` only for the literal string `"yes"` (after trimming
+/// whitespace). Empty strings, `"no"`, or anything else returns `false`.
+pub fn parse_yes(input: &str) -> bool {
+    input.trim() == "yes"
+}
+
 /// Verify a raw 64-byte Ed25519 signature over `msg` using the key represented
 /// by the 44-byte `spki` (SubjectPublicKeyInfo DER).
 ///

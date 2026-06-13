@@ -299,38 +299,11 @@ pub async fn run_inner_auth_client(
 ///
 /// The test helper [`parse_yes`] is provided separately so unit tests can
 /// exercise the yes/no parsing without a TTY.
+///
+/// This function now delegates to the shared `nosh_auth::keys::prompt_host_key_accept`
+/// to maintain a single canonical TOFU prompt implementation (WR-02).
 pub fn prompt_tofu_or_fail(host: &str, fingerprint: &str) -> anyhow::Result<bool> {
-    use std::io::{BufRead, IsTerminal, Write};
-
-    let stderr = std::io::stderr();
-    let mut out = stderr.lock();
-
-    // Always print the key fingerprint before the yes/no decision (D-08).
-    writeln!(out, "The authenticity of host '{host}' can't be established.")?;
-    writeln!(out, "ED25519 key fingerprint is {fingerprint}.")?;
-
-    // D-10: non-interactive context fails closed.
-    if !std::io::stdin().is_terminal() {
-        writeln!(out, "Host key verification failed: stdin is not a TTY.")?;
-        writeln!(
-            out,
-            "Use --trust-key <fingerprint> (future flag) for non-interactive use."
-        )?;
-        return Ok(false);
-    }
-
-    // Interactive path: prompt and read one line.
-    write!(out, "Are you sure you want to continue connecting (yes/no)? ")?;
-    out.flush()?;
-    drop(out); // release stderr lock before locking stdin
-
-    let line = std::io::stdin()
-        .lock()
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("stdin closed during TOFU prompt"))??;
-
-    Ok(parse_yes(&line))
+    nosh_auth::keys::prompt_host_key_accept(host, fingerprint)
 }
 
 /// Parse a yes/no prompt response.
@@ -340,8 +313,11 @@ pub fn prompt_tofu_or_fail(host: &str, fingerprint: &str) -> anyhow::Result<bool
 ///
 /// Extracted as a separate function so unit tests can exercise the parse
 /// logic without a TTY (D-08 acceptance criterion: `prompt_tofu_rejects_empty_input`).
+///
+/// This function now delegates to the shared `nosh_auth::keys::parse_yes`
+/// to maintain a single canonical parse implementation (WR-02).
 pub fn parse_yes(input: &str) -> bool {
-    input.trim() == "yes"
+    nosh_auth::keys::parse_yes(input)
 }
 
 #[cfg(test)]

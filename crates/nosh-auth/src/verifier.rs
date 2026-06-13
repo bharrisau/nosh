@@ -229,41 +229,19 @@ impl ServerCertVerifier for HostKeyVerifier {
 ///
 /// Matches OpenSSH wording exactly so users familiar with `ssh` recognise the
 /// prompt. Requires typing `"yes"` (exact, after trimming whitespace) to accept.
+///
+/// This function now uses the shared `keys::prompt_host_key_accept` helper
+/// to maintain a single canonical TOFU prompt implementation (WR-02).
 fn prompt_and_record(
     known_hosts: &Path,
     host: &str,
     key: &NoshPublicKey,
 ) -> anyhow::Result<()> {
-    use std::io::{BufRead, IsTerminal, Write};
-
     let fingerprint = key.fingerprint();
-    let stderr = std::io::stderr();
-    let mut out = stderr.lock();
 
-    writeln!(out, "The authenticity of host '{host}' can't be established.")?;
-    writeln!(out, "ED25519 key fingerprint is {fingerprint}.")?;
-
-    // D-10: no-TTY fails closed. Never silently record in automation.
-    if !std::io::stdin().is_terminal() {
-        writeln!(out, "Host key verification failed: stdin is not a TTY.")?;
-        writeln!(
-            out,
-            "Use --trust-key <fingerprint> (future flag) for non-interactive use."
-        )?;
-        anyhow::bail!("cannot prompt for TOFU confirmation: stdin is not a TTY");
-    }
-
-    write!(out, "Are you sure you want to continue connecting (yes/no)? ")?;
-    out.flush()?;
-    drop(out); // release stderr lock before locking stdin
-
-    let line = std::io::stdin()
-        .lock()
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("stdin closed during TOFU prompt"))??;
-
-    if line.trim() != "yes" {
+    // Shared TOFU prompt logic — fails closed on no-TTY or non-"yes" input.
+    let accepted = keys::prompt_host_key_accept(host, &fingerprint)?;
+    if !accepted {
         anyhow::bail!("Host key not accepted; connection refused.");
     }
 
