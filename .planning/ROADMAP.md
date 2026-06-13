@@ -68,7 +68,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 
 - [x] **Phase 23: Transport Abstraction Seam** — `NoshTransport`/`NoshSendStream`/`NoshRecvStream` traits; Quinn concrete wrappers; session pump made generic; all existing tests green with zero behavioural change (completed 2026-06-13)
 - [x] **Phase 24: WebTransport Endpoint + Mode A** — `wtransport` 0.7.1 integrated; server binds UDP/443 as a WebTransport-over-HTTP/3 listener; client connects; full shell session (datagrams, streams, channels) over the WebTransport pump; downgrade protection (completed 2026-06-13)
-- [ ] **Phase 25: Inner SSH-Key Handshake + TOFU Prompt** — four-step mutual challenge-response (discriminants 18-21) with RFC 9266 tls-exporter channel binding; interactive blocking TOFU fingerprint prompt on first contact; inner auth gated before any `SessionOpen` or `Reattach`
+- [x] **Phase 25: Inner SSH-Key Handshake + TOFU Prompt** — four-step mutual challenge-response (discriminants 18-21) with RFC 9266 tls-exporter channel binding; interactive blocking TOFU fingerprint prompt on first contact; inner auth gated before any `SessionOpen` or `Reattach` (completed 2026-06-13)
 - [ ] **Phase 26: Migration Handover over WebTransport** — client detects WebTransport session loss, reconnects, re-runs inner auth, resumes via 1-RTT cold reattach with byte-exact replay; concurrent same-token reattach resolved atomically
 - [ ] **Phase 27: Security Hardening Pass** — OSC OOM adversarial re-verification (999.7) + regression CI gate; SEC-04 client trust-boundary hardening (per-OSC byte gate, clipboard-read rejection, escape stripping, resize rate-limit, recv cap, channel-ID validation); SEC-01 threat-model document (`docs/SECURITY.md`)
 - [ ] **Phase 28: Interactive UAT Clearing** — human-driven, one item at a time: carried-forward backlog (Windows alt-screen, 999.3, 999.4, CI gates) then new M7 path end-to-end
@@ -136,7 +136,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 - [x] 25-01-PLAN.md — Wire foundation: Message variants 18-21 + discriminant-stability/fieldless tests + transcript label consts + NoshTransport::export_keying_material + nosh-auth check_authorized_key/verify_ed25519_spki helpers
 - [x] 25-02-PLAN.md — Server inner auth: run_inner_auth_server state machine (EKM-bound transcripts, single-use nonce, spawn_blocking signing) + WT export_keying_material + handle_connection_wt gate + main.rs host-key/authorized_keys wiring
 - [x] 25-03-PLAN.md — Client inner auth: run_inner_auth_client + blocking SEC-02 TOFU prompt (fail-closed on no-TTY) + WT connect-path wiring + native-path TofuPolicy replacing silent-record
-- [ ] 25-04-PLAN.md — Adversarial integration tests: happy path + tampered channel binding (WT-3) + pre-auth SessionOpen rejection (MH-1) + unknown client key + TOFU no-TTY fail-closed
+- [x] 25-04-PLAN.md — Adversarial integration tests: happy path + tampered channel binding (WT-3) + pre-auth SessionOpen rejection (MH-1) + unknown client key + TOFU no-TTY fail-closed
 
 ### Phase 26: Migration Handover over WebTransport
 
@@ -211,7 +211,7 @@ Full detail archived at `.planning/milestones/v1.3-ROADMAP.md`.
 | 22. Scrollback Sync | 5/5 | Shipped | 2026-06-12 |
 | 23. Transport Abstraction Seam | 2/2 | Complete    | 2026-06-13 |
 | 24. WebTransport Endpoint + Mode A | 5/5 | Complete    | 2026-06-13 |
-| 25. Inner SSH-Key Handshake + TOFU Prompt | 3/4 | In Progress|  |
+| 25. Inner SSH-Key Handshake + TOFU Prompt | 4/4 | Complete   | 2026-06-13 |
 | 26. Migration Handover over WebTransport | 0/? | Not started | - |
 | 27. Security Hardening Pass | 0/? | Not started | - |
 | 28. Interactive UAT Clearing | 0/? | Not started | - |

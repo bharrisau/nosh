@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: M7 Remote Access over HTTP/3 + Security Hardening
 status: executing
-stopped_at: Phase 25 wave-2 merged to main (25-02 server + 25-03 client inner auth); post-merge gate green after quick-fix 260614-47b (TofuPolicy::Silent test seam). NEXT = 25-04 adversarial integration tests.
-last_updated: "2026-06-14T00:00:00.000Z"
+stopped_at: Phase 25 wave-2 (25-02 server + 25-03 client) merged to main; quick-fix 260614-47b restored the integration-test gate to green. HEAD = 54a1d4b.
+last_updated: "2026-06-13T19:25:26.246Z"
 last_activity: 2026-06-14 -- 25-02/25-03 merged; TOFU test-harness regression quick-fixed; full gate green
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 11
-  completed_plans: 10
-  percent: 33
+  completed_plans: 11
+  percent: 50
 ---
 
 # Project State
@@ -31,7 +31,7 @@ Status: Executing Phase 25 — wave-2 merged, post-merge gate green
 Last activity: 2026-06-14 -- 25-02/25-03 merged; TOFU test-harness regression quick-fixed; full gate green
 
 ```
-Progress: [████████░░] 83%
+Progress: [██████████] 100%
 ```
 
 ## Performance Metrics
@@ -147,7 +147,7 @@ Items acknowledged and carried forward from previous milestones:
 
 ## Session Continuity
 
-Last session: 2026-06-14T00:00:00.000Z
+Last session: 2026-06-13T19:25:26.232Z
 Stopped at: Phase 25 wave-2 (25-02 server + 25-03 client) merged to main; quick-fix 260614-47b restored the integration-test gate to green. HEAD = 54a1d4b.
 Resume file: .planning/phases/25-inner-ssh-key-handshake-tofu-prompt/25-03-SUMMARY.md
 

@@ -21,7 +21,7 @@ Direct WebTransport mode (Mode A — nosh binds its own listener on UDP/443) is 
 ### Security Hardening (SEC)
 
 - [ ] **SEC-01**: A threat-model document (`docs/SECURITY.md`) covers the internet-exposed topology — assets, trust boundaries, attacker capabilities, the proxy trust model, the Mode A vs Mode B distinction, the mandatory-inner-auth rationale, and residual risks
-- [ ] **SEC-02**: On first contact with an unknown server host key, the client shows an interactive, blocking TOFU fingerprint-confirm dialogue (SHA-256 hex fingerprint, explicit `yes` required, no PTY output until resolved), replacing the current silent-record behaviour
+- [x] **SEC-02**: On first contact with an unknown server host key, the client shows an interactive, blocking TOFU fingerprint-confirm dialogue (SHA-256 hex fingerprint, explicit `yes` required, no PTY output until resolved), replacing the current silent-record behaviour
 - [ ] **SEC-04**: The client is hardened against a malicious or compromised server — per-OSC byte-count gate before the VT parser, OSC 52 clipboard-read rejection, DCS/PM/APC no-op, title escape-byte stripping, clipboard selection-field validation, server-issued resize rate-limit, `PtyData` receive cap, and channel-ID range validation
 - [ ] **SEC-05**: The post-auth OSC-accumulation OOM bound (999.7) is adversarially re-verified and regression-gated — the named bound test re-run, the fuzz target re-run at raised `max_len`, and the prefilter confirmed to bound all OSC categories nosh handles (not just OSC 0/2/52); a CI gate prevents regression from M7 changes to the terminal advance path
 
@@ -78,7 +78,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | WT-05 | Phase 24 | Complete |
 | WT-06 | Phase 26 | Pending |
 | SEC-01 | Phase 27 | Pending |
-| SEC-02 | Phase 25 | Pending |
+| SEC-02 | Phase 25 | Complete |
 | SEC-04 | Phase 27 | Pending |
 | SEC-05 | Phase 27 | Pending |
 | UAT-01 | Phase 28 | Pending |
