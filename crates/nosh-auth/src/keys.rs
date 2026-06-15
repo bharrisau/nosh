@@ -202,13 +202,19 @@ pub fn record_known_host(path: &Path, host: &str, key: &NoshPublicKey) -> anyhow
     }
     let line = format!("{host} {}\n", key.to_openssh_line()?);
 
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    // Restrict to owner-only on Unix (D-01 TOFU file hardening). `mode()` is a
+    // Unix-only `OpenOptionsExt` method, so gate it: on Windows the file is
+    // created with default ACLs (documented limitation — see
+    // docs/windows-client-test.md §2; mirrors signer.rs's not(unix) path).
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
 
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
+    let mut f = opts
         .open(path)
         .with_context(|| format!("open known_hosts {} for append", path.display()))?;
     f.write_all(line.as_bytes())
