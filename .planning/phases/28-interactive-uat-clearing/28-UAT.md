@@ -9,20 +9,18 @@ updated: "2026-06-14"
 ## Current Test
 <!-- OVERWRITE each test - shows where we are -->
 
-number: 1
-name: vim alternate-screen round-trip (Windows client)
-expected: |
-  On the Windows nosh client against the Linux server, `vim --noplugin <file>`
-  opens to a blank canvas (no shell text bleeding through the alternate screen);
-  after `:q`, the primary buffer and cursor are exactly as they were before vim
-  launched (clean alt-screen enter/exit, no residue).
-awaiting: user response
+[paused — blocker found on Test 1: reliable-stream framing desync → reconnect loop
+(FrameTooLarge 0x6669673D). Tests 2-6 (Windows visual) and 12 (M7 reattach) are
+blocked on the same path. Awaiting operator decision: diagnose+fix now vs continue
+non-affected items (8 CI, 9 latency) first.]
 
 ## Tests
 
 ### 1. vim alternate-screen round-trip (Windows client)
 expected: vim --noplugin opens to a blank canvas (no shell bleed-through); after :q the primary buffer + cursor are restored exactly. [TUI-01, SC#1; re-test on Windows]
-result: [pending]
+result: issue
+reported: "Tested vim - it isn't great. When I first open it I got a quick disconnect as nosh fell into 'reliable mode'. Looks like the screen is now too small when in VIM. After reconnect, recovered + vim usable."
+severity: major
 
 ### 2. htop rendering vs reference terminal (Windows client)
 expected: htop renders columns, bars, and CPU meters aligned/correct side-by-side against the same htop in a reference terminal — no garbled output, no missing spaces. [TUI-04, SC#1]
@@ -46,7 +44,9 @@ result: [pending]
 
 ### 7. read -s noecho + Enter line-advance + predictive echo (Windows client) (999.4 D-02 / 999.3)
 expected: at a `read -s` password prompt, typed secret characters are structurally suppressed (no echo, no predicted chars); pressing Enter advances the line (prompt drops a line) rather than stalling; fast-typing / holding a key (typematic) in vim and bracketed-paste of a multi-line block show no predictive-echo glitch over a real RTT. [999.4 D-02 + 999.3 typematic/read-s items]
-result: [pending]
+result: issue
+reported: "Tested the SECRET read: the first enter is better as it moves the cursor correctly. But the second one now places the cursor at position 0, not at the end of the prompt on the next line."
+severity: major
 
 ### 8. CI green — build-windows + cargo audit
 expected: the latest `main` CI run shows the `build-windows` job and the `cargo audit` job both green. [SC#1 support; orchestrator verifies via gh, operator confirms]
@@ -72,10 +72,10 @@ result: [pending]
 
 total: 12
 passed: 0
-issues: 0
-pending: 12
+issues: 2
+pending: 5
 skipped: 0
-blocked: 0
+blocked: 5
 
 ## Gaps
 
@@ -90,3 +90,53 @@ blocked: 0
     - path: "crates/nosh-auth/src/keys.rs"
       issue: "Unconditional Unix-only .mode(0o600) broke Windows build"
   debug_session: ""
+
+- truth: "Full-screen TUIs (vim etc.) render at the client's actual terminal size, including after a reconnect"
+  status: failed
+  reason: "User reported: vim renders into a too-small screen after a quick disconnect/reconnect on first open (nosh briefly 'fell into reliable mode' = transport hiccup → reconnect). Session recovered and vim was usable but sized too small."
+  severity: major
+  test: 1
+  root_cause: "HYPOTHESIS (needs diagnosis): terminal size not re-applied to the server PTY after a reconnect, so the PTY stays at a stale/default size (likely 80x24) while the client window is larger. Possibly compounded by a Windows datagram (quinn_udp WSAEMSGSIZE/GSO) hiccup during vim's heavy initial repaint triggering the reconnect. Display flows exclusively via the datagram path (main.rs:459-462), so a degraded datagram path also degrades rendering."
+  artifacts:
+    - path: "crates/nosh-client/src/main.rs"
+      issue: "resize not re-sent on reconnect? (resize poll vs reattach) — confirm"
+  missing:
+    - "Re-send current terminal size on reconnect/reattach (or verify the reattach path carries it)"
+    - "Investigate Windows datagram degradation under heavy repaint (WSAEMSGSIZE/GSO)"
+  debug_session: ""
+
+- truth: "read -s: each Enter's predicted cursor lands at the next prompt's end column once confirmed, not stuck at column 0"
+  status: failed
+  reason: "User reported: first Enter moves the cursor correctly, but the SECOND Enter places the cursor at column 0 instead of at the end of the prompt on the next line."
+  severity: major
+  test: 7
+  root_cause: "HYPOTHESIS (needs diagnosis): PredictEnter predicts cursor (row+1, col 0) and relies on sync_cursor_from_confirmed to snap to the real prompt column once the server confirms (predictor.rs:458-485). On the second consecutive Enter/epoch the re-sync does not fire (or confirmed cursor is read as col 0), so the predicted col-0 sticks."
+  artifacts:
+    - path: "crates/nosh-client/src/predictor.rs"
+      issue: "PredictEnter col-0 prediction not re-synced to confirmed prompt column on 2nd epoch"
+  missing:
+    - "Adversarial repro: two consecutive read -s prompts; assert predicted cursor snaps to prompt-end col on the 2nd Enter"
+  debug_session: ""
+
+- truth: "Reliable-stream framing stays in sync; the client does not misread payload as a frame-length prefix, and reattach/replay does not desync the stream"
+  status: failed
+  reason: |
+    User reported a garbled screen that clear/Ctrl-L/closing vim could NOT recover, with the prompt marker offset by several rows. CLIENT LOG (smoking gun):
+      WARN nosh_client: reliable stream error, triggering reconnect: frame too large: 1718183741 bytes (max 16777216)
+    1718183741 = 0x6669673D = ASCII "fig=" — terminal payload bytes read as a u32 BE frame-length prefix (codec.rs:67-71). The reliable-stream length-prefixed framing desynced; the bogus 1.7GB length exceeds MAX_FRAME_LEN (16 MiB) → error → reconnect → reattach+replay → desync again → reconnect LOOP.
+    SERVER LOG corroboration: connection accepted; "reattach accepted"; "replay complete replaying_from_seq=10 chunks=9 truncated=false"; then "transport lost during reattach; re-orphaning"; new connection; session open term=xterm-256color cols=270 rows=72 (so size WAS sent correctly — 270x72); then "reattach rejected" (token consumed by the loop); "transport lost; orphaning session". A classic reconnect/reattach storm.
+  severity: blocker
+  test: 1
+  root_cause: |
+    HYPOTHESIS (needs diagnosis): the reliable-stream framing desyncs — most likely in the reattach-replay write path (server replays 9 PtyData chunks over the reliable stream on reattach; the desync appears right at "replay complete"). A frame written with a length prefix that doesn't match its body length, OR raw bytes written to the reliable stream without a length prefix, would shift every subsequent read so a later read interprets payload ("fig=") as a 4-byte length. Likely PLATFORM-AGNOSTIC (framing/replay), not the documented Windows datagram quirk. Display flows exclusively via the datagram path (main.rs:459-462), so the reliable-stream desync + reconnect loop is what corrupts the screen and prevents recovery. This also threatens the M7 reattach test (12), which exercises the same replay path over WebTransport.
+  artifacts:
+    - path: "crates/nosh-proto/src/codec.rs"
+      issue: "Length-prefixed framing (u32 BE + body); desync read 0x6669673D as length"
+    - path: "crates/nosh-server/src/server.rs"
+      issue: "Reattach replay write path (replay complete chunks=9) — suspected source of framing desync"
+  missing:
+    - "Diagnose: audit reattach-replay write path for a frame-length/body mismatch or an unframed raw write to the reliable stream"
+    - "Adversarial regression test: reattach with N replay chunks; assert the client reads every frame without a FrameTooLarge/desync"
+    - "Confirm whether a fresh connect (no reconnect/reattach) renders cleanly — isolates replay-path vs general framing"
+  debug_session: ""
+  blocks_tests: [2, 3, 4, 5, 6, 12]  # Windows visual items + M7 reattach all ride the affected path
