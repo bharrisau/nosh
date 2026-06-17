@@ -50,7 +50,21 @@ severity: major
 
 ### 8. CI green — build-windows + cargo audit
 expected: the latest `main` CI run shows the `build-windows` job and the `cargo audit` job both green. [SC#1 support; orchestrator verifies via gh, operator confirms]
-result: [pending]
+result: in-progress
+findings: |
+  Orchestrator gh verification (2026-06-17), runs 27528732533 + 27657209208:
+  - build-windows (nosh-client Windows MSVC, HARDEN-02): GREEN ✓ — confirms the
+    75a7c84 keys.rs cfg-gate fixed the Windows build.
+  - cargo audit: was RED — single advisory RUSTSEC-2023-0071 (rsa "Marvin Attack"
+    timing sidechannel, no fixed upgrade). rsa is transitive via ssh-key (parse-
+    only); nosh uses Ed25519 and does no in-process RSA private-key ops. Accepted
+    residual; added to the audit `ignore:` list in ci.yml with rationale. Re-run
+    pending to confirm green.
+  - NOT in test-8 scope but observed: the `cargo test (Linux)` job's Clippy step is
+    RED (`cargo clippy --locked -- -D warnings`) on PRE-EXISTING lib/bin lints
+    (client.rs:798, channel.rs:176, registry.rs:562, server.rs:1410, main.rs
+    378/2240/2560/2601). Separate CI-health item — flag to operator; not a test-8
+    blocker. Test files don't count (CI clippy has no --all-targets).
 
 ### 9. PTY echo latency budget — p50 ≤ 5 ms on live hardware (23-HUMAN-UAT #1)
 expected: on representative hardware under normal load, the predictive/echo PTY round-trip median (p50) stays at or under the 5 ms budget asserted by `channel_echo_roundtrip` (the prior flake was load-induced scheduler jitter, not a refactor regression). [23 deferred item]

@@ -59,7 +59,14 @@ jobs:
       - uses: actions-rust-lang/audit@v1
         name: Audit Rust dependencies
         with:
-          ignore: ""  # Add RUSTSEC-YYYY-NNNN here for accepted/false-positive advisories
+          # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in the `rsa`
+          # crate (no fixed upgrade available). Pulled in TRANSITIVELY via
+          # `ssh-key` for PARSING RSA keys only. nosh's own identity/host keys are
+          # Ed25519, and it performs NO in-process RSA private-key operations (the
+          # vulnerable decrypt/sign timing path) — any RSA signing happens
+          # out-of-process in ssh-agent. Accepted residual; see docs/999.1-SECURITY.md.
+          # NOTE (operator): re-confirm this acceptance when ssh-key/rsa versions move.
+          ignore: RUSTSEC-2023-0071
 
   osc-bound-regression:
     name: OSC-OOM regression gate (SEC-05)
