@@ -135,8 +135,32 @@ blocked: 5
     - path: "crates/nosh-server/src/server.rs"
       issue: "Reattach replay write path (replay complete chunks=9) — suspected source of framing desync"
   missing:
-    - "Diagnose: audit reattach-replay write path for a frame-length/body mismatch or an unframed raw write to the reliable stream"
-    - "Adversarial regression test: reattach with N replay chunks; assert the client reads every frame without a FrameTooLarge/desync"
-    - "Confirm whether a fresh connect (no reconnect/reattach) renders cleanly — isolates replay-path vs general framing"
-  debug_session: ""
+    - "Operator capture on Windows with NOSH_FRAME_TRACE=1 (+ optional NOSH_RECORD) to pinpoint the frame preceding the desync"
+  diagnosis: |
+    Orchestrator (opus) direct diagnosis, 2026-06-17. Could NOT reproduce on Linux
+    despite an adversarial repro that exercises the exact operator path (heavy
+    OSC-laden output + a large buffered replay across orphan→reattach + continuous
+    post-reattach output): crates/nosh-client/tests/reattach_steady_state.rs — both
+    scenarios pass frame-clean. Audited and RULED OUT every nosh-layer desync
+    mechanism:
+      1. codec framing asymmetry — write_message_ns/read_message_ns are symmetric
+         (4-byte BE len + postcard body); scrollback's raw write uses codec::encode
+         (prefix included), byte-identical.
+      2. client partial read — QuinnRecvStream::read_exact delegates to quinn's
+         looping read_exact; chunking handled.
+      3. server multi-writer on the session stream — STRUCTURALLY IMPOSSIBLE: `send`
+         is Box<dyn NoshSendStream> (not Arc), so the borrow checker enforces a
+         single writer; channels/scrollback use their OWN streams.
+      4. client multi-reader on `recv` — single select! arm.
+      5. test-only raw echo loop — #[cfg(test)], not production.
+      6. datagram→reliable-stream fallback — explicitly REJECTED by design
+         (D-11-01a, datagram.rs:221); overflow defers cells within the datagram
+         path, never writes diffs to a stream.
+    CONCLUSION: not a nosh-layer framing bug reproducible on Linux. It is
+    Windows-transport-specific (the field symptom followed a datagram hiccup →
+    reconnect). Next step is decisive on-Windows capture, not a blind edit.
+    Instrumentation landed (always-on desync log + NOSH_FRAME_TRACE full hex dump +
+    NOSH_RECORD terminal recording + recent-frame ring buffer on the desync path).
+  status_note: "downgraded from blind-fix to instrument-and-capture; regression guard + diagnostics committed; awaiting Windows logs"
+  debug_session: "orchestrator-direct (opus); see commit for reattach_steady_state.rs + transport_trait.rs instrumentation"
   blocks_tests: [2, 3, 4, 5, 6, 12]  # Windows visual items + M7 reattach all ride the affected path

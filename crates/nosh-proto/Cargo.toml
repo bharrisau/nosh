@@ -13,3 +13,4 @@ quinn = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }

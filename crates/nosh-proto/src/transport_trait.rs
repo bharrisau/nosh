@@ -290,6 +290,19 @@ pub async fn read_message_ns(
     })?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > crate::codec::MAX_FRAME_LEN {
+        // DIAGNOSTIC (Phase 28 framing-desync blocker): a length prefix larger
+        // than MAX_FRAME_LEN almost always means the reliable stream has DESYNCED
+        // — we are reading payload bytes as a 4-byte big-endian length. Surface
+        // the raw prefix bytes (hex + ASCII) so the offending content is visible.
+        // 1718183741 == 0x6669673D == "fig=" was the field report. This log is
+        // always-on (it only fires on the bug) and never leaks normal traffic.
+        tracing::error!(
+            len,
+            len_bytes_hex = %format!("{:02x} {:02x} {:02x} {:02x}", len_buf[0], len_buf[1], len_buf[2], len_buf[3]),
+            len_bytes_ascii = %bytes_as_ascii(&len_buf),
+            "reliable-stream framing DESYNC: length prefix exceeds MAX_FRAME_LEN \
+             (read payload as a frame length — stream is misaligned)"
+        );
         return Err(crate::codec::ProtoError::FrameTooLarge(len));
     }
     let mut body = vec![0u8; len];
@@ -299,7 +312,49 @@ pub async fn read_message_ns(
             e,
         ))
     })?;
-    crate::codec::decode(&body)
+    let msg = crate::codec::decode(&body)?;
+    // DIAGNOSTIC (env-gated full frame trace): when NOSH_FRAME_TRACE is set, log
+    // every reliable frame read on this process (client AND server) — variant,
+    // body length, and the full body bytes as hex. The operator opted into full
+    // dumps; size is not a concern for diagnosis. Off by default (zero overhead
+    // beyond a OnceLock load once the bool is cached).
+    if frame_trace_enabled() {
+        tracing::info!(
+            target: "nosh_frame_trace",
+            variant = msg.variant_name(),
+            body_len = len,
+            body_hex = %hex_dump(&body),
+            "rx frame"
+        );
+    }
+    Ok(msg)
+}
+
+/// Render bytes as a printable-ASCII string, replacing non-printables with `.`.
+/// Used by the framing-desync diagnostic — safe for arbitrary bytes.
+fn bytes_as_ascii(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .collect()
+}
+
+/// Lowercase hex dump (no separators) of an arbitrary byte slice.
+fn hex_dump(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Whether the env-gated full frame trace (`NOSH_FRAME_TRACE`) is active.
+/// Read once and cached — the env var is sampled a single time per process.
+fn frame_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NOSH_FRAME_TRACE").is_some())
 }
 
 // ── Blanket impls for Box<dyn NoshSendStream> / Box<dyn NoshRecvStream> ────────

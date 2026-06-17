@@ -1814,6 +1814,69 @@ async fn reattach_session_on_stream(
     }
 }
 
+/// DIAGNOSTIC (Phase 28 framing-desync blocker): optional tee of everything
+/// written to the client's stdout (the rendered ANSI byte stream) into the file
+/// named by the `NOSH_RECORD` env var. The capture is a raw terminal recording —
+/// replay it on any terminal with `cat <file>` (Unix) or `type <file>` /
+/// `Get-Content -Raw <file>` (Windows) to reproduce exactly what nosh rendered,
+/// including the garbled-screen state. When `NOSH_RECORD` is unset, the wrapper
+/// is a zero-overhead pass-through (`file == None`).
+struct RecordingWriter<W> {
+    inner: W,
+    file: Option<std::fs::File>,
+}
+
+impl<W> RecordingWriter<W> {
+    fn new(inner: W) -> Self {
+        let file = std::env::var_os("NOSH_RECORD").and_then(|p| match std::fs::File::create(&p) {
+            Ok(f) => {
+                tracing::info!(path = ?p, "NOSH_RECORD: recording rendered terminal output");
+                Some(f)
+            }
+            Err(e) => {
+                tracing::warn!(path = ?p, "NOSH_RECORD: failed to create recording file: {e}");
+                None
+            }
+        });
+        Self { inner, file }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RecordingWriter<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let n = std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_write(cx, buf))?;
+        // Mirror exactly the bytes accepted by the inner writer into the recording.
+        if let Some(f) = this.file.as_mut() {
+            let _ = std::io::Write::write_all(f, &buf[..n]);
+        }
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(f) = this.file.as_mut() {
+            let _ = std::io::Write::flush(f);
+        }
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
 /// Core pump loop: render output, forward input, debounce resize, send periodic
 /// Ack. Returns the pump outcome.
 #[allow(clippy::too_many_arguments)] // 10 args are load-bearing: conn + streams + state + watcher + baseline + predict_mode + status
@@ -1830,7 +1893,9 @@ async fn run_pump(
     status: bool,
 ) -> anyhow::Result<PumpOutcome> {
     let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    // DIAGNOSTIC (Phase 28): wrap stdout so NOSH_RECORD can tee the rendered ANSI
+    // stream to a file for replay. No-op pass-through when the env var is unset.
+    let mut stdout = RecordingWriter::new(tokio::io::stdout());
     let mut stdin_buf = [0u8; 8 * 1024];
     let mut resize_deadline: Option<tokio::time::Instant> = None;
     let mut ack_interval = tokio::time::interval(ACK_INTERVAL);
@@ -2037,6 +2102,15 @@ async fn run_pump(
 
     let exit_code;
 
+    // DIAGNOSTIC (Phase 28 framing-desync blocker): always-on ring buffer of the
+    // last reliable-stream frame variants read on the SESSION stream. On a desync
+    // (FrameTooLarge / decode error) we log this sequence so the frame TYPE that
+    // immediately precedes the misalignment is visible even on a run that did not
+    // set NOSH_FRAME_TRACE. Variant names only (no payload) — cheap and leak-free.
+    const FRAME_RING_CAP: usize = 24;
+    let mut recent_frames: std::collections::VecDeque<&'static str> =
+        std::collections::VecDeque::with_capacity(FRAME_RING_CAP);
+
     loop {
         // BUG-G one-shot (Windows): resolve at the recheck deadline, else pending.
         // On non-Windows the deadline is always None so this is permanently pending.
@@ -2063,6 +2137,14 @@ async fn run_pump(
         tokio::select! {
             // Server → client reliable stream frames (QOL-02/03: TerminalControl re-emit).
             msg = nosh_proto::read_message_ns(recv) => {
+                // DIAGNOSTIC: record the variant of each successfully-read frame in
+                // the ring buffer before dispatch (Phase 28 framing-desync blocker).
+                if let Ok(ref m) = msg {
+                    if recent_frames.len() == FRAME_RING_CAP {
+                        recent_frames.pop_front();
+                    }
+                    recent_frames.push_back(m.variant_name());
+                }
                 match msg {
                     Ok(Message::PtyData { data }) => {
                         // D-02: client has no vte parser; server-side osc_prefilter is the authoritative OSC byte gate
@@ -2221,7 +2303,14 @@ async fn run_pump(
                     }
                     Ok(_) => {} // ignore other control frames
                     Err(e) => {
-                        tracing::warn!("reliable stream error, triggering reconnect: {e}");
+                        // DIAGNOSTIC (Phase 28): dump the recent frame-variant sequence
+                        // on the session stream so the frame TYPE preceding the desync is
+                        // visible. Pair with NOSH_FRAME_TRACE=1 for full per-frame hex.
+                        let recent: Vec<&str> = recent_frames.iter().copied().collect();
+                        tracing::warn!(
+                            recent_session_frames = ?recent,
+                            "reliable stream error, triggering reconnect: {e}"
+                        );
                         return Ok(PumpOutcome::TransportDrop);
                     }
                 }

@@ -295,4 +295,33 @@ mod tests {
             other => panic!("expected ProtoError::FrameTooLarge, got {other:?}"),
         }
     }
+
+    /// Phase 28 framing-desync diagnostic: reproduce the EXACT field symptom — a
+    /// reliable stream that has desynced so the next 4 payload bytes are read as a
+    /// length prefix. The operator's Windows log reported
+    /// `frame too large: 1718183741 bytes` == 0x6669673D == ASCII "fig=". This test
+    /// pins that mapping: feeding the literal bytes `fig=` as a length prefix must
+    /// produce `FrameTooLarge(1_718_183_741)` (and, in a real process with a
+    /// subscriber, the always-on `reliable-stream framing DESYNC` error log). It
+    /// documents the byte→length identity so the diagnostic stays meaningful.
+    #[tokio::test]
+    async fn read_message_ns_desync_reports_field_fig_value() {
+        use crate::codec::ProtoError;
+        use crate::transport_trait::read_message_ns;
+
+        // "fig=" read as a big-endian u32 length prefix.
+        let fig = *b"fig=";
+        assert_eq!(u32::from_be_bytes(fig), 1_718_183_741, "field-report identity");
+
+        let mut recv_stream = OwnedSliceRecvStream::new(fig.to_vec());
+        match read_message_ns(&mut recv_stream).await {
+            Err(ProtoError::FrameTooLarge(n)) => {
+                assert_eq!(
+                    n, 1_718_183_741,
+                    "the 'fig=' desync must surface as FrameTooLarge with the field-reported length"
+                );
+            }
+            other => panic!("expected ProtoError::FrameTooLarge(1718183741), got {other:?}"),
+        }
+    }
 }
